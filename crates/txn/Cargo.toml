@@ -1,0 +1,18 @@
+[package]
+name = "rustdb-txn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Transaction manager, lock manager, and MVCC for rustdb."
+
+[dependencies]
+rustdb-storage.workspace = true
+rustdb-wal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

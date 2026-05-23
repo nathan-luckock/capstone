@@ -1,0 +1,17 @@
+[package]
+name = "rustdb-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Logical and physical planning + cost-based query optimization for rustdb."
+
+[dependencies]
+rustdb-sql.workspace = true
+rustdb-storage.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rustdb-wal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Write-ahead log and ARIES-style crash recovery for rustdb."
+
+[dependencies]
+rustdb-storage.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

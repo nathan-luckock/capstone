@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/storage",
+    "crates/wal",
+    "crates/txn",
+    "crates/sql",
+    "crates/planner",
+    "crates/executor",
+    "crates/rustdb",
+    "crates/rustdb-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Nathan7108/capstone"
+authors = ["Nathan Luckock <nathanluckock@gmail.com>"]
+
+[workspace.dependencies]
+# Internal crates
+rustdb-storage = { path = "crates/storage" }
+rustdb-wal = { path = "crates/wal" }
+rustdb-txn = { path = "crates/txn" }
+rustdb-sql = { path = "crates/sql" }
+rustdb-planner = { path = "crates/planner" }
+rustdb-executor = { path = "crates/executor" }
+rustdb = { path = "crates/rustdb" }
+
+# Plumbing only — nothing storage/parser/planner-related is allowed here.
+# The graded must-haves are hand-written. See CLAUDE.md rule 6.
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bytes = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"           # Selectively #[allow] in storage layer when unavoidable, with SAFETY comments.
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Carve-outs (we're a database engine, some pedantic lints fight us):
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1                       # Keep line tables for stack traces from torture-test crashes.
+
+[profile.dev]
+opt-level = 1                   # Tests are too slow with -O0 on the buffer pool.

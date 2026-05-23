@@ -1,0 +1,30 @@
+# Cargo build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data files produced by the DB at runtime
+/data
+**/data
+*.db
+*.wal
+*.log
+
+# Crash dumps / cores
+*.core
+core.*
+
+# Local Claude session noise (we keep .claude/skills/ and .mcp.json tracked)
+.claude/cache/
+.claude/projects/
+.claude/sessions/
