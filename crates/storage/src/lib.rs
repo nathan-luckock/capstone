@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod buffer;
 pub mod crc32;
 pub mod error;
 pub mod file;
@@ -34,6 +35,7 @@ pub mod header;
 pub mod heap;
 pub mod page;
 
+pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, K};
 pub use error::{Result, StorageError};
 pub use file::FileManager;
 pub use header::{

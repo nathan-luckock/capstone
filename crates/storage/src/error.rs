@@ -85,6 +85,12 @@ pub enum StorageError {
     /// Caller tried to delete a slot that was already tombstoned.
     #[error("slot {0} is already tombstoned")]
     SlotAlreadyDeleted(u16),
+
+    /// All buffer pool frames are pinned; no victim available for eviction.
+    /// The caller is holding too many guards simultaneously — typically a
+    /// query plan bug that pins more pages than the pool can hold.
+    #[error("buffer pool full: all frames are pinned")]
+    BufferPoolFull,
 }
 
 /// Convenience alias for results returned by the storage layer.
