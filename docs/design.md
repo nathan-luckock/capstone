@@ -20,8 +20,9 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 |---|---|---|
 | 0 | Bootstrap: workspace, CI, design doc, working agreement | ✅ shipped (PR #1) |
 | 1 | Storage I: file manager, page header + CRC32, slotted page, proptests | ✅ shipped (PRs #7–#10) |
-| 2 | Storage II: buffer pool + B+ tree | ⏳ next |
-| 3–4 | WAL + ARIES recovery | ⏳ |
+| 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17–#21) |
+| 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27–#31) |
+| 4 | ARIES recovery (analysis + redo + undo + torture test) | ⏳ next |
 | 5–6 | Transactions + MVCC | ⏳ |
 | 7–9 | SQL parser → planner → executor | ⏳ |
 | 10 | Torture test + polish | ⏳ |
@@ -165,11 +166,56 @@ LRU-K (K=2) replacement. Pin/unpin via RAII `PageGuard`. Pinned pages are evict-
 
 ---
 
-## WAL & recovery (Sprints 3–4 — planned)
+## WAL (Sprint 3 — shipped)
 
-### Log record layout
+### Log record layout (29-byte header + payload + 4-byte trailer)
 
-Variable-length records, prefixed with length + type:
+| Offset | Size | Field |
+|---|---|---|
+| 0..4 | 4 | `length: u32` (total record size including length and checksum) |
+| 4..5 | 1 | `type: u8` (Begin / Update / Commit / Abort / Checkpoint / Clr) |
+| 5..13 | 8 | `lsn: u64` (assigned by writer, starts at 1) |
+| 13..21 | 8 | `txn_id: u64` |
+| 21..29 | 8 | `prev_lsn: u64` (`Lsn::INVALID = u64::MAX` for first record in txn) |
+| 29..N-4 | N | payload (per-type) |
+| N-4..N | 4 | `checksum: u32` (CRC32 of bytes `[0..N-4]`) |
+
+Update payload: `page_id u64 + slot_id u16 + before (u16-prefixed bytes) + after (u16-prefixed bytes)`. Insert has empty before; delete has empty after.
+
+### Writer (`WalWriter`)
+
+- `open(path)`: creates the file if missing. Scans existing files to recover the highest assigned LSN; resumes allocation at `last_lsn + 1`.
+- `append(record, txn, prev_lsn) -> Lsn`: serializes into an in-memory buffer. NOT durable until `fsync_through` or `fsync_all`.
+- `fsync_through(lsn)`: flushes buffer and calls `File::sync_all` if `lsn > durable_through`. No-op otherwise.
+- `fsync_all()`: makes everything currently buffered durable.
+
+### Reader (`WalReader`)
+
+Forward `Iterator<Item = Result<(RecordHeader, LogRecord)>>`. Clean `None` on EOF or torn tail (before length prefix or mid-record). Single `Some(Err)` then `None` on checksum mismatch / unknown type byte (poisoned).
+
+### Buffer pool integration
+
+`BufferPool::with_wal(file, pool_size, hook: Rc<dyn WalSyncHook>)` constructor. Before any dirty-page write (eviction, `flush_page`, `flush_all`), the pool reads the page header LSN and calls `hook.fsync_through(lsn)`. Page LSN = 0 is a sentinel for "never logged about" and skips the hook.
+
+### Decisions
+
+- **Checksum after the length** so the reader can size the buffer before verifying.
+- **Length-prefixed framing** for variable-length Update records and torn-tail tolerance.
+- **Lsn::INVALID = u64::MAX** sentinel (not 0); zero-init bugs would otherwise look like valid LSNs.
+- **Update carries both before and after images.** Before for undo, after for redo.
+- **Tail-truncation tolerance** in both the writer (on reopen) and reader (during iteration). A crash during fsync can leave a partial record at EOF; recovery treats everything after the last complete record as if it was never appended.
+- **WAL ordering hook trait lives in `rustdb-storage`** to avoid a circular dependency on `rustdb-wal`.
+
+### Rejected
+
+- Variable-length length prefix (varint). Fixed `u32` is plenty and keeps fast-forward seeking trivial.
+- 4-byte length prefixes for before/after images. `u16` is enough (tuples are at most ~8 KiB).
+- WAL segment rotation. Single-file fits demo scope.
+- `O_DIRECT` for the WAL. OS page cache hides write latency without changing semantics, since we explicitly `sync_all` for durability.
+
+## Recovery (Sprint 4 — planned)
+
+Original log record sketch (kept for reference):
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -244,17 +290,22 @@ Resolved during Sprint 1 (moved to the relevant sections above):
 - ~~Slot ID recycling policy~~ → no recycling, IDs stable for page lifetime.
 - ~~Tombstone encoding~~ → slot length 0.
 
+Resolved during Sprint 2/3 (moved to relevant sections above):
+- ~~B+ tree fanout~~: 509 keys per internal node, 453 per leaf, locked.
+- ~~Buffer pool replacement~~: LRU-K with K=2.
+- ~~WAL record field ordering~~: locked (length, type, lsn, txn, prev_lsn, payload, checksum).
+
 Still open (resolve before the relevant sprint):
 
 | Question | When to resolve |
 |---|---|
-| B+ tree fanout: empirical (benchmark) or analytic (target 128)? | Sprint 2 |
-| Buffer pool replacement: LRU-K, CLOCK, or 2Q? | Sprint 2 |
-| Free-space tracking: per-page free-space map page, or scan-on-demand? | Sprint 2 |
+| Free-space tracking: per-page free-space map, or scan-on-demand? | Sprint 5 (executor needs it) |
 | MVCC garbage collection: epoch-based or vacuum scan? | Sprint 6 |
 | Checkpoint strategy: fuzzy vs sharp? | Sprint 4 |
+| Checkpoint frequency: time-based, transaction-count-based, or WAL-size-based? | Sprint 4 |
+| Compensation log records (CLR): write per-undo-step or per-aborted-txn? | Sprint 4 |
+| Group commit: batch fsync across multiple committers? | Sprint 5 (txn manager) |
 | Isolation levels above SI: ship Serializable (SSI) or stop at SI? | Sprint 6 |
-| WAL format: do `prev_lsn` and `txn_id` go before or after the per-type payload? | Sprint 3 |
 
 ---
 
