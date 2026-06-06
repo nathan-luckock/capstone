@@ -34,16 +34,33 @@ Each sprint = ~1 calendar week, ~9-10 hours of work. Sprint label aligns with th
 
 **Counts**: 45 tests (39 unit + 6 proptests), ~1500 LOC, all gates clean locally.
 
-## Sprint 2 — Storage II (next)
+## Sprint 2 — Storage II ✅ shipped (5/5 issues)
 
-Theme: in-memory buffer pool with pin/unpin + a B+ tree index over the page manager.
+- [x] [#12](https://github.com/Nathan7108/capstone/issues/12) buffer pool with LRU-K (PR #17)
+- [x] [#13](https://github.com/Nathan7108/capstone/issues/13) B+ tree internal node (PR #18)
+- [x] [#14](https://github.com/Nathan7108/capstone/issues/14) B+ tree leaf node (PR #19)
+- [x] [#15](https://github.com/Nathan7108/capstone/issues/15) B+ tree insert/search/range_scan (PR #20)
+- [x] [#16](https://github.com/Nathan7108/capstone/issues/16) B+ tree proptests (PR #21)
+
+## Sprint 3 — WAL ✅ shipped (5/5 issues)
+
+- [x] [#22](https://github.com/Nathan7108/capstone/issues/22) record format + serialization (PR #27)
+- [x] [#23](https://github.com/Nathan7108/capstone/issues/23) writer (PR #28)
+- [x] [#24](https://github.com/Nathan7108/capstone/issues/24) forward reader (PR #29)
+- [x] [#25](https://github.com/Nathan7108/capstone/issues/25) buffer pool integration (PR #30)
+- [x] [#26](https://github.com/Nathan7108/capstone/issues/26) proptests + doc lockdown (this PR)
+
+## Sprint 4 — ARIES recovery (next)
+
+Theme: crash recovery. Take the WAL, replay it on startup, restore the database to a state consistent with everything committed before the crash.
 
 Issues to file at sprint start:
-- Buffer pool with LRU-K (K=2) replacement, RAII `PageGuard`, dirty-bit propagation
-- B+ tree internal node layout (separate from heap page)
-- B+ tree leaf node layout (with sibling pointer)
-- `BTree::insert`, `BTree::search`, `BTree::range_scan` over the buffer pool
-- Property tests over B+ tree invariants (sorted, balanced, range-scan completeness)
+- Analysis pass: scan from last checkpoint, build transaction table and dirty page table
+- Redo pass: replay every log record forward, conditional on page LSN
+- Undo pass: walk per-transaction prev_lsn chains backward, write compensation log records
+- Checkpoint emission and use
+- Torture test: kill the process at random WAL offsets, restart, verify consistency
+- Sprint 4 doc lockdown
 
 ## Out of scope until decided
 
