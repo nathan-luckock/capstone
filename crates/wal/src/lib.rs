@@ -19,12 +19,14 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod hook;
 pub mod lsn;
 pub mod reader;
 pub mod record;
 pub mod writer;
 
 pub use error::{Result, WalError};
+pub use hook::WalSyncHandle;
 pub use lsn::{Lsn, TxnId};
 pub use reader::WalReader;
 pub use record::{LogRecord, RecordHeader, RecordKind, HEADER_BYTES, MIN_RECORD_BYTES};
