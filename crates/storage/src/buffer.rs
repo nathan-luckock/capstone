@@ -41,10 +41,31 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::error::{Result, StorageError};
 use crate::file::FileManager;
+use crate::header::PageHeader;
 use crate::page::{Page, PageId, PAGE_SIZE};
+
+/// Hook the buffer pool calls before flushing any dirty page, to enforce
+/// the WAL ordering invariant: WAL records are durable before the dirty
+/// pages they describe ever reach disk.
+///
+/// The buffer pool reads the page's LSN from its header and calls
+/// [`fsync_through`](Self::fsync_through) with that LSN. The hook
+/// guarantees every WAL record with LSN `<= page_lsn` is durable before
+/// returning.
+///
+/// Implementors live in the WAL crate (see `rustdb-wal::WalSyncHandle`).
+/// This trait lives in storage so the buffer pool can call it without
+/// taking a dependency on `rustdb-wal`, which would create a dependency
+/// cycle.
+pub trait WalSyncHook: std::fmt::Debug {
+    /// Make every WAL record with LSN less than or equal to `page_lsn`
+    /// durable on disk.
+    fn fsync_through(&self, page_lsn: u64) -> std::io::Result<()>;
+}
 
 /// LRU-K parameter. K=2 gives "scan-resistant" eviction: a single sweep
 /// over a large relation can't evict the working set.
@@ -145,6 +166,10 @@ pub struct BufferPool {
     frames: Vec<Frame>,
     index: RefCell<HashMap<PageId, usize>>,
     clock: Cell<Timestamp>,
+    /// Optional hook to enforce the WAL ordering invariant. Set via
+    /// [`BufferPool::with_wal`]. When `None`, the pool flushes pages
+    /// directly without consulting any WAL.
+    wal: Option<Rc<dyn WalSyncHook>>,
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -160,13 +185,33 @@ impl std::fmt::Debug for BufferPool {
 }
 
 impl BufferPool {
-    /// Construct a buffer pool of `pool_size` frames over `file`.
+    /// Construct a buffer pool of `pool_size` frames over `file`. The
+    /// pool flushes pages directly to disk without WAL ordering checks.
+    /// For a pool that enforces WAL ordering, use [`Self::with_wal`].
     ///
     /// # Panics
     ///
     /// Panics if `pool_size == 0`. A pool with zero frames is useless.
     #[must_use]
     pub fn new(file: FileManager, pool_size: usize) -> Self {
+        Self::build(file, pool_size, None)
+    }
+
+    /// Construct a buffer pool of `pool_size` frames over `file` with WAL
+    /// ordering enforced through `wal_hook`. Before flushing a dirty
+    /// page, the pool reads the page's LSN and calls
+    /// [`WalSyncHook::fsync_through`] to make sure the corresponding WAL
+    /// records are durable first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pool_size == 0`.
+    #[must_use]
+    pub fn with_wal(file: FileManager, pool_size: usize, wal_hook: Rc<dyn WalSyncHook>) -> Self {
+        Self::build(file, pool_size, Some(wal_hook))
+    }
+
+    fn build(file: FileManager, pool_size: usize, wal: Option<Rc<dyn WalSyncHook>>) -> Self {
         assert!(pool_size > 0, "buffer pool size must be > 0");
         let frames = (0..pool_size).map(|_| Frame::empty()).collect();
         Self {
@@ -174,7 +219,34 @@ impl BufferPool {
             frames,
             index: RefCell::new(HashMap::with_capacity(pool_size)),
             clock: Cell::new(1),
+            wal,
         }
+    }
+
+    /// Helper: read a page's LSN from its header and call the WAL hook,
+    /// if one is configured. Called before any `write_page` on a dirty
+    /// page. No-op when no hook is set or the page header is invalid
+    /// (a fresh page may have an unwritten header; in that case
+    /// `PageHeader::read` returns an error and we just skip the WAL
+    /// call, since there are no log records to wait for).
+    fn enforce_wal_ordering(&self, page: &Page) -> Result<()> {
+        if let Some(hook) = &self.wal {
+            // The page header read can fail for a freshly-allocated page
+            // whose page_type byte is still 0 (which is PageType::Free).
+            // That's not a real WAL ordering violation; treat as "no LSN
+            // to wait for" and continue.
+            if let Ok(header) = PageHeader::read(page) {
+                // LSN 0 is the "never been logged" sentinel; the WAL
+                // writer assigns LSNs starting at 1. A page with LSN 0
+                // either is freshly allocated or comes from a build of
+                // the engine that did not record an LSN; either way the
+                // WAL has no records to make durable on its behalf.
+                if header.lsn != 0 {
+                    hook.fsync_through(header.lsn).map_err(StorageError::Io)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Total number of frames in the pool.
@@ -242,11 +314,13 @@ impl BufferPool {
     }
 
     /// Flush the page with `id` if it's resident and dirty. Issues an
-    /// fsync at the end either way.
+    /// fsync at the end either way. Enforces WAL ordering when a WAL hook
+    /// is configured.
     pub fn flush_page(&self, id: PageId) -> Result<()> {
         if let Some(&idx) = self.index.borrow().get(&id) {
             let mut inner = self.frames[idx].inner.borrow_mut();
             if inner.dirty {
+                self.enforce_wal_ordering(&inner.page)?;
                 self.file.borrow_mut().write_page(id, &inner.page)?;
                 inner.dirty = false;
             }
@@ -261,6 +335,7 @@ impl BufferPool {
             let mut inner = frame.inner.borrow_mut();
             if inner.dirty {
                 if let Some(id) = inner.page_id {
+                    self.enforce_wal_ordering(&inner.page)?;
                     self.file.borrow_mut().write_page(id, &inner.page)?;
                     inner.dirty = false;
                 }
@@ -319,10 +394,12 @@ impl BufferPool {
     }
 
     /// Spill `inner`'s current page to disk if dirty, remove from index.
+    /// Enforces WAL ordering before the write.
     /// Caller is responsible for resetting metadata after this returns.
     fn evict_inner(&self, inner: &mut FrameInner) -> Result<()> {
         if let Some(old_id) = inner.page_id.take() {
             if inner.dirty {
+                self.enforce_wal_ordering(&inner.page)?;
                 self.file.borrow_mut().write_page(old_id, &inner.page)?;
                 inner.dirty = false;
             }
