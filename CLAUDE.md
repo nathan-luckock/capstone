@@ -2,8 +2,8 @@
 
 CSE 499 senior project. Build a real disk-based relational database engine in Rust with ACID guarantees, WAL+ARIES recovery, MVCC, SQL parser, cost-based planner, and query executor.
 
-**Owner:** Nathan Luckock — `nathanluckock@gmail.com`
-**Repo:** https://github.com/Nathan7108/capstone
+**Owner:** Nathan Luckock, `nathanluckock@gmail.com`
+**Repo:** https://github.com/slatefile/capstone
 **Budget:** ~120 hrs over 13 weeks (W1-13)
 
 ---
@@ -56,6 +56,8 @@ All crates live in a single Cargo workspace.
 
 > **Update this section as a running heartbeat.** Top entry = most recent. Keep terse — one line per shipped task.
 
+- _(Sprint 4, 2026-06-06)_ Recovery analysis + redo landed (issue #33). `wal::recovery` with `analyze` (rebuilds txn table, winners vs losers) and `redo` (replays Update + CLR after/undo images, gated on page LSN for idempotency, materializes missing pages via the new `BufferPool::ensure_allocated`). Added `HeapPage::recover_slot` (apply image at a chosen slot id; empty image = tombstone) so replaying logged inserts in LSN order reproduces the original slot assignment. 10 new tests (5 storage recover_slot, 5 recovery), 159 total.
+- _(Sprint 4, 2026-06-06)_ Checkpoint + CLR record payloads landed (issue #32). `Checkpoint{active_txns}` and `Clr{page_id,slot_id,undo_image,undo_next}` now serialize and parse. CLRs are redo-only; `undo_next` chains the undo for idempotent rollback across repeated crashes. 11 new tests.
 - _(Sprint 3, 2026-06-06)_ WAL writer landed (issue #23). `WalWriter` with `open`/`append`/`fsync_through`/`fsync_all`/`current_lsn`/`durable_through`. Buffered append (records sit in memory until fsync), monotonic LSN allocation starting at 1, scan-on-reopen recovers `next_lsn` from the last complete record on disk, torn tail at EOF is silently skipped. 11 new tests, 122 total (112 unit + 10 proptests).
 - _(Sprint 3, 2026-06-06)_ WAL record format landed (issue #22). `LogRecord` enum (Begin, Update, Commit, Abort, Checkpoint+Clr stubbed for Sprint 4). 29-byte header (length, type, lsn, txn_id, prev_lsn) + per-type payload + CRC32 trailer. `Lsn` and `TxnId` newtypes with `Lsn::INVALID = u64::MAX` sentinel. `WalError` variants for short records, checksum mismatch, unknown types, truncated payloads, tail truncation. 12 new tests, 111 total (101 unit + 10 proptests).
 - _(Sprint 2, 2026-06-06)_ **Sprint 2 done.** B+ tree proptests landed (issue #16). Buffer pool ops sequences preserve pin invariants and content. B+ tree sibling chain is sorted after arbitrary inserts. Search matches a `BTreeMap` oracle for arbitrary queries. Range scan matches the oracle's range filter. 99 tests total (89 unit + 10 proptests). Sprint 3 next: WAL.

@@ -238,6 +238,89 @@ impl<'a> HeapPage<'a> {
         Ok(())
     }
 
+    /// Force slot `slot_id` to hold exactly `image`, used by WAL recovery
+    /// to apply redo after-images and undo before-images.
+    ///
+    /// Unlike [`insert`](Self::insert), the caller chooses the slot id, so
+    /// replaying logged mutations in LSN order reproduces the exact slot
+    /// assignment the original workload made.
+    ///
+    /// Semantics:
+    /// - `slot_id` must be `<= slot_count` (an existing slot, or exactly
+    ///   the next one to append). A gap returns [`StorageError::InvalidSlot`].
+    /// - An empty `image` tombstones the slot (undo of an insert, or redo
+    ///   of a delete).
+    /// - A non-empty `image` writes the bytes into the free region and
+    ///   points the slot at them. Overwriting an existing slot leaves the
+    ///   old bytes as dead space, reclaimed on the next [`compact`].
+    ///
+    /// If the free region is too small, [`compact`](Self::compact) runs
+    /// once and the write is retried before giving up with
+    /// [`StorageError::PageFull`].
+    pub fn recover_slot(&mut self, slot_id: SlotId, image: &[u8]) -> Result<()> {
+        let idx = slot_id.0;
+        let count = self.slot_count();
+        if idx > count {
+            return Err(StorageError::InvalidSlot {
+                slot: idx,
+                slot_count: count,
+            });
+        }
+        if image.len() > MAX_TUPLE_SIZE {
+            return Err(StorageError::TupleTooLarge { size: image.len() });
+        }
+        let appending = idx == count;
+
+        // Empty image = tombstone.
+        if image.is_empty() {
+            if appending {
+                // Append a tombstoned slot (length 0). Needs a directory
+                // entry but no tuple bytes.
+                if self.free_space() < SLOT_SIZE_U16 {
+                    return Err(StorageError::PageFull {
+                        needed: SLOT_SIZE_U16,
+                        available: self.free_space(),
+                    });
+                }
+                self.write_slot_at(idx, 0, 0);
+                let mut h = self.header();
+                h.slot_count += 1;
+                self.write_header(h);
+            } else {
+                let off = self.slot_offset_at(idx);
+                self.write_slot_at(idx, off, 0);
+            }
+            return Ok(());
+        }
+
+        let img_len = u16::try_from(image.len()).expect("checked against MAX_TUPLE_SIZE");
+        let needed = if appending {
+            img_len.saturating_add(SLOT_SIZE_U16)
+        } else {
+            img_len
+        };
+        if self.free_space() < needed {
+            self.compact();
+            if self.free_space() < needed {
+                return Err(StorageError::PageFull {
+                    needed,
+                    available: self.free_space(),
+                });
+            }
+        }
+
+        let mut h = self.header();
+        let new_offset = h.free_space_ptr - img_len;
+        self.buf[new_offset as usize..(new_offset as usize + image.len())].copy_from_slice(image);
+        self.write_slot_at(idx, new_offset, img_len);
+        h.free_space_ptr = new_offset;
+        if appending {
+            h.slot_count += 1;
+        }
+        self.write_header(h);
+        Ok(())
+    }
+
     /// Reclaim space from tombstoned slots by packing live tuples toward
     /// the end of the page. Slot IDs of live tuples are preserved.
     ///
@@ -585,5 +668,86 @@ mod tests {
             0,
             "compact must clear the vacuum hint",
         );
+    }
+
+    #[test]
+    fn recover_slot_appends_like_insert() {
+        let mut buf = fresh_page();
+        let mut page = HeapPage::init(&mut buf);
+        page.recover_slot(SlotId::new(0), b"alpha")
+            .expect("append 0");
+        page.recover_slot(SlotId::new(1), b"bravo")
+            .expect("append 1");
+        assert_eq!(page.slot_count(), 2);
+        assert_eq!(page.get(SlotId::new(0)), Some(&b"alpha"[..]));
+        assert_eq!(page.get(SlotId::new(1)), Some(&b"bravo"[..]));
+    }
+
+    #[test]
+    fn recover_slot_overwrites_existing_slot() {
+        let mut buf = fresh_page();
+        let mut page = HeapPage::init(&mut buf);
+        let id = page.insert(b"original").expect("insert");
+        // Overwrite with a longer image (forces a relocation in the free
+        // region; old bytes become dead space).
+        page.recover_slot(id, b"a much longer replacement value")
+            .expect("overwrite");
+        assert_eq!(page.get(id), Some(&b"a much longer replacement value"[..]));
+        assert_eq!(page.slot_count(), 1);
+    }
+
+    #[test]
+    fn recover_slot_empty_image_tombstones() {
+        let mut buf = fresh_page();
+        let mut page = HeapPage::init(&mut buf);
+        let id = page.insert(b"doomed").expect("insert");
+        page.recover_slot(id, b"").expect("tombstone");
+        assert_eq!(page.get(id), None);
+        // Slot count preserved (tombstone, not removal).
+        assert_eq!(page.slot_count(), 1);
+    }
+
+    #[test]
+    fn recover_slot_rejects_gap() {
+        let mut buf = fresh_page();
+        let mut page = HeapPage::init(&mut buf);
+        // slot_count is 0; asking for slot 3 is a gap.
+        let err = page.recover_slot(SlotId::new(3), b"x").expect_err("gap");
+        assert!(matches!(
+            err,
+            StorageError::InvalidSlot {
+                slot: 3,
+                slot_count: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn recover_slot_reproduces_insert_slot_ids_in_order() {
+        // Replaying logged inserts in order must reproduce the same slot
+        // ids the original insert sequence assigned. This is the property
+        // WAL redo relies on.
+        let mut orig_buf = fresh_page();
+        let mut orig = HeapPage::init(&mut orig_buf);
+        let mut logged: Vec<(SlotId, Vec<u8>)> = Vec::new();
+        for i in 0..20u32 {
+            let tuple = format!("row-{i}").into_bytes();
+            let id = orig.insert(&tuple).expect("insert");
+            logged.push((id, tuple));
+        }
+
+        // Replay into a fresh page via recover_slot in LSN order.
+        let mut replay_buf = fresh_page();
+        let mut replay = HeapPage::init(&mut replay_buf);
+        for (id, tuple) in &logged {
+            replay.recover_slot(*id, tuple).expect("replay");
+        }
+
+        // Both pages must read identically.
+        for (id, tuple) in &logged {
+            assert_eq!(replay.get(*id), Some(tuple.as_slice()));
+            assert_eq!(orig.get(*id), replay.get(*id));
+        }
+        assert_eq!(orig.slot_count(), replay.slot_count());
     }
 }

@@ -313,6 +313,28 @@ impl BufferPool {
         ))
     }
 
+    /// Number of pages currently allocated in the underlying file.
+    #[must_use]
+    pub fn page_count(&self) -> u64 {
+        self.file.borrow().page_count()
+    }
+
+    /// Ensure the file has a page with `id`, extending it with zero pages
+    /// if necessary, then return a write guard over it.
+    ///
+    /// Used by WAL recovery: after a crash the data file may have fewer
+    /// pages than the log references (a page was allocated in memory but
+    /// never flushed). Redo calls this so it can re-apply mutations to a
+    /// page that does not yet exist on disk. Newly created pages are zero,
+    /// which reads back as a `PageType::Free` page with LSN 0, so redo's
+    /// page-LSN gate will always re-apply the first logged mutation.
+    pub fn ensure_allocated(&self, id: PageId) -> Result<PageWriteGuard<'_>> {
+        while self.file.borrow().page_count() <= id.get() {
+            self.file.borrow_mut().allocate_page()?;
+        }
+        self.fetch_page_mut(id)
+    }
+
     /// Flush the page with `id` if it's resident and dirty. Issues an
     /// fsync at the end either way. Enforces WAL ordering when a WAL hook
     /// is configured.
