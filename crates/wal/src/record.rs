@@ -94,6 +94,31 @@ pub enum LogRecord {
     Commit,
     /// `ABORT T` marker.
     Abort,
+    /// Fuzzy checkpoint. Records the set of transactions active at
+    /// checkpoint time so analysis can start mid-log instead of from byte
+    /// zero. Sprint 4 stores only the active txn table (no dirty page
+    /// table yet); recovery falls back to scanning from the start when no
+    /// checkpoint is present.
+    Checkpoint {
+        /// `(txn_id, last_lsn)` for each transaction active at checkpoint.
+        active_txns: Vec<(u64, u64)>,
+    },
+    /// Compensation log record, written during undo. Redo-only: a CLR is
+    /// replayed by redo but is never itself undone. `undo_next` chains to
+    /// the next record to undo for this transaction, which makes undo
+    /// idempotent across repeated crashes.
+    Clr {
+        /// Page the undo touched.
+        page_id: u64,
+        /// Slot within that page.
+        slot_id: u16,
+        /// Bytes to restore (the before-image of the undone update). Empty
+        /// means tombstone the slot (undo of an insert).
+        undo_image: Vec<u8>,
+        /// LSN to undo next for this txn (the undone record's `prev_lsn`),
+        /// or [`Lsn::INVALID`](crate::Lsn::INVALID) when nothing remains.
+        undo_next: u64,
+    },
 }
 
 impl LogRecord {
@@ -105,6 +130,8 @@ impl LogRecord {
             Self::Update { .. } => RecordKind::Update,
             Self::Commit => RecordKind::Commit,
             Self::Abort => RecordKind::Abort,
+            Self::Checkpoint { .. } => RecordKind::Checkpoint,
+            Self::Clr { .. } => RecordKind::Clr,
         }
     }
 
@@ -139,6 +166,27 @@ impl LogRecord {
                 let after_len = u16::try_from(after.len()).expect("Update after-image fits in u16");
                 out.extend_from_slice(&after_len.to_le_bytes());
                 out.extend_from_slice(after);
+            }
+            Self::Checkpoint { active_txns } => {
+                let count = u32::try_from(active_txns.len()).expect("active txn count fits in u32");
+                out.extend_from_slice(&count.to_le_bytes());
+                for (txn_id, last_lsn) in active_txns {
+                    out.extend_from_slice(&txn_id.to_le_bytes());
+                    out.extend_from_slice(&last_lsn.to_le_bytes());
+                }
+            }
+            Self::Clr {
+                page_id,
+                slot_id,
+                undo_image,
+                undo_next,
+            } => {
+                out.extend_from_slice(&page_id.to_le_bytes());
+                out.extend_from_slice(&slot_id.to_le_bytes());
+                out.extend_from_slice(&undo_next.to_le_bytes());
+                let img_len = u16::try_from(undo_image.len()).expect("CLR undo image fits in u16");
+                out.extend_from_slice(&img_len.to_le_bytes());
+                out.extend_from_slice(undo_image);
             }
         }
 
@@ -206,6 +254,15 @@ impl LogRecord {
         };
 
         let payload = &buf[PAYLOAD_OFFSET..trailer_offset];
+        let record = Self::decode_payload(kind, payload)?;
+        Ok((header, record))
+    }
+
+    /// Decode the per-kind payload bytes (everything between the fixed
+    /// header and the checksum trailer) into a `LogRecord`. The header
+    /// fields and checksum are validated by [`read`](Self::read) before
+    /// this is called.
+    fn decode_payload(kind: RecordKind, payload: &[u8]) -> Result<Self> {
         let record = match kind {
             RecordKind::Begin => Self::Begin,
             RecordKind::Commit => Self::Commit,
@@ -231,14 +288,61 @@ impl LogRecord {
                     after,
                 }
             }
-            RecordKind::Checkpoint | RecordKind::Clr => {
-                // Sprint 4 will land the real payloads. For now treat as
-                // an unknown variant on the read side so we don't
-                // silently accept malformed entries.
-                return Err(WalError::UnknownRecordType(kind as u8));
-            }
+            RecordKind::Checkpoint => Self::decode_checkpoint(payload)?,
+            RecordKind::Clr => Self::decode_clr(payload)?,
         };
-        Ok((header, record))
+        Ok(record)
+    }
+
+    fn decode_checkpoint(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 4 {
+            return Err(WalError::PayloadTruncated {
+                expected: 4,
+                available: payload.len(),
+            });
+        }
+        let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+        let needed = 4 + count * 16;
+        if payload.len() < needed {
+            return Err(WalError::PayloadTruncated {
+                expected: needed,
+                available: payload.len(),
+            });
+        }
+        let mut active_txns = Vec::with_capacity(count);
+        let mut cursor = 4;
+        for _ in 0..count {
+            let txn_id =
+                u64::from_le_bytes(payload[cursor..cursor + 8].try_into().expect("8 bytes"));
+            let last_lsn = u64::from_le_bytes(
+                payload[cursor + 8..cursor + 16]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            active_txns.push((txn_id, last_lsn));
+            cursor += 16;
+        }
+        Ok(Self::Checkpoint { active_txns })
+    }
+
+    fn decode_clr(payload: &[u8]) -> Result<Self> {
+        // page_id (8) + slot_id (2) + undo_next (8) = 18 fixed.
+        if payload.len() < 18 {
+            return Err(WalError::PayloadTruncated {
+                expected: 18,
+                available: payload.len(),
+            });
+        }
+        let page_id = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+        let slot_id = u16::from_le_bytes(payload[8..10].try_into().expect("2 bytes"));
+        let undo_next = u64::from_le_bytes(payload[10..18].try_into().expect("8 bytes"));
+        let (undo_image, _) = read_length_prefixed(&payload[18..])?;
+        Ok(Self::Clr {
+            page_id,
+            slot_id,
+            undo_image,
+            undo_next,
+        })
     }
 }
 
@@ -464,19 +568,81 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_and_clr_rejected_on_read() {
-        // For Sprint 3 we treat these as "not yet implemented" on the
-        // read side. They have known type bytes but no payload schema.
+    fn checkpoint_round_trips_with_active_txns() {
+        let r = LogRecord::Checkpoint {
+            active_txns: vec![(7, 100), (9, 142), (12, 7)],
+        };
+        let (hdr, rec) = round_trip(&r, 200, 199, 0);
+        assert_eq!(hdr.kind, RecordKind::Checkpoint);
+        assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn checkpoint_empty_active_list_round_trips() {
+        let r = LogRecord::Checkpoint {
+            active_txns: vec![],
+        };
+        let (_hdr, rec) = round_trip(&r, 1, Lsn::INVALID.get(), 0);
+        assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn clr_round_trips() {
+        let r = LogRecord::Clr {
+            page_id: 0x1234_5678,
+            slot_id: 9,
+            undo_image: b"restore me".to_vec(),
+            undo_next: 41,
+        };
+        let (hdr, rec) = round_trip(&r, 50, 49, 6);
+        assert_eq!(hdr.kind, RecordKind::Clr);
+        assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn clr_empty_undo_image_round_trips() {
+        // Empty undo image = undo of an insert (tombstone the slot).
+        let r = LogRecord::Clr {
+            page_id: 3,
+            slot_id: 0,
+            undo_image: vec![],
+            undo_next: Lsn::INVALID.get(),
+        };
+        let (_hdr, rec) = round_trip(&r, 5, 4, 2);
+        assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn truncated_checkpoint_payload_rejected() {
+        let r = LogRecord::Checkpoint {
+            active_txns: vec![(1, 2), (3, 4)],
+        };
         let mut buf = Vec::new();
-        LogRecord::Begin.write(lsn(1), Lsn::INVALID, txn(1), &mut buf);
-        buf[TYPE_OFFSET] = RecordKind::Checkpoint as u8;
+        r.write(lsn(1), Lsn::INVALID, txn(0), &mut buf);
+        // Drop the last 8 bytes (half of the second pair), patch length +
+        // checksum so the inner truncation check fires.
+        buf.truncate(buf.len() - 8);
+        let new_len = u32::try_from(buf.len()).unwrap();
+        buf[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&new_len.to_le_bytes());
         let trailer_offset = buf.len() - TRAILER_BYTES;
         let new_crc = crc32(&buf[..trailer_offset]);
         buf[trailer_offset..].copy_from_slice(&new_crc.to_le_bytes());
-        let err = LogRecord::read(&buf).expect_err("must reject");
-        assert!(matches!(
-            err,
-            WalError::UnknownRecordType(v) if v == RecordKind::Checkpoint as u8
-        ));
+        let err = LogRecord::read(&buf).expect_err("must error");
+        assert!(matches!(err, WalError::PayloadTruncated { .. }));
+    }
+
+    #[test]
+    fn clr_checksum_corruption_detected() {
+        let r = LogRecord::Clr {
+            page_id: 1,
+            slot_id: 2,
+            undo_image: vec![9, 9, 9],
+            undo_next: 0,
+        };
+        let mut buf = Vec::new();
+        r.write(lsn(1), Lsn::INVALID, txn(1), &mut buf);
+        buf[PAYLOAD_OFFSET] ^= 0xFF;
+        let err = LogRecord::read(&buf).expect_err("must error");
+        assert!(matches!(err, WalError::ChecksumMismatch));
     }
 }
