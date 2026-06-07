@@ -22,8 +22,8 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 1 | Storage I: file manager, page header + CRC32, slotted page, proptests | ✅ shipped (PRs #7–#10) |
 | 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17–#21) |
 | 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27–#31) |
-| 4 | ARIES recovery (analysis + redo + undo + torture test) | ⏳ next |
-| 5–6 | Transactions + MVCC | ⏳ |
+| 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37–#42) |
+| 5–6 | Transactions + MVCC | ⏳ next |
 | 7–9 | SQL parser → planner → executor | ⏳ |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
@@ -231,15 +231,29 @@ Original log record sketch (kept for reference):
 └────────────────────────────────────────────────┘
 ```
 
-### Three-phase recovery (ARIES)
+### Three-phase recovery (ARIES) — Sprint 4, shipped
 
-1. **Analysis.** Scan from last checkpoint, rebuild the active transaction table + dirty page table.
-2. **Redo.** Replay every log record from the earliest dirty-page recovery LSN forward, applying any update whose page LSN < record LSN.
-3. **Undo.** For every transaction still active at crash time, walk back via `prev_lsn` and write compensation log records (CLRs).
+Implemented in `crates/wal/src/recovery.rs`. `recover(pool, wal_path)` runs all three phases and returns a `RecoveryStats { winners, losers, redone, undone }`.
+
+1. **Analysis** (`analyze`). Scan the WAL forward and rebuild the transaction table: each transaction's last LSN and whether it committed. Committed transactions are *winners*; everything else is a *loser*. Sprint 4 scans from the start of the log (the dirty page table optimization is deferred — see below).
+2. **Redo** (`redo`). Replay history: re-apply every `Update` after-image and every `Clr` undo-image to its page, but only when the page's stored LSN is strictly less than the record's LSN (the page-LSN gate). This makes redo idempotent. Redo runs for winners and losers alike so undo starts from a known state. Pages the crashed data file never persisted are materialized via `BufferPool::ensure_allocated`.
+3. **Undo** (`undo`). For each loser, walk its `prev_lsn` chain backward from its last LSN. Revert each `Update` by applying its before-image, and append a fsync'd CLR whose `undo_next` points at the next record to undo. CLRs left by a prior crashed undo are skipped straight to their `undo_next`; a loser already ending in `Abort` is skipped entirely.
+
+### Why CLRs
+
+A CLR (compensation log record) is **redo-only**: redo replays it, undo never undoes it. `undo_next` chains the rollback so that a crash *during* undo is safe — re-recovery replays the CLRs already on disk (idempotent via the page-LSN gate) and resumes undo from the last CLR's `undo_next` instead of re-reverting compensated work. This is what makes the whole recovery process idempotent: running it twice, or crashing partway through and rerunning, converges to the same state.
+
+### Crash model and the torture test
+
+The graded requirement is a forced crash with no committed data loss. Two layers prove it:
+- **In-process** (`crates/wal/tests/recovery_integration.rs`): drive a `MiniHeap` workload, drop the buffer pool *without* flushing (dirty pages lost, only the fsync'd WAL survives — exactly what a kill does to unflushed pages), recover, assert committed rows survive and uncommitted rows are rolled back.
+- **Forced process kill** (`crates/wal/tests/torture.rs` + the `crash_harness` binary): spawn a child process that commits rows forever and records each durably-committed row to a ground-truth file *after* its commit is on disk, then hard-kill it (`TerminateProcess` on Windows / `SIGKILL`), recover, and assert every ground-truth row is present. Runs several rounds so the kill lands at different points.
+
+`MiniHeap` (`crates/wal/src/workload.rs`) is the recoverable workload harness standing in for the not-yet-built SQL executor: begin / insert / update / delete / commit / abort, logging WAL-before-page and stamping each page's LSN exactly the way recovery expects to replay it.
 
 ### Invariant (WAL ordering)
 
-A dirty page cannot be flushed before its corresponding log records are fsync'd. Enforced by the buffer pool's flush path: before write-back, look up the page's LSN, ensure WAL has fsync'd through that LSN.
+A dirty page cannot be flushed before its corresponding log records are fsync'd. Enforced by the buffer pool's flush path: before write-back, it calls the WAL hook to fsync through the page's stored LSN.
 
 ---
 
@@ -277,7 +291,7 @@ Target subset:
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
 - **Property tests** via `proptest` in `crates/storage/tests/proptests.rs`. Covers header round-trip, full checksum bit-flip sweep (8 KiB × 8 bits = 65K flips per case), insert/delete/compact op-sequence invariants against an oracle, file manager durability across reopen.
-- **Crash-recovery torture test** (Sprint 10): kill the process at random points during a WAL-heavy write workload, restart, verify the database is consistent with the committed transactions.
+- **Crash-recovery torture test** (Sprint 4, shipped): `crates/wal/tests/torture.rs` spawns the `crash_harness` binary, force-kills it mid-write, recovers, and asserts no committed row is lost. Runs several rounds. A polish pass in Sprint 10 will extend the run length and add a long-soak variant.
 - CI bumps `PROPTEST_CASES=512` (local default 256).
 
 ---
@@ -295,15 +309,19 @@ Resolved during Sprint 2/3 (moved to relevant sections above):
 - ~~Buffer pool replacement~~: LRU-K with K=2.
 - ~~WAL record field ordering~~: locked (length, type, lsn, txn, prev_lsn, payload, checksum).
 
+Resolved during Sprint 4 (moved to relevant sections above):
+- ~~CLR granularity~~: one CLR per undo step, with `undo_next` chaining for crash-safe, idempotent rollback.
+- ~~Recovery start point~~: scan from the start of the WAL. The dirty-page-table optimization (start redo at the earliest recovery LSN) is deferred — with no long-running server, a full scan is fast and far simpler to reason about. The `Checkpoint` record type exists and carries the active txn table so adding a checkpoint-bounded analysis later is additive.
+- ~~Crash model for testing~~: forced process kill of a child harness, plus an in-process "drop the pool without flushing" simulation.
+
 Still open (resolve before the relevant sprint):
 
 | Question | When to resolve |
 |---|---|
 | Free-space tracking: per-page free-space map, or scan-on-demand? | Sprint 5 (executor needs it) |
 | MVCC garbage collection: epoch-based or vacuum scan? | Sprint 6 |
-| Checkpoint strategy: fuzzy vs sharp? | Sprint 4 |
-| Checkpoint frequency: time-based, transaction-count-based, or WAL-size-based? | Sprint 4 |
-| Compensation log records (CLR): write per-undo-step or per-aborted-txn? | Sprint 4 |
+| Checkpoint strategy: fuzzy vs sharp, and frequency (time / txn-count / WAL-size)? | Sprint 5 (when there is a long-running server to checkpoint) |
+| Page checksum maintenance on the write path (recompute on flush)? | Sprint 5 |
 | Group commit: batch fsync across multiple committers? | Sprint 5 (txn manager) |
 | Isolation levels above SI: ship Serializable (SSI) or stop at SI? | Sprint 6 |
 
