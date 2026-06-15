@@ -484,10 +484,6 @@ and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
 
 ### Known limitations (tracked, not gaps in M1)
 
-- `ORDER BY` resolves against the projected columns, because the planner puts
-  `Sort` above `Project`. Ordering by a column that is not in the select list
-  is not yet supported; the fix is to let the sort see the pre-projection
-  input.
 - `IndexScan` executes as a full scan with a residual filter (correct, not yet
   faster); the physical index lookup lands with the index-scan work.
 - The catalog is in-memory per session. A reopened database does not yet

@@ -64,18 +64,10 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         };
     }
 
-    // 4. Projection. Resolve every projected expression; `*` needs nothing.
-    for item in &select.projections {
-        if let SelectItem::Expr(expr, _) = item {
-            resolve_expr(expr, &scope)?;
-        }
-    }
-    plan = LogicalPlan::Project {
-        items: select.projections.clone(),
-        input: Box::new(plan),
-    };
-
-    // 5. ORDER BY.
+    // 4. ORDER BY. Placed *below* the projection so a sort key can be any
+    //    column in scope, not only the projected ones (SQL allows ORDER BY on
+    //    columns absent from the SELECT list). The projection above preserves
+    //    row order, so the final output is still sorted.
     if !select.order_by.is_empty() {
         let mut keys = Vec::with_capacity(select.order_by.len());
         for item in &select.order_by {
@@ -87,6 +79,17 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
             input: Box::new(plan),
         };
     }
+
+    // 5. Projection. Resolve every projected expression; `*` needs nothing.
+    for item in &select.projections {
+        if let SelectItem::Expr(expr, _) = item {
+            resolve_expr(expr, &scope)?;
+        }
+    }
+    plan = LogicalPlan::Project {
+        items: select.projections.clone(),
+        input: Box::new(plan),
+    };
 
     // 6. LIMIT.
     if let Some(n) = select.limit {
@@ -224,13 +227,14 @@ mod tests {
 
     #[test]
     fn clause_order_is_canonical() {
-        // Limit { Sort { Project { Aggregate { Filter { Scan } } } } }
+        // Limit { Project { Sort { Aggregate { Filter { Scan } } } } }
+        // Sort sits below Project so ORDER BY can reference any in-scope column.
         let p = plan("SELECT id FROM orders WHERE total > 0 GROUP BY id ORDER BY id DESC LIMIT 5");
         let printed = p.to_string();
         let lines: Vec<&str> = printed.lines().map(str::trim_start).collect();
         assert_eq!(lines[0], "Limit 5");
-        assert_eq!(lines[1], "Sort id DESC");
-        assert!(lines[2].starts_with("Project"));
+        assert!(lines[1].starts_with("Project"));
+        assert_eq!(lines[2], "Sort id DESC");
         assert!(lines[3].starts_with("Aggregate GROUP BY"));
         assert!(lines[4].starts_with("Filter"));
         assert!(lines[5].starts_with("Scan orders"));
