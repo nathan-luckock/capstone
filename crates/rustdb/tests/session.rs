@@ -50,6 +50,31 @@ fn create_insert_select_explain_session() {
 }
 
 #[test]
+fn order_by_a_non_projected_column() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("orderby.db")).expect("open");
+    db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (2, 'b'), (1, 'a'), (3, 'c')")
+        .unwrap();
+
+    // Sort by `id` even though only `name` is selected. This used to fail.
+    match db.execute("SELECT name FROM t ORDER BY id").unwrap() {
+        QueryOutcome::Rows { columns, rows } => {
+            assert_eq!(col_names(&columns), ["name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Text("a".into())],
+                    vec![Value::Text("b".into())],
+                    vec![Value::Text("c".into())],
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn introspection_lists_and_describes_tables() {
     let dir = tempdir().expect("tempdir");
     let mut db = Database::open(dir.path().join("introspect.db")).expect("open");
