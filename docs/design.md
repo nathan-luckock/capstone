@@ -344,10 +344,31 @@ Precedence-climbing (Pratt): a single `parse_bp` plus a binding-power table. Pre
 
 Every AST node has a `Display` that prints canonical SQL, fully parenthesizing expressions. The property test (`tests/proptests.rs`) generates arbitrary ASTs, prints them, re-parses, and asserts equality: `parse(print(ast)) == ast`. The printer and parser are exact inverses by construction, which is the parser's correctness oracle.
 
+### Supported SQL surface
+
+DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` column
+constraints), `CREATE INDEX`, and `DROP TABLE`. DML is `INSERT` (multi-row),
+`UPDATE`, and `DELETE`. Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`.
+`SELECT` covers:
+
+- Projections with `AS` aliases, `*`, and arbitrary expressions.
+- `WHERE` over the full expression grammar.
+- `INNER JOIN` and `LEFT JOIN` with `ON`.
+- `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, and `HAVING`.
+- `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`), `LIMIT`, and `OFFSET`.
+- `EXPLAIN` of any of the above.
+
+The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
+arithmetic with int-to-float promotion, comparison and boolean logic with
+three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
+`IS NULL` (each negatable), `CASE` (searched and simple), string concatenation
+(`||`), and the scalar functions `LENGTH`, `UPPER`, `LOWER`, `ABS`, `ROUND`,
+`CONCAT`, `COALESCE`, and `NULLIF`.
+
 ### Scope and deferrals
 
 - The parser is **schema-free**: it enforces grammar only. Semantic checks (INSERT column/value arity, unknown columns, type errors) are the planner's job, since they need the catalog.
-- Subqueries, `HAVING`, set operations (`UNION`), and right/full outer joins are out of scope for the capstone.
+- Subqueries, set operations (`UNION`), `COUNT(DISTINCT ...)`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use.
 
 ---
 
