@@ -25,6 +25,9 @@ pub enum DbError {
     /// A write-ahead-log failure.
     #[error(transparent)]
     Wal(#[from] rustdb_wal::WalError),
+    /// An I/O failure reading or writing the catalog sidecar.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// A statement named a table the catalog does not have.
     #[error("unknown table: {0}")]
     UnknownTable(String),
