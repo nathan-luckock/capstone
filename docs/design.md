@@ -33,7 +33,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 6 | MVCC polish: write-write conflict detection, version garbage collection | Deferred |
 | 7 | SQL parser: lexer, Pratt expressions, DDL, DML, SELECT with JOIN/GROUP/ORDER/LIMIT | Shipped (PRs #62-#67) |
 | 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | Shipped (PRs #73-#77) |
-| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, CLI | Shipped (PRs #85-#97); real index scan and catalog persistence remain |
+| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, catalog persistence, CLI | Shipped (PRs #85-#99); a true index-scan runtime path remains |
 | 10 | Torture-test extension and polish | Planned |
 | 11 | Demo, write-up, and presentation | Planned |
 
@@ -475,6 +475,16 @@ backing `MvccTable`; `INSERT` encodes each row and stores it under an
 auto-increment rowid in one auto-commit transaction; `SELECT` binds, plans,
 and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
 
+After each statement that changes the schema or a table's data, the engine
+flushes every dirty page to the data file and rewrites a catalog sidecar
+(`<base>.meta`) recording, per table, the columns, indexes, the index B+ tree
+root page, the current version heap page, and the next rowid. On open the
+engine reads the sidecar to rebuild the catalog and the per-table descriptors,
+so the existing on-disk pages are reachable again. The sidecar is written
+atomically (temp file, then rename), so an interrupted write never leaves a
+half-written catalog. This is what makes a table and its rows survive closing
+and reopening the database.
+
 ### Design decisions
 
 - **Tables are reopened per operation, not stored.** An `MvccTable` borrows
@@ -499,9 +509,12 @@ and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
 - Both join algorithms run through the nested-loop executor. The result is
   correct and the planner's hash-vs-loop choice is shown by EXPLAIN; the hash
   build/probe is a deferred runtime optimization, exactly like the index scan.
-- The catalog is in-memory per session. A reopened database does not yet
-  rediscover its tables; a persisted system catalog is the next durability
-  step. Raw page durability is already provided by the WAL.
+- Schema and data survive a clean restart (flush plus catalog sidecar). Full
+  crash-consistency at the SQL level, where the index pages are rebuilt from
+  the WAL after a mid-statement kill, is the remaining durability step: the
+  WAL currently logs heap version writes but not B+ tree index pages, so the
+  raw forced-kill recovery (proven in Sprint 4) covers the heap, while the
+  index relies on the per-statement flush.
 
 ### CLI
 

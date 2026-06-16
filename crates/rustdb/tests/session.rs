@@ -174,6 +174,60 @@ fn group_by_and_whole_table_aggregates() {
 }
 
 #[test]
+fn data_and_schema_survive_a_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("persist.db");
+
+    // Session one: create a table and index, insert, then drop the handle.
+    {
+        let mut db = Database::open(&path).expect("open");
+        db.execute("CREATE TABLE parts (id INT, name TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx ON parts (id)").unwrap();
+        db.execute("INSERT INTO parts (id, name) VALUES (1, 'nut'), (2, 'bolt')")
+            .unwrap();
+    }
+
+    // Session two: reopen the same path. The catalog and rows are back.
+    let mut db = Database::open(&path).expect("reopen");
+    assert_eq!(db.table_names(), vec!["parts".to_string()]);
+    assert_eq!(db.columns("parts").expect("columns").len(), 2);
+
+    match db
+        .execute("SELECT id, name FROM parts ORDER BY id")
+        .unwrap()
+    {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int(1), Value::Text("nut".into())],
+                    vec![Value::Int(2), Value::Text("bolt".into())],
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // The rowid counter persisted too, so a new insert does not collide.
+    db.execute("INSERT INTO parts (id, name) VALUES (3, 'washer')")
+        .unwrap();
+    match db.execute("SELECT id FROM parts ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int(1)],
+                    vec![Value::Int(2)],
+                    vec![Value::Int(3)]
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn introspection_lists_and_describes_tables() {
     let dir = tempdir().expect("tempdir");
     let mut db = Database::open(dir.path().join("introspect.db")).expect("open");

@@ -17,25 +17,27 @@
 //! for the duration of each operation via [`MvccTable::open`]. After a write,
 //! the (possibly changed) anchor pages are read back and persisted.
 //!
-//! # Scope
+//! # Persistence
 //!
-//! This change delivers in-session CREATE / DROP / INSERT. SELECT arrives
-//! with the executor. The catalog is in-memory and rebuilt per session;
-//! persisting the schema so a reopened database rediscovers its tables is a
-//! later polish item.
+//! The catalog and the per-table anchor pages are persisted to a sidecar
+//! file (see [`crate::persist`]) after each statement that changes the schema
+//! or a table's data, and the buffer pool is flushed at the same time. On
+//! open the sidecar is read back to rebuild the catalog and descriptors, so a
+//! table and its rows survive closing and reopening the database.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
 use rustdb_planner::{bind, explain, plan, Catalog};
-use rustdb_sql::statement::DataType;
+use rustdb_sql::statement::{ColumnDef, DataType};
 use rustdb_sql::{Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
 use rustdb_wal::{WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
+use crate::persist::{self, TableRecord};
 
 /// Buffer pool size in pages. Generous for the capstone's working set.
 const POOL_PAGES: usize = 256;
@@ -81,6 +83,8 @@ pub struct Database {
     mgr: TransactionManager,
     catalog: Catalog,
     tables: HashMap<String, TableStore>,
+    /// Sidecar file recording the catalog and per-table anchor pages.
+    meta_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -102,17 +106,90 @@ impl Database {
     pub fn open(base: impl AsRef<Path>) -> Result<Self> {
         let base = base.as_ref();
         let wal_path = base.with_extension("wal");
+        let meta_path = base.with_extension("meta");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
         let pool = BufferPool::with_wal(file, POOL_PAGES, wal.as_hook());
-        Ok(Self {
+        let mut db = Self {
             pool,
             wal,
             mgr: TransactionManager::new(),
             catalog: Catalog::new(),
             tables: HashMap::new(),
-        })
+            meta_path,
+        };
+        db.load_catalog()?;
+        Ok(db)
+    }
+
+    /// Rebuild the catalog and table descriptors from the sidecar so the
+    /// existing on-disk pages are reachable again.
+    fn load_catalog(&mut self) -> Result<()> {
+        for r in persist::load(&self.meta_path)? {
+            let columns: Vec<ColumnDef> = r
+                .columns
+                .iter()
+                .map(|(name, ty, primary_key)| ColumnDef {
+                    name: name.clone(),
+                    ty: *ty,
+                    primary_key: *primary_key,
+                })
+                .collect();
+            self.catalog.apply(&Statement::CreateTable {
+                name: r.name.clone(),
+                columns,
+            })?;
+            for (index, column) in &r.indexes {
+                self.catalog.apply(&Statement::CreateIndex {
+                    name: index.clone(),
+                    table: r.name.clone(),
+                    column: column.clone(),
+                })?;
+            }
+            self.catalog.set_row_count(&r.name, r.next_rowid)?;
+            self.tables.insert(
+                r.name.clone(),
+                TableStore {
+                    index_root: PageId(r.index_root),
+                    version_page: PageId(r.version_page),
+                    next_rowid: r.next_rowid,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Flush every dirty page to the data file and rewrite the catalog
+    /// sidecar, so the database is durable across a clean restart. Called
+    /// after each statement that changes the schema or a table's data.
+    fn persist(&self) -> Result<()> {
+        self.pool.flush_all()?;
+        let records: Vec<TableRecord> = self
+            .tables
+            .iter()
+            .filter_map(|(name, store)| {
+                let meta = self.catalog.get_table(name)?;
+                Some(TableRecord {
+                    name: name.clone(),
+                    columns: meta
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.ty, c.primary_key))
+                        .collect(),
+                    indexes: meta
+                        .indexes
+                        .iter()
+                        .map(|i| (i.name.clone(), i.column.clone()))
+                        .collect(),
+                    index_root: store.index_root.0,
+                    version_page: store.version_page.0,
+                    next_rowid: store.next_rowid,
+                })
+            })
+            .collect();
+        persist::save(&self.meta_path, &records)?;
+        Ok(())
     }
 
     /// Parse and run one SQL statement.
@@ -128,6 +205,7 @@ impl Database {
             Statement::CreateTable { .. } => self.create_table(&stmt),
             Statement::CreateIndex { .. } => {
                 self.catalog.apply(&stmt)?;
+                self.persist()?;
                 Ok(QueryOutcome::Ddl)
             }
             Statement::DropTable { ref name } => self.drop_table(&stmt, name),
@@ -181,12 +259,14 @@ impl Database {
             next_rowid: 0,
         };
         self.tables.insert(name.clone(), store);
+        self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
 
     fn drop_table(&mut self, stmt: &Statement, name: &str) -> Result<QueryOutcome> {
         self.catalog.apply(stmt)?;
         self.tables.remove(name);
+        self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
 
@@ -262,6 +342,7 @@ impl Database {
         // show true costs instead of zero.
         let row_count = store.next_rowid;
         self.catalog.set_row_count(table, row_count)?;
+        self.persist()?;
         Ok(QueryOutcome::Mutation { affected })
     }
 
