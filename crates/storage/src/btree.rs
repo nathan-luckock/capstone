@@ -790,6 +790,40 @@ impl<'pool> BTree<'pool> {
         self.insert(key, tuple)
     }
 
+    /// Delete `key`. Returns the removed `TupleRef`, or `BTreeKeyNotFound`
+    /// if the key is absent.
+    ///
+    /// Leaves are not rebalanced or merged on delete: an emptied slot is
+    /// simply removed and the leaf holds fewer entries. This keeps deletion
+    /// a single O(log n) walk, which is all a secondary index needs. The
+    /// tree stays correct and searchable; it just may hold more pages than a
+    /// compacting tree would after many deletes. The MVCC primary index never
+    /// removes keys (deletes are tombstone versions), so only secondary
+    /// indexes exercise this path.
+    pub fn delete(&self, key: u64) -> Result<TupleRef> {
+        let mut current = self.root.get();
+        let leaf_id = loop {
+            let guard = self.pool.fetch_page(current)?;
+            let header = PageHeader::read(guard.page())?;
+            match header.page_type {
+                PageType::BTreeLeaf => break current,
+                PageType::BTreeInternal => {
+                    let internal = InternalView::new(guard.page())?;
+                    current = internal.find_child(key);
+                }
+                other => {
+                    return Err(StorageError::WrongPageType {
+                        expected: PageType::BTreeLeaf,
+                        actual: other,
+                    });
+                }
+            }
+        };
+        let mut guard = self.pool.fetch_page_mut(leaf_id)?;
+        let mut leaf = LeafPage::from_bytes(guard.page_mut())?;
+        leaf.delete(key)
+    }
+
     /// Insert `(key, tuple)`. Splits and propagates as needed; allocates a
     /// new root when the existing root splits.
     pub fn insert(&self, key: u64, tuple: TupleRef) -> Result<()> {
@@ -1505,6 +1539,78 @@ mod tests {
         let err = tree.insert(42, tr(1)).expect_err("dup");
         assert!(matches!(err, StorageError::DuplicateBTreeKey(42)));
         assert_eq!(tree.search(42).expect("search"), Some(tr(0)));
+    }
+
+    #[test]
+    fn btree_delete_removes_key_and_keeps_others() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        for (i, k) in [10u64, 20, 30, 5, 15].iter().enumerate() {
+            tree.insert(*k, tr(u16::try_from(i).unwrap()))
+                .expect("insert");
+        }
+        // Delete returns the removed reference (slot 1 was key 20).
+        assert_eq!(tree.delete(20).expect("delete"), tr(1));
+        assert_eq!(tree.search(20).expect("search"), None);
+        // Untouched keys remain.
+        assert_eq!(tree.search(10).expect("search"), Some(tr(0)));
+        assert_eq!(tree.search(30).expect("search"), Some(tr(2)));
+        assert_eq!(tree.search(5).expect("search"), Some(tr(3)));
+        assert_eq!(tree.search(15).expect("search"), Some(tr(4)));
+    }
+
+    #[test]
+    fn btree_delete_absent_key_errors() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        tree.insert(1, tr(0)).expect("insert");
+        let err = tree.delete(99).expect_err("absent");
+        assert!(matches!(err, StorageError::BTreeKeyNotFound(99)));
+    }
+
+    #[test]
+    fn btree_delete_then_reinsert_same_key() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        tree.insert(7, tr(0)).expect("insert");
+        tree.delete(7).expect("delete");
+        // The key is gone, so re-inserting it is not a duplicate.
+        tree.insert(7, tr(9)).expect("reinsert");
+        assert_eq!(tree.search(7).expect("search"), Some(tr(9)));
+    }
+
+    #[test]
+    fn btree_delete_across_internal_nodes_after_split() {
+        // Force a split so the tree has an internal root, then delete a key
+        // that lives in a non-root leaf: the delete must traverse down.
+        let (_dir, pool) = fresh_tree(64);
+        let tree = BTree::create(&pool).expect("create");
+        let n: u64 = 2_000;
+        for k in 0..n {
+            tree.insert(k, tr(u16::try_from(k % 1000).unwrap()))
+                .expect("insert");
+        }
+        // Confirm the root really is internal (we split).
+        let g = pool.fetch_page(tree.root_page()).expect("root");
+        assert_eq!(
+            PageHeader::read(g.page()).expect("hdr").page_type,
+            PageType::BTreeInternal,
+        );
+        drop(g);
+        // Delete a spread of keys and check they are gone while neighbours stay.
+        for k in (0..n).step_by(137) {
+            tree.delete(k).expect("delete");
+        }
+        for k in (0..n).step_by(137) {
+            assert_eq!(tree.search(k).expect("search"), None, "key {k}");
+            if k + 1 < n && (k + 1) % 137 != 0 {
+                assert!(
+                    tree.search(k + 1).expect("search").is_some(),
+                    "key {}",
+                    k + 1
+                );
+            }
+        }
     }
 
     #[test]
