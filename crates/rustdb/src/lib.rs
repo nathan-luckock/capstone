@@ -16,5 +16,6 @@ pub use error::{DbError, Result};
 
 // Re-export the value and type vocabulary so callers (the CLI, a future HTTP
 // API) can render results without depending on the SQL crate directly.
+pub use rustdb_sql::datetime;
 pub use rustdb_sql::statement::DataType;
 pub use rustdb_sql::Value;

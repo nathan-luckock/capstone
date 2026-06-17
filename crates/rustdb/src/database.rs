@@ -2080,6 +2080,12 @@ impl Database {
                 values[*idx] = Value::Int(*next);
                 *next += 1;
             }
+            // Coerce a text value into a DATE / TIMESTAMP column by parsing it,
+            // so `INSERT ... VALUES ('2024-01-15')` lands in a date column.
+            for (i, &ty) in schema.iter().enumerate() {
+                let v = std::mem::replace(&mut values[i], Value::Null);
+                values[i] = coerce_value(v, ty)?;
+            }
             // NOT NULL.
             for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
                 if *not_null && matches!(values[i], Value::Null) {
@@ -2233,7 +2239,10 @@ impl Database {
                                             table: table.to_string(),
                                             column: col.clone(),
                                         })?;
-                                    new_row[idx] = eval(expr, &combined_row, &combined_cols)?;
+                                    new_row[idx] = coerce_value(
+                                        eval(expr, &combined_row, &combined_cols)?,
+                                        schema[idx],
+                                    )?;
                                 }
                                 // Validate the updated row as any written row is.
                                 for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
@@ -2853,7 +2862,7 @@ impl Database {
             // `SET n = n + 1` sees the old value.
             let mut new_row = row.clone();
             for ((_, expr), &pos) in assignments.iter().zip(&targets) {
-                new_row[pos] = eval(expr, &row, &columns)?;
+                new_row[pos] = coerce_value(eval(expr, &row, &columns)?, schema[pos])?;
             }
             for &col in &not_null {
                 if matches!(new_row[col], Value::Null) {
@@ -3252,6 +3261,8 @@ fn csv_field_from_value(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Date(days) => rustdb_sql::datetime::format_date(*days),
+        Value::Timestamp(micros) => rustdb_sql::datetime::format_timestamp(*micros),
         Value::Text(s) => s.clone(),
     }
 }
@@ -3282,6 +3293,15 @@ fn value_from_csv_field(field: &str, ty: DataType) -> Result<Value> {
                 )))
             }
         },
+        DataType::Date => Value::Date(
+            rustdb_sql::datetime::parse_date(field)
+                .ok_or_else(|| DbError::Constraint(format!("invalid date in CSV: {field:?}")))?,
+        ),
+        DataType::Timestamp => {
+            Value::Timestamp(rustdb_sql::datetime::parse_timestamp(field).ok_or_else(|| {
+                DbError::Constraint(format!("invalid timestamp in CSV: {field:?}"))
+            })?)
+        }
         DataType::Text => Value::Text(field.to_string()),
     })
 }
@@ -3295,6 +3315,8 @@ fn column_type(rows: &[Vec<Value>], i: usize) -> DataType {
             Some(Value::Float(_)) => Some(DataType::Float),
             Some(Value::Text(_)) => Some(DataType::Text),
             Some(Value::Bool(_)) => Some(DataType::Bool),
+            Some(Value::Date(_)) => Some(DataType::Date),
+            Some(Value::Timestamp(_)) => Some(DataType::Timestamp),
             _ => None,
         })
         .unwrap_or(DataType::Int)
@@ -3349,6 +3371,14 @@ fn stat_key(value: &Value) -> Vec<u8> {
             b.push(4);
             b.extend_from_slice(&x.to_bits().to_le_bytes());
         }
+        Value::Date(n) => {
+            b.push(5);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Timestamp(n) => {
+            b.push(6);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
     }
     b
 }
@@ -3383,6 +3413,8 @@ const fn sql_type_name(ty: DataType) -> &'static str {
         DataType::Float => "double precision",
         DataType::Bool => "boolean",
         DataType::Text => "text",
+        DataType::Date => "date",
+        DataType::Timestamp => "timestamp without time zone",
     }
 }
 
@@ -3728,6 +3760,25 @@ fn expr_mentions_column(expr: &Expr, col: &str) -> bool {
                 || order_by.iter().any(|o| expr_mentions_column(&o.expr, col))
         }
         _ => false,
+    }
+}
+
+/// Coerce a value to a column's declared type where there is a well-defined
+/// implicit conversion: a text literal into a `DATE` / `TIMESTAMP` (parsed), and
+/// a `DATE` into a `TIMESTAMP` (taken at midnight). Every other value passes
+/// through unchanged for the row codec to type-check.
+fn coerce_value(value: Value, ty: DataType) -> Result<Value> {
+    match (&value, ty) {
+        (Value::Text(s), DataType::Date) => rustdb_sql::datetime::parse_date(s)
+            .map(Value::Date)
+            .ok_or_else(|| DbError::Constraint(format!("invalid date literal {s:?}"))),
+        (Value::Text(s), DataType::Timestamp) => rustdb_sql::datetime::parse_timestamp(s)
+            .map(Value::Timestamp)
+            .ok_or_else(|| DbError::Constraint(format!("invalid timestamp literal {s:?}"))),
+        (Value::Date(days), DataType::Timestamp) => Ok(Value::Timestamp(
+            days * rustdb_sql::datetime::MICROS_PER_DAY,
+        )),
+        _ => Ok(value),
     }
 }
 
@@ -6538,6 +6589,53 @@ mod tests {
                 Value::Float(3.7),
             ]
         );
+    }
+
+    #[test]
+    fn date_and_timestamp_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dt.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE events (id INT, on_day DATE, at_time TIMESTAMP)")
+                .unwrap();
+            // A typed literal, and a bare string coerced into the date column.
+            db.execute(
+                "INSERT INTO events VALUES \
+                 (1, DATE '2024-01-15', TIMESTAMP '2024-01-15 09:30:00'), \
+                 (2, '2023-12-31', '2023-12-31 23:59:59')",
+            )
+            .unwrap();
+            // Dates compare and order as dates, not strings.
+            let (cols, rows) = query(
+                &mut db,
+                "SELECT id, on_day FROM events WHERE on_day < DATE '2024-01-01' ORDER BY on_day",
+            );
+            assert_eq!(names(&cols), ["id", "on_day"]);
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(2), Value::Date(parse_day("2023-12-31"))]]
+            );
+        }
+        // Values survive a reopen (codec + sidecar round-trip).
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT at_time FROM events WHERE id = 1");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Timestamp(parse_micros("2024-01-15 09:30:00"))]]
+        );
+        // An unparseable date is rejected.
+        assert!(db
+            .execute("INSERT INTO events VALUES (3, 'not-a-date', NULL)")
+            .is_err());
+    }
+
+    fn parse_day(s: &str) -> i64 {
+        rustdb_sql::datetime::parse_date(s).expect("date")
+    }
+
+    fn parse_micros(s: &str) -> i64 {
+        rustdb_sql::datetime::parse_timestamp(s).expect("timestamp")
     }
 
     #[test]

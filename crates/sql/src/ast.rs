@@ -28,6 +28,10 @@ pub enum Value {
     Text(String),
     /// Boolean literal.
     Bool(bool),
+    /// A `DATE`, as days from the Unix epoch (1970-01-01).
+    Date(i64),
+    /// A `TIMESTAMP`, as microseconds from the Unix epoch (UTC, no time zone).
+    Timestamp(i64),
     /// SQL `NULL`.
     Null,
 }
@@ -35,7 +39,10 @@ pub enum Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Int(a), Self::Int(b)) => a == b,
+            // Int, Date, and Timestamp are all i64-backed and compare the same.
+            (Self::Int(a), Self::Int(b))
+            | (Self::Date(a), Self::Date(b))
+            | (Self::Timestamp(a), Self::Timestamp(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Text(a), Self::Text(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
@@ -67,6 +74,16 @@ impl fmt::Display for Value {
             }
             Self::Bool(true) => write!(f, "TRUE"),
             Self::Bool(false) => write!(f, "FALSE"),
+            // Typed-literal form, so `parse(print(v)) == v` and a dumped row
+            // re-inserts as the same DATE / TIMESTAMP.
+            Self::Date(days) => write!(f, "DATE '{}'", crate::datetime::format_date(*days)),
+            Self::Timestamp(micros) => {
+                write!(
+                    f,
+                    "TIMESTAMP '{}'",
+                    crate::datetime::format_timestamp(*micros)
+                )
+            }
             Self::Null => write!(f, "NULL"),
         }
     }

@@ -150,6 +150,8 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Float => "FLOAT",
         DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
+        DataType::Date => "DATE",
+        DataType::Timestamp => "TIMESTAMP",
     }
 }
 
@@ -219,6 +221,8 @@ fn fmt_value(v: &Value) -> String {
         Value::Float(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
+        Value::Date(days) => rustdb::datetime::format_date(*days),
+        Value::Timestamp(micros) => rustdb::datetime::format_timestamp(*micros),
         Value::Null => "NULL".to_string(),
     }
 }

@@ -52,9 +52,16 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   script (tables in foreign-key-safe order with their constraints, then
   explicit indexes, views, and an `INSERT` per table) that recreates the whole
   database when run on an empty one. This is rustdb's `pg_dump`.
-- **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with
-  int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string
-  `||`, and a library of scalar functions: string (`LENGTH`, `UPPER` / `LOWER`,
+- **Temporal types** — `DATE` and `TIMESTAMP` columns, with `DATE '2024-01-15'`
+  / `TIMESTAMP '2024-01-15 10:30:00'` typed literals (a bare string is coerced
+  into a temporal column). Stored as an epoch offset (days / microseconds) so
+  they compare, `ORDER BY`, and index as time, not text. The date math is
+  in-tree (no external crate); a column named `date` still works, since the
+  type words are not reserved.
+- **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
+  arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`,
+  `CASE`, string `||`, and a library of scalar functions: string (`LENGTH`,
+  `UPPER` / `LOWER`,
   `INITCAP`, `TRIM` / `LTRIM` / `RTRIM`, `SUBSTR`, `RIGHT`, `REPEAT`, `REVERSE`,
   `REPLACE`, `STRPOS` / `POSITION`, `CONCAT`), numeric (`ABS`, `SIGN`, `MOD`,
   `ROUND`, `TRUNC`, `FLOOR`, `CEIL`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`), and

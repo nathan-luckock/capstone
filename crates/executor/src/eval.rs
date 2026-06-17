@@ -400,6 +400,8 @@ fn value_text(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(x) => x.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Date(days) => rustdb_sql::datetime::format_date(*days),
+        Value::Timestamp(micros) => rustdb_sql::datetime::format_timestamp(*micros),
         Value::Null => String::new(),
     }
 }
@@ -509,7 +511,10 @@ fn truth(v: &Value) -> Result<Option<bool>> {
 #[allow(clippy::cast_precision_loss)]
 fn compare(l: &Value, r: &Value) -> Result<Ordering> {
     match (l, r) {
-        (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+        // Int and the i64-backed temporal types compare by their value.
+        (Value::Int(a), Value::Int(b))
+        | (Value::Date(a), Value::Date(b))
+        | (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Float(a), Value::Float(b)) => Ok(a.total_cmp(b)),
         (Value::Int(a), Value::Float(b)) => Ok((*a as f64).total_cmp(b)),
         (Value::Float(a), Value::Int(b)) => Ok(a.total_cmp(&(*b as f64))),

@@ -37,6 +37,10 @@ const FLOAT8_OID: i32 = 701;
 const BOOL_OID: i32 = 16;
 /// `text` type OID.
 const TEXT_OID: i32 = 25;
+/// `date` type OID.
+const DATE_OID: i32 = 1082;
+/// `timestamp` (without time zone) type OID.
+const TIMESTAMP_OID: i32 = 1114;
 
 /// Protocol version 3.0, sent in the startup message.
 const PROTOCOL_3_0: i32 = 196_608;
@@ -694,6 +698,10 @@ fn value_text(value: &Value) -> Option<Vec<u8>> {
         Value::Float(x) => Some(x.to_string().into_bytes()),
         // Postgres renders booleans as `t` / `f` in text format.
         Value::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
+        Value::Date(days) => Some(rustdb_sql::datetime::format_date(*days).into_bytes()),
+        Value::Timestamp(micros) => {
+            Some(rustdb_sql::datetime::format_timestamp(*micros).into_bytes())
+        }
         Value::Text(s) => Some(s.clone().into_bytes()),
     }
 }
@@ -707,6 +715,8 @@ fn column_oid(rows: &[Vec<Value>], col: usize) -> i32 {
             Some(Value::Float(_)) => return FLOAT8_OID,
             Some(Value::Bool(_)) => return BOOL_OID,
             Some(Value::Text(_)) => return TEXT_OID,
+            Some(Value::Date(_)) => return DATE_OID,
+            Some(Value::Timestamp(_)) => return TIMESTAMP_OID,
             _ => {}
         }
     }
@@ -716,7 +726,8 @@ fn column_oid(rows: &[Vec<Value>], col: usize) -> i32 {
 /// The fixed byte width of a type, or `-1` for variable-length.
 const fn type_size(oid: i32) -> i16 {
     match oid {
-        INT8_OID | FLOAT8_OID => 8,
+        INT8_OID | FLOAT8_OID | TIMESTAMP_OID => 8,
+        DATE_OID => 4,
         BOOL_OID => 1,
         _ => -1,
     }

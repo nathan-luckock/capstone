@@ -158,6 +158,9 @@ fn value_json(v: &Value) -> Json {
         Value::Float(x) => Json::Float(*x),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
+        // JSON has no date type; render the canonical string form.
+        Value::Date(days) => Json::Str(rustdb_sql::datetime::format_date(*days)),
+        Value::Timestamp(micros) => Json::Str(rustdb_sql::datetime::format_timestamp(*micros)),
         Value::Null => Json::Null,
     }
 }
@@ -194,6 +197,8 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Float => "FLOAT",
         DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
+        DataType::Date => "DATE",
+        DataType::Timestamp => "TIMESTAMP",
     }
 }
 

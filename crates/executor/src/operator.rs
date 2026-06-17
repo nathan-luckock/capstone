@@ -260,7 +260,10 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        // Int and the i64-backed temporal types order the same way.
+        (Value::Int(x), Value::Int(y))
+        | (Value::Date(x), Value::Date(y))
+        | (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
         #[allow(clippy::cast_precision_loss)]
         (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y),
@@ -915,6 +918,14 @@ fn group_key_bytes(values: &[Value]) -> Vec<u8> {
                 // land in the same group.
                 b.push(4);
                 b.extend_from_slice(&x.to_bits().to_le_bytes());
+            }
+            Value::Date(n) => {
+                b.push(5);
+                b.extend_from_slice(&n.to_le_bytes());
+            }
+            Value::Timestamp(n) => {
+                b.push(6);
+                b.extend_from_slice(&n.to_le_bytes());
             }
         }
     }

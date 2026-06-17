@@ -452,42 +452,78 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                if self.eat(&TokenKind::LParen) {
-                    // Function call: name '(' [DISTINCT] [args] ')', e.g.
-                    // SUM(total), COUNT(*), or COUNT(DISTINCT col). The name is
-                    // stored upper-cased and canonical.
-                    let distinct = self.eat_keyword(Keyword::Distinct);
-                    let args = self.parse_call_args()?;
-                    self.expect(&TokenKind::RParen)?;
-                    // A trailing `OVER (...)` makes this a window function.
-                    if self.eat_keyword(Keyword::Over) {
-                        let (partition_by, order_by) = self.parse_window_over()?;
-                        return Ok(Expr::Window {
-                            func: name.to_ascii_uppercase(),
-                            distinct,
-                            args,
-                            partition_by,
-                            order_by,
-                        });
-                    }
-                    Ok(Expr::Func {
-                        name: name.to_ascii_uppercase(),
-                        distinct,
-                        args,
-                    })
-                } else if self.eat(&TokenKind::Dot) {
-                    // Qualified column: name '.' name.
-                    let col = self.parse_ident()?;
-                    Ok(Expr::QualifiedColumn(name, col))
-                } else {
-                    Ok(Expr::Column(name))
+                // Typed temporal literal: `DATE '...'` / `TIMESTAMP '...'`. The
+                // type word is a plain identifier (not reserved), recognized
+                // only when a string literal follows immediately.
+                if matches!(self.peek(), TokenKind::Str(_))
+                    && (name.eq_ignore_ascii_case("date")
+                        || name.eq_ignore_ascii_case("timestamp")
+                        || name.eq_ignore_ascii_case("datetime"))
+                {
+                    return self.parse_temporal_literal(&name);
                 }
+                self.parse_ident_primary(name)
             }
             other => Err(SqlError::parse(
                 format!("expected an expression, found {other:?}"),
                 self.span(),
             )),
         }
+    }
+
+    /// Parse what follows a bareword `name` already consumed in prefix position:
+    /// a function (or window) call `name(...)`, a qualified column `name.col`,
+    /// or a bare column reference.
+    fn parse_ident_primary(&mut self, name: String) -> Result<Expr> {
+        if self.eat(&TokenKind::LParen) {
+            // Function call: name '(' [DISTINCT] [args] ')', e.g. SUM(total),
+            // COUNT(*), or COUNT(DISTINCT col). The name is stored upper-cased.
+            let distinct = self.eat_keyword(Keyword::Distinct);
+            let args = self.parse_call_args()?;
+            self.expect(&TokenKind::RParen)?;
+            // A trailing `OVER (...)` makes this a window function.
+            if self.eat_keyword(Keyword::Over) {
+                let (partition_by, order_by) = self.parse_window_over()?;
+                return Ok(Expr::Window {
+                    func: name.to_ascii_uppercase(),
+                    distinct,
+                    args,
+                    partition_by,
+                    order_by,
+                });
+            }
+            Ok(Expr::Func {
+                name: name.to_ascii_uppercase(),
+                distinct,
+                args,
+            })
+        } else if self.eat(&TokenKind::Dot) {
+            // Qualified column: name '.' name.
+            let col = self.parse_ident()?;
+            Ok(Expr::QualifiedColumn(name, col))
+        } else {
+            Ok(Expr::Column(name))
+        }
+    }
+
+    /// Parse the string following a `DATE` / `TIMESTAMP` type word into the
+    /// corresponding literal value. `kind` is the (already consumed) type word.
+    fn parse_temporal_literal(&mut self, kind: &str) -> Result<Expr> {
+        let text = self.parse_string()?;
+        let value = if kind.eq_ignore_ascii_case("date") {
+            crate::datetime::parse_date(&text)
+                .map(Value::Date)
+                .ok_or_else(|| {
+                    SqlError::parse(format!("invalid DATE literal '{text}'"), self.span())
+                })?
+        } else {
+            crate::datetime::parse_timestamp(&text)
+                .map(Value::Timestamp)
+                .ok_or_else(|| {
+                    SqlError::parse(format!("invalid TIMESTAMP literal '{text}'"), self.span())
+                })?
+        };
+        Ok(Expr::Literal(value))
     }
 }
 
