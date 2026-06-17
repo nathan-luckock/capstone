@@ -421,8 +421,14 @@ pub enum Statement {
         /// `RETURNING` projection over the deleted rows (empty if absent).
         returning: Vec<SelectItem>,
     },
-    /// `EXPLAIN <statement>`: plan the inner statement instead of running it.
-    Explain(Box<Self>),
+    /// `EXPLAIN [ANALYZE] <statement>`: plan the inner statement instead of
+    /// running it; `ANALYZE` also runs it and reports actual rows and time.
+    Explain {
+        /// Whether `ANALYZE` was given.
+        analyze: bool,
+        /// The statement to plan (and, under `ANALYZE`, run).
+        statement: Box<Self>,
+    },
     /// `TRUNCATE TABLE t`: remove all rows from `t`.
     Truncate {
         /// Target table.
@@ -679,7 +685,13 @@ impl fmt::Display for Statement {
                 }
                 write_returning(f, returning)
             }
-            Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
+            Self::Explain { analyze, statement } => {
+                if *analyze {
+                    write!(f, "EXPLAIN ANALYZE {statement}")
+                } else {
+                    write!(f, "EXPLAIN {statement}")
+                }
+            }
             Self::Truncate { table } => write!(f, "TRUNCATE TABLE {table}"),
             Self::Analyze { table } => match table {
                 Some(t) => write!(f, "ANALYZE {t}"),
@@ -784,7 +796,11 @@ impl Parser {
             TokenKind::Keyword(Keyword::Delete) => self.parse_delete()?,
             TokenKind::Keyword(Keyword::Explain) => {
                 self.advance();
-                Statement::Explain(Box::new(self.parse_statement()?))
+                let analyze = self.eat_keyword(Keyword::Analyze);
+                Statement::Explain {
+                    analyze,
+                    statement: Box::new(self.parse_statement()?),
+                }
             }
             TokenKind::Keyword(Keyword::Begin) => {
                 self.advance();
@@ -1588,7 +1604,10 @@ impl Statement {
                 limit: *limit,
                 offset: *offset,
             },
-            Self::Explain(inner) => Self::Explain(Box::new(inner.substitute_params(params))),
+            Self::Explain { analyze, statement } => Self::Explain {
+                analyze: *analyze,
+                statement: Box::new(statement.substitute_params(params)),
+            },
             Self::CreateView { name, query } => Self::CreateView {
                 name: name.clone(),
                 query: Box::new(query.substitute_params(params)),
@@ -2167,13 +2186,20 @@ mod tests {
     #[test]
     fn explain_wraps_inner_statement() {
         let s = round_trip("EXPLAIN SELECT id FROM t WHERE id = 5");
-        let Statement::Explain(inner) = s else {
+        let Statement::Explain { analyze, statement } = s else {
             panic!("expected Explain");
         };
+        assert!(!analyze);
         assert!(
-            matches!(*inner, Statement::Select(_)),
+            matches!(*statement, Statement::Select(_)),
             "inner must be Select"
         );
+    }
+
+    #[test]
+    fn explain_analyze_round_trips() {
+        let s = round_trip("EXPLAIN ANALYZE SELECT id FROM t WHERE id = 5");
+        assert!(matches!(s, Statement::Explain { analyze: true, .. }));
     }
 
     #[test]
@@ -2181,6 +2207,10 @@ mod tests {
         assert_eq!(
             parse("explain select * from t").to_string(),
             "EXPLAIN SELECT * FROM t"
+        );
+        assert_eq!(
+            parse("explain analyze select * from t").to_string(),
+            "EXPLAIN ANALYZE SELECT * FROM t"
         );
     }
 

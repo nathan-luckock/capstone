@@ -420,7 +420,9 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
   (`information_schema.tables`) is parsed as a single dotted name, which also
   keeps the system views out of the `FROM`-able space for ordinary DDL/DML
   (those parse a single bare identifier).
-- `EXPLAIN` of any of the above.
+- `EXPLAIN` of any of the above, and `EXPLAIN ANALYZE`, which also runs the
+  query and appends the actual row count and wall-clock time below the
+  estimated plan.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
 arithmetic with int-to-float promotion, comparison and boolean logic with
