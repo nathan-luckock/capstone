@@ -11,12 +11,12 @@
 //! operators above the scan are pure in-memory transforms.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use rustdb_planner::PhysicalPlan;
 use rustdb_sql::statement::SelectItem;
-use rustdb_sql::{Expr, JoinKind, Value};
+use rustdb_sql::{BinOp, Expr, JoinKind, Value};
 
 use crate::error::{ExecError, Result};
 use crate::eval::{eval, eval_with, is_truthy, SubqueryRunner};
@@ -471,6 +471,210 @@ impl Executor for NestedLoopJoin {
     }
 }
 
+/// A build/probe equi-join. The right (build) side is hashed by its join-key
+/// columns; each left (probe) row finds matching right rows by key in O(1), then
+/// the full `ON` predicate confirms each candidate (so any extra, non-equi
+/// conditions still apply). This replaces the nested-loop scan for equi-joins,
+/// turning an O(n*m) join into O(n+m). A join with no usable equality key uses
+/// the nested-loop executor instead (decided at build time).
+struct HashJoin {
+    kind: JoinKind,
+    columns: Vec<String>,
+    right_width: usize,
+    left: Box<dyn Executor>,
+    left_columns: Vec<String>,
+    /// Key expressions evaluated against a left row.
+    left_keys: Vec<Expr>,
+    /// The full `ON` predicate, re-checked per candidate as a residual.
+    on: Expr,
+    /// Build-side rows indexed by their encoded join key.
+    table: HashMap<Vec<u8>, Vec<Row>>,
+    /// Output rows produced from the current left row, drained one at a time.
+    pending: VecDeque<Row>,
+}
+
+impl HashJoin {
+    fn new(
+        left: Box<dyn Executor>,
+        mut right: Box<dyn Executor>,
+        kind: JoinKind,
+        on: Expr,
+        left_keys: Vec<Expr>,
+        right_keys: &[Expr],
+    ) -> Result<Self> {
+        let left_columns = left.columns().to_vec();
+        let right_columns = right.columns().to_vec();
+        let mut columns = left_columns.clone();
+        columns.extend(right_columns.iter().cloned());
+        let right_width = right_columns.len();
+
+        // Build phase: hash every right row by its key. A row whose key contains
+        // NULL can never satisfy an equi-join (NULL = NULL is unknown), so it is
+        // dropped from the build side.
+        let mut table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
+        while let Some(r) = right.next()? {
+            let key = right_keys
+                .iter()
+                .map(|e| eval(e, &r, &right_columns))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(kb) = join_key_bytes(&key) {
+                table.entry(kb).or_default().push(r);
+            }
+        }
+
+        Ok(Self {
+            kind,
+            columns,
+            right_width,
+            left,
+            left_columns,
+            left_keys,
+            on,
+            table,
+            pending: VecDeque::new(),
+        })
+    }
+}
+
+impl Executor for HashJoin {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(left_row) = self.left.next()? else {
+                return Ok(None);
+            };
+            let key = self
+                .left_keys
+                .iter()
+                .map(|e| eval(e, &left_row, &self.left_columns))
+                .collect::<Result<Vec<_>>>()?;
+            let mut matched = false;
+            if let Some(kb) = join_key_bytes(&key) {
+                if let Some(rights) = self.table.get(&kb) {
+                    for right in rights {
+                        let mut combined = left_row.clone();
+                        combined.extend_from_slice(right);
+                        if is_truthy(&eval(&self.on, &combined, &self.columns)?) {
+                            matched = true;
+                            self.pending.push_back(combined);
+                        }
+                    }
+                }
+            }
+            // A LEFT join keeps an unmatched left row, padded with NULLs.
+            if self.kind == JoinKind::Left && !matched {
+                let mut combined = left_row;
+                combined.extend(std::iter::repeat(Value::Null).take(self.right_width));
+                self.pending.push_back(combined);
+            }
+        }
+    }
+}
+
+/// Encode join-key values to comparable bytes, or `None` if any is NULL (a NULL
+/// key never matches in an equi-join).
+fn join_key_bytes(values: &[Value]) -> Option<Vec<u8>> {
+    if values.iter().any(|v| matches!(v, Value::Null)) {
+        return None;
+    }
+    Some(group_key_bytes(values))
+}
+
+/// Which input a column reference belongs to.
+enum Side {
+    Left,
+    Right,
+}
+
+/// Extract column-equality join keys from `on`: for each top-level `AND`
+/// conjunct of the form `left_col = right_col`, the left and right key
+/// expressions. Returns `None` if there is no usable equality (the caller then
+/// falls back to a nested-loop join).
+fn extract_equi_keys(
+    on: &Expr,
+    left_cols: &[String],
+    right_cols: &[String],
+) -> Option<(Vec<Expr>, Vec<Expr>)> {
+    let mut conjuncts = Vec::new();
+    collect_and(on, &mut conjuncts);
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    for c in conjuncts {
+        if let Expr::Binary {
+            op: BinOp::Eq,
+            left,
+            right,
+        } = c
+        {
+            match (
+                column_side(left, left_cols, right_cols),
+                column_side(right, left_cols, right_cols),
+            ) {
+                (Some(Side::Left), Some(Side::Right)) => {
+                    left_keys.push((**left).clone());
+                    right_keys.push((**right).clone());
+                }
+                (Some(Side::Right), Some(Side::Left)) => {
+                    left_keys.push((**right).clone());
+                    right_keys.push((**left).clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    (!left_keys.is_empty()).then_some((left_keys, right_keys))
+}
+
+/// Flatten an `AND` tree into its leaf conjuncts.
+fn collect_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::Binary {
+        op: BinOp::And,
+        left,
+        right,
+    } = expr
+    {
+        collect_and(left, out);
+        collect_and(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// Whether `expr` is a single column that resolves to the left or right input.
+fn column_side(expr: &Expr, left_cols: &[String], right_cols: &[String]) -> Option<Side> {
+    let name = match expr {
+        Expr::Column(n) => n.clone(),
+        Expr::QualifiedColumn(q, c) => format!("{q}.{c}"),
+        _ => return None,
+    };
+    if resolves_in(&name, left_cols) {
+        Some(Side::Left)
+    } else if resolves_in(&name, right_cols) {
+        Some(Side::Right)
+    } else {
+        None
+    }
+}
+
+/// Whether `name` resolves to exactly one column in `cols` (exact match, or a
+/// unique bare-name match), mirroring the evaluator's column resolution.
+fn resolves_in(name: &str, cols: &[String]) -> bool {
+    if cols.iter().any(|c| c == name) {
+        return true;
+    }
+    !name.contains('.')
+        && cols
+            .iter()
+            .filter(|c| c.rsplit('.').next() == Some(name))
+            .count()
+            == 1
+}
+
 /// An aggregate function.
 #[derive(Clone, Copy)]
 enum AggFunc {
@@ -860,17 +1064,7 @@ fn build_with(
                 on_left: true,
             }))
         }
-        // Both join algorithms run through the nested-loop executor; the hash
-        // build/probe is a deferred runtime optimization (the planner's choice
-        // is still shown by EXPLAIN).
         PhysicalPlan::NestedLoopJoin {
-            kind,
-            left,
-            right,
-            on,
-            ..
-        }
-        | PhysicalPlan::HashJoin {
             kind,
             left,
             right,
@@ -882,6 +1076,35 @@ fn build_with(
             *kind,
             on.clone(),
         )?)),
+        // The planner chooses a hash join for an equi-join on sizable inputs.
+        // Build a real build/probe hash join when an equality key can be
+        // extracted from ON; otherwise fall back to the nested-loop executor.
+        PhysicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            on,
+            ..
+        } => {
+            let left = build_with(left, source, runner)?;
+            let right = build_with(right, source, runner)?;
+            match extract_equi_keys(on, left.columns(), right.columns()) {
+                Some((left_keys, right_keys)) => Ok(Box::new(HashJoin::new(
+                    left,
+                    right,
+                    *kind,
+                    on.clone(),
+                    left_keys,
+                    &right_keys,
+                )?)),
+                None => Ok(Box::new(NestedLoopJoin::new(
+                    left,
+                    right,
+                    *kind,
+                    on.clone(),
+                )?)),
+            }
+        }
         PhysicalPlan::Aggregate {
             group_by,
             aggregates,
@@ -935,4 +1158,89 @@ fn drain(mut op: Box<dyn Executor>) -> Result<(Vec<String>, Vec<Row>)> {
         rows.push(row);
     }
     Ok((columns, rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values(columns: &[&str], rows: Vec<Row>) -> Box<dyn Executor> {
+        Box::new(Values {
+            columns: columns.iter().map(|s| (*s).to_string()).collect(),
+            rows: rows.into_iter(),
+        })
+    }
+
+    fn eq(left: &str, right: &str) -> Expr {
+        Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Column(left.to_string())),
+            right: Box::new(Expr::Column(right.to_string())),
+        }
+    }
+
+    fn hash_join(
+        left: Box<dyn Executor>,
+        right: Box<dyn Executor>,
+        kind: JoinKind,
+        on: Expr,
+    ) -> Vec<Row> {
+        let (lk, rk) = extract_equi_keys(&on, left.columns(), right.columns()).expect("equi keys");
+        let mut op: Box<dyn Executor> =
+            Box::new(HashJoin::new(left, right, kind, on, lk, &rk).unwrap());
+        let mut rows = Vec::new();
+        while let Some(r) = op.next().unwrap() {
+            rows.push(r);
+        }
+        rows
+    }
+
+    #[test]
+    fn hash_join_inner_matches_by_key() {
+        let left = values(
+            &["a.id"],
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+            ],
+        );
+        let right = values(
+            &["b.aid", "b.tag"],
+            vec![
+                vec![Value::Int(1), Value::Text("x".into())],
+                vec![Value::Int(1), Value::Text("y".into())],
+                vec![Value::Int(3), Value::Text("z".into())],
+            ],
+        );
+        // 1 matches x and y, 3 matches z, 2 matches nothing.
+        let rows = hash_join(left, right, JoinKind::Inner, eq("a.id", "b.aid"));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r[0] == r[1]));
+    }
+
+    #[test]
+    fn hash_join_left_keeps_unmatched_and_null_keys() {
+        let left = values(
+            &["a.id"],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Null]],
+        );
+        let right = values(&["b.aid"], vec![vec![Value::Int(1)]]);
+        let rows = hash_join(left, right, JoinKind::Left, eq("a.id", "b.aid"));
+        // 1 matches; 2 and NULL are kept, padded with NULL on the right.
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&vec![Value::Int(1), Value::Int(1)]));
+        assert!(rows.contains(&vec![Value::Int(2), Value::Null]));
+        assert!(rows.contains(&vec![Value::Null, Value::Null]));
+    }
+
+    #[test]
+    fn extract_equi_keys_rejects_non_equi_join() {
+        let on = Expr::Binary {
+            op: BinOp::Gt,
+            left: Box::new(Expr::Column("a.id".into())),
+            right: Box::new(Expr::Column("b.aid".into())),
+        };
+        assert!(extract_equi_keys(&on, &["a.id".to_string()], &["b.aid".to_string()]).is_none());
+    }
 }
