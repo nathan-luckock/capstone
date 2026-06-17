@@ -123,10 +123,6 @@ cargo run --release --bin difftest -- 100000   # 100k queries checked against SQ
 | [docs/sprints.md](docs/sprints.md) | how the build was sequenced |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | `fmt` + `clippy -D warnings` + `test` before every PR |
 
-## 👋 About
-
-I'm Nathan - 20, and I've been getting paid to write software since I was in high school. picklejar is my senior capstone (CSE 499). I wanted to know if I could build a *real* database instead of a toy, so I wrote every layer myself: the bytes on disk, crash recovery, the optimizer, the Postgres wire protocol. It's open source because the best way to learn how a database works is to read one that was built on purpose, end to end. Still shipping.
-
 ## 📄 License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
