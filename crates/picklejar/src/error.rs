@@ -53,6 +53,10 @@ pub enum DbError {
     /// A column constraint (NOT NULL, UNIQUE, or PRIMARY KEY) was violated.
     #[error("constraint violation: {0}")]
     Constraint(String),
+    /// The current role lacks the privilege a statement needs, or a role
+    /// management statement was rejected.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 /// Engine result alias.

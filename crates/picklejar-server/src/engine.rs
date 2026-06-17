@@ -36,6 +36,9 @@ pub trait Engine {
     fn execute(&mut self, sql: &str) -> Result<QueryOutcome, String>;
     /// Whether this session currently has an open explicit transaction.
     fn in_transaction(&self) -> bool;
+    /// Set the authenticated role this session runs statements as. The default
+    /// is a no-op (trust). The wire server calls it once after authentication.
+    fn set_user(&mut self, _user: &str) {}
 }
 
 impl Engine for Database {
@@ -45,6 +48,9 @@ impl Engine for Database {
     fn in_transaction(&self) -> bool {
         Self::in_transaction(self)
     }
+    fn set_user(&mut self, user: &str) {
+        Self::set_session_user(self, user);
+    }
 }
 
 /// The reply to one `Execute`: the result and whether the session is now in a
@@ -53,9 +59,13 @@ type ExecReply = (Result<QueryOutcome, String>, bool);
 
 /// A message to the engine thread.
 enum Command {
-    /// Run `sql` for `session` and reply on `reply`.
+    /// Run `sql` for `session` as role `user` and reply on `reply`.
     Execute {
         session: u64,
+        /// The connection's authenticated role (empty for trust). The engine
+        /// thread switches to it before every statement so connections sharing
+        /// one engine never inherit each other's role.
+        user: String,
         sql: String,
         reply: Sender<ExecReply>,
     },
@@ -112,6 +122,7 @@ impl EngineActor {
             session: self.next_session.fetch_add(1, Ordering::Relaxed),
             tx: self.tx.clone(),
             in_txn: false,
+            user: String::new(),
         }
     }
 }
@@ -123,6 +134,8 @@ pub struct SessionHandle {
     session: u64,
     tx: Sender<Command>,
     in_txn: bool,
+    /// The connection's authenticated role, sent with every statement.
+    user: String,
 }
 
 impl Engine for SessionHandle {
@@ -130,6 +143,7 @@ impl Engine for SessionHandle {
         let (reply_tx, reply_rx) = channel();
         let sent = self.tx.send(Command::Execute {
             session: self.session,
+            user: self.user.clone(),
             sql: sql.to_string(),
             reply: reply_tx,
         });
@@ -146,6 +160,9 @@ impl Engine for SessionHandle {
     }
     fn in_transaction(&self) -> bool {
         self.in_txn
+    }
+    fn set_user(&mut self, user: &str) {
+        self.user = user.to_string();
     }
 }
 
@@ -179,9 +196,13 @@ fn drain(db: &mut Database, owner: &mut Option<u64>, pending: &mut VecDeque<Comm
         match pending.remove(i).expect("index from position") {
             Command::Execute {
                 session,
+                user,
                 sql,
                 reply,
             } => {
+                // Run as the connection's authenticated role. Resetting before
+                // every statement keeps connections sharing this engine isolated.
+                db.set_session_user(&user);
                 let result = db.execute(&sql).map_err(|e| e.to_string());
                 let in_txn = db.in_transaction();
                 *owner = if in_txn { Some(session) } else { None };

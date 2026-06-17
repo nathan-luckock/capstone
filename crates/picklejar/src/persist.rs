@@ -490,6 +490,95 @@ pub fn load_sequences(path: &Path) -> io::Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// The persisted access-control state: roles, table grants, role memberships,
+/// and table ownership. Used to serialize the security catalog to its sidecar.
+#[derive(Debug, Default, Clone)]
+pub struct AclData {
+    /// `(name, [superuser, login, createrole, bypassrls, has_password])`.
+    pub roles: Vec<(String, [bool; 5])>,
+    /// `(grantee, table, privilege_bits)`.
+    pub grants: Vec<(String, String, u8)>,
+    /// `(member, group)` membership edges.
+    pub members: Vec<(String, String)>,
+    /// `(table, owner)` pairs.
+    pub owners: Vec<(String, String)>,
+}
+
+/// Persist the access-control state, one tagged record per line, atomically.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_acl(path: &Path, acl: &AclData) -> io::Result<()> {
+    let mut out = String::new();
+    for (name, [su, login, cr, brls, pw]) in &acl.roles {
+        let _ = writeln!(
+            out,
+            "role {name} {} {} {} {} {}",
+            u8::from(*su),
+            u8::from(*login),
+            u8::from(*cr),
+            u8::from(*brls),
+            u8::from(*pw),
+        );
+    }
+    for (grantee, table, bits) in &acl.grants {
+        let _ = writeln!(out, "grant {grantee} {table} {bits}");
+    }
+    for (member, group) in &acl.members {
+        let _ = writeln!(out, "member {member} {group}");
+    }
+    for (table, owner) in &acl.owners {
+        let _ = writeln!(out, "owner {table} {owner}");
+    }
+    let tmp = path.with_extension("acl.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the access-control state. An absent file yields an empty set.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but is unreadable or malformed.
+pub fn load_acl(path: &Path) -> io::Result<AclData> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(AclData::default()),
+        Err(e) => return Err(e),
+    };
+    let mut acl = AclData::default();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        match toks.first().copied() {
+            Some("role") if toks.len() == 7 => {
+                let flag = |i: usize| toks[i] == "1";
+                acl.roles.push((
+                    toks[1].to_string(),
+                    [flag(2), flag(3), flag(4), flag(5), flag(6)],
+                ));
+            }
+            Some("grant") if toks.len() == 4 => {
+                acl.grants.push((
+                    toks[1].to_string(),
+                    toks[2].to_string(),
+                    toks[3].parse().map_err(|_| invalid())?,
+                ));
+            }
+            Some("member") if toks.len() == 3 => {
+                acl.members.push((toks[1].to_string(), toks[2].to_string()));
+            }
+            Some("owner") if toks.len() == 3 => {
+                acl.owners.push((toks[1].to_string(), toks[2].to_string()));
+            }
+            None => {}
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(acl)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }

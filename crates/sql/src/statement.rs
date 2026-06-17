@@ -643,6 +643,151 @@ pub enum Statement {
         /// OFFSET over the output (None if none).
         offset: Option<u64>,
     },
+    /// `CREATE ROLE name [opts]` / `CREATE USER name [opts]` (`USER` implies
+    /// `LOGIN`). Defines a role (a user or a group) the engine can authorize.
+    CreateRole {
+        /// Role name.
+        name: String,
+        /// `true` for `CREATE USER` (login defaults on), `false` for
+        /// `CREATE ROLE` (login defaults off).
+        is_user: bool,
+        /// The role attributes given (`SUPERUSER`, `LOGIN`, ...).
+        options: Vec<RoleOption>,
+    },
+    /// `ALTER ROLE name opts`: change a role's attributes.
+    AlterRole {
+        /// Role name.
+        name: String,
+        /// The attributes to change.
+        options: Vec<RoleOption>,
+    },
+    /// `DROP ROLE [IF EXISTS] name`.
+    DropRole {
+        /// `IF EXISTS`: a missing role is not an error.
+        if_exists: bool,
+        /// Role name.
+        name: String,
+    },
+    /// `GRANT <privileges> ON [TABLE] table TO grantees [WITH GRANT OPTION]`, or
+    /// `GRANT role TO grantees` (role membership, signalled by an empty
+    /// `privileges` and a `None` `table`).
+    Grant {
+        /// The privileges granted (empty for a role-membership grant).
+        privileges: Vec<Privilege>,
+        /// The table the privileges are on (`None` for a role-membership grant).
+        table: Option<String>,
+        /// The roles granted (a role-membership grant; empty for a privilege
+        /// grant).
+        roles: Vec<String>,
+        /// Who receives the grant.
+        grantees: Vec<Grantee>,
+        /// `WITH GRANT OPTION`: the grantee may re-grant.
+        with_grant_option: bool,
+    },
+    /// `REVOKE <privileges> ON [TABLE] table FROM grantees`, or
+    /// `REVOKE role FROM grantees`.
+    Revoke {
+        /// The privileges revoked (empty for a role-membership revoke).
+        privileges: Vec<Privilege>,
+        /// The table the privileges are on (`None` for a role-membership revoke).
+        table: Option<String>,
+        /// The roles revoked (a role-membership revoke; empty otherwise).
+        roles: Vec<String>,
+        /// Who loses the grant.
+        grantees: Vec<Grantee>,
+    },
+    /// `SET ROLE name` / `SET ROLE NONE` / `RESET ROLE`: switch the current role
+    /// for the session (`None` resets to the session role).
+    SetRole {
+        /// The role to assume, or `None` for `NONE` / `RESET`.
+        name: Option<String>,
+    },
+}
+
+/// A table-level privilege that can be granted or revoked.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Privilege {
+    /// `ALL [PRIVILEGES]`: every table privilege.
+    All,
+    /// `SELECT`: read rows.
+    Select,
+    /// `INSERT`: add rows.
+    Insert,
+    /// `UPDATE`: modify rows.
+    Update,
+    /// `DELETE`: remove rows.
+    Delete,
+    /// `TRUNCATE`: empty the table.
+    Truncate,
+}
+
+impl Privilege {
+    /// The SQL keyword for this privilege.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
+impl fmt::Display for Privilege {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword())
+    }
+}
+
+/// The recipient of a `GRANT` / `REVOKE`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Grantee {
+    /// A named role.
+    Role(String),
+    /// `PUBLIC`: every role.
+    Public,
+}
+
+impl fmt::Display for Grantee {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Role(name) => f.write_str(name),
+            Self::Public => f.write_str("PUBLIC"),
+        }
+    }
+}
+
+/// A role attribute set by `CREATE ROLE` / `ALTER ROLE`. Each carries the
+/// on/off sense the keyword implies (`SUPERUSER` vs `NOSUPERUSER`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleOption {
+    /// `SUPERUSER` / `NOSUPERUSER`: bypass all permission checks.
+    Superuser(bool),
+    /// `LOGIN` / `NOLOGIN`: may start a session.
+    Login(bool),
+    /// `CREATEROLE` / `NOCREATEROLE`: may create and drop other roles.
+    CreateRole(bool),
+    /// `BYPASSRLS` / `NOBYPASSRLS`: skip row-level security policies.
+    BypassRls(bool),
+    /// `PASSWORD '...'` (or `PASSWORD NULL`): the login secret.
+    Password(Option<String>),
+}
+
+impl fmt::Display for RoleOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let word = |on: bool, yes: &'static str, no: &'static str| if on { yes } else { no };
+        match self {
+            Self::Superuser(on) => f.write_str(word(*on, "SUPERUSER", "NOSUPERUSER")),
+            Self::Login(on) => f.write_str(word(*on, "LOGIN", "NOLOGIN")),
+            Self::CreateRole(on) => f.write_str(word(*on, "CREATEROLE", "NOCREATEROLE")),
+            Self::BypassRls(on) => f.write_str(word(*on, "BYPASSRLS", "NOBYPASSRLS")),
+            Self::Password(Some(p)) => write!(f, "PASSWORD '{p}'"),
+            Self::Password(None) => f.write_str("PASSWORD NULL"),
+        }
+    }
 }
 
 /// The `ON CONFLICT` clause of an `INSERT`: what to do when a proposed row
@@ -941,12 +1086,91 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::CreateRole {
+                name,
+                is_user,
+                options,
+            } => {
+                let kind = if *is_user { "USER" } else { "ROLE" };
+                write!(f, "CREATE {kind} {name}")?;
+                for opt in options {
+                    write!(f, " {opt}")?;
+                }
+                Ok(())
+            }
+            Self::AlterRole { name, options } => {
+                write!(f, "ALTER ROLE {name}")?;
+                for opt in options {
+                    write!(f, " {opt}")?;
+                }
+                Ok(())
+            }
+            Self::DropRole { if_exists, name } => {
+                let guard = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP ROLE {guard}{name}")
+            }
+            Self::Grant {
+                privileges,
+                table,
+                roles,
+                grantees,
+                with_grant_option,
+            } => {
+                write!(
+                    f,
+                    "GRANT {}",
+                    grant_subject(privileges, table.as_deref(), roles)
+                )?;
+                write!(f, " TO {}", join_display(grantees))?;
+                if *with_grant_option {
+                    f.write_str(" WITH GRANT OPTION")?;
+                }
+                Ok(())
+            }
+            Self::Revoke {
+                privileges,
+                table,
+                roles,
+                grantees,
+            } => {
+                write!(
+                    f,
+                    "REVOKE {}",
+                    grant_subject(privileges, table.as_deref(), roles)
+                )?;
+                write!(f, " FROM {}", join_display(grantees))
+            }
+            Self::SetRole { name } => match name {
+                Some(name) => write!(f, "SET ROLE {name}"),
+                None => f.write_str("SET ROLE NONE"),
+            },
         }
     }
 }
 
+/// Render the subject of a `GRANT` / `REVOKE`: either `<privs> ON table` or the
+/// granted role list (membership).
+fn grant_subject(privileges: &[Privilege], table: Option<&str>, roles: &[String]) -> String {
+    table.map_or_else(
+        || roles.join(", "),
+        |table| format!("{} ON {table}", join_display(privileges)),
+    )
+}
+
+/// Comma-join any slice of `Display` items.
+fn join_display<T: fmt::Display>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Parser {
     /// Parse a single statement, consuming an optional trailing semicolon.
+    // A flat dispatch over every statement keyword; splitting it would only
+    // scatter the one-line arms across helpers.
+    #[allow(clippy::too_many_lines)]
     pub fn parse_statement(&mut self) -> Result<Statement> {
         let stmt = match self.peek() {
             TokenKind::Keyword(Keyword::Create) => self.parse_create()?,
@@ -1002,10 +1226,35 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Alter) => {
                 self.advance();
-                self.expect_keyword(Keyword::Table)?;
-                let table = self.parse_ident()?;
-                let action = self.parse_alter_action()?;
-                Statement::AlterTable { table, action }
+                if self.eat_ident_kw("role") || self.eat_ident_kw("user") {
+                    let name = self.parse_ident()?;
+                    self.eat_keyword(Keyword::With);
+                    let options = self.parse_role_options()?;
+                    Statement::AlterRole { name, options }
+                } else {
+                    self.expect_keyword(Keyword::Table)?;
+                    let table = self.parse_ident()?;
+                    let action = self.parse_alter_action()?;
+                    Statement::AlterTable { table, action }
+                }
+            }
+            TokenKind::Keyword(Keyword::Grant) => self.parse_grant()?,
+            TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke()?,
+            TokenKind::Keyword(Keyword::Set) => {
+                self.advance();
+                // Only `SET ROLE` is recognised as a statement; other `SET`s are
+                // out of scope.
+                if !self.eat_ident_kw("role") {
+                    return Err(SqlError::parse("expected ROLE after SET", self.span()));
+                }
+                self.parse_set_role_tail()?
+            }
+            TokenKind::Keyword(Keyword::Reset) => {
+                self.advance();
+                if !self.eat_ident_kw("role") {
+                    return Err(SqlError::parse("expected ROLE after RESET", self.span()));
+                }
+                Statement::SetRole { name: None }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::With) => self.parse_with()?,
@@ -1434,15 +1683,64 @@ impl Parser {
             self.parse_create_index_tail()
         } else if self.eat_keyword(Keyword::View) {
             self.parse_create_view_tail()
+        } else if self.eat_ident_kw("role") {
+            self.parse_create_role_tail(false)
+        } else if self.eat_ident_kw("user") {
+            self.parse_create_role_tail(true)
         } else {
             Err(SqlError::parse(
                 format!(
-                    "expected TABLE, INDEX, or VIEW after CREATE, found {:?}",
+                    "expected TABLE, INDEX, VIEW, ROLE, or USER after CREATE, found {:?}",
                     self.peek()
                 ),
                 self.span(),
             ))
         }
+    }
+
+    /// `CREATE {ROLE|USER} name [opt ...]`. The `WITH` keyword before options is
+    /// optional in PostgreSQL; accept and ignore it.
+    fn parse_create_role_tail(&mut self, is_user: bool) -> Result<Statement> {
+        let name = self.parse_ident()?;
+        self.eat_keyword(Keyword::With);
+        let options = self.parse_role_options()?;
+        Ok(Statement::CreateRole {
+            name,
+            is_user,
+            options,
+        })
+    }
+
+    /// Parse a run of role attributes (`SUPERUSER`, `LOGIN`, `PASSWORD '...'`,
+    /// each with a `NO...` negation), stopping at the first token that is not one.
+    fn parse_role_options(&mut self) -> Result<Vec<RoleOption>> {
+        let mut options = Vec::new();
+        while let TokenKind::Ident(word) = self.peek().clone() {
+            let opt = match word.to_ascii_lowercase().as_str() {
+                "superuser" => RoleOption::Superuser(true),
+                "nosuperuser" => RoleOption::Superuser(false),
+                "login" => RoleOption::Login(true),
+                "nologin" => RoleOption::Login(false),
+                "createrole" => RoleOption::CreateRole(true),
+                "nocreaterole" => RoleOption::CreateRole(false),
+                "bypassrls" => RoleOption::BypassRls(true),
+                "nobypassrls" => RoleOption::BypassRls(false),
+                "password" => {
+                    self.advance();
+                    // `PASSWORD NULL` clears it; otherwise a string literal.
+                    if self.eat_keyword(Keyword::Null) {
+                        options.push(RoleOption::Password(None));
+                    } else {
+                        options.push(RoleOption::Password(Some(self.parse_string()?)));
+                    }
+                    continue;
+                }
+                _ => break,
+            };
+            self.advance();
+            options.push(opt);
+        }
+        Ok(options)
     }
 
     fn parse_create_view_tail(&mut self) -> Result<Statement> {
@@ -1734,10 +2032,141 @@ impl Parser {
             let name = self.parse_ident()?;
             return Ok(Statement::DropView { if_exists, name });
         }
+        if self.eat_ident_kw("role") || self.eat_ident_kw("user") {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.parse_ident()?;
+            return Ok(Statement::DropRole { if_exists, name });
+        }
         self.expect_keyword(Keyword::Table)?;
         let if_exists = self.parse_if_exists()?;
         let name = self.parse_ident()?;
         Ok(Statement::DropTable { if_exists, name })
+    }
+
+    /// `SET ROLE name` / `SET ROLE NONE` (the `SET ROLE` is already consumed).
+    fn parse_set_role_tail(&mut self) -> Result<Statement> {
+        if self.eat_keyword(Keyword::Null) || self.eat_ident_kw("none") {
+            return Ok(Statement::SetRole { name: None });
+        }
+        Ok(Statement::SetRole {
+            name: Some(self.parse_ident()?),
+        })
+    }
+
+    /// `GRANT <privileges> ON [TABLE] table TO grantees [WITH GRANT OPTION]`, or
+    /// `GRANT role[, ...] TO grantees` (membership).
+    fn parse_grant(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Grant)?;
+        let (privileges, table, roles) = self.parse_grant_subject()?;
+        if !self.eat_ident_kw("to") {
+            return Err(SqlError::parse("expected TO in GRANT", self.span()));
+        }
+        let grantees = self.parse_grantees()?;
+        let with_grant_option = if self.eat_keyword(Keyword::With) {
+            self.expect_keyword(Keyword::Grant)?;
+            if !self.eat_ident_kw("option") {
+                return Err(SqlError::parse(
+                    "expected OPTION after WITH GRANT",
+                    self.span(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        Ok(Statement::Grant {
+            privileges,
+            table,
+            roles,
+            grantees,
+            with_grant_option,
+        })
+    }
+
+    /// `REVOKE <privileges> ON [TABLE] table FROM grantees`, or
+    /// `REVOKE role[, ...] FROM grantees`.
+    fn parse_revoke(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Revoke)?;
+        let (privileges, table, roles) = self.parse_grant_subject()?;
+        self.expect_keyword(Keyword::From)?;
+        let grantees = self.parse_grantees()?;
+        Ok(Statement::Revoke {
+            privileges,
+            table,
+            roles,
+            grantees,
+        })
+    }
+
+    /// Parse the subject shared by `GRANT` / `REVOKE`: either a privilege list
+    /// and a table (`<privs> ON [TABLE] t`), or a role list (membership). Returns
+    /// `(privileges, table, roles)` with the unused arm empty.
+    #[allow(clippy::type_complexity)]
+    fn parse_grant_subject(&mut self) -> Result<(Vec<Privilege>, Option<String>, Vec<String>)> {
+        // A privilege grant starts with a privilege keyword; otherwise it is a
+        // role-membership grant naming the roles directly.
+        if let Some(first) = self.peek_privilege() {
+            let mut privileges = vec![first];
+            self.advance();
+            if matches!(first, Privilege::All) {
+                // `ALL [PRIVILEGES]`.
+                self.eat_ident_kw("privileges");
+            } else {
+                while self.eat(&TokenKind::Comma) {
+                    privileges.push(self.expect_privilege()?);
+                }
+            }
+            self.expect_keyword(Keyword::On)?;
+            self.eat_keyword(Keyword::Table); // optional TABLE keyword
+            let table = self.parse_ident()?;
+            Ok((privileges, Some(table), Vec::new()))
+        } else {
+            let mut roles = vec![self.parse_ident()?];
+            while self.eat(&TokenKind::Comma) {
+                roles.push(self.parse_ident()?);
+            }
+            Ok((Vec::new(), None, roles))
+        }
+    }
+
+    /// The privilege the current token names, without consuming it.
+    fn peek_privilege(&self) -> Option<Privilege> {
+        match self.peek() {
+            TokenKind::Keyword(Keyword::Select) => Some(Privilege::Select),
+            TokenKind::Keyword(Keyword::Insert) => Some(Privilege::Insert),
+            TokenKind::Keyword(Keyword::Update) => Some(Privilege::Update),
+            TokenKind::Keyword(Keyword::Delete) => Some(Privilege::Delete),
+            TokenKind::Keyword(Keyword::Truncate) => Some(Privilege::Truncate),
+            TokenKind::Keyword(Keyword::All) => Some(Privilege::All),
+            _ => None,
+        }
+    }
+
+    /// Consume and return the privilege the current token names, or error.
+    fn expect_privilege(&mut self) -> Result<Privilege> {
+        let priv_ = self
+            .peek_privilege()
+            .ok_or_else(|| SqlError::parse("expected a privilege", self.span()))?;
+        self.advance();
+        Ok(priv_)
+    }
+
+    /// Parse a comma-separated grantee list (`PUBLIC` or role names).
+    fn parse_grantees(&mut self) -> Result<Vec<Grantee>> {
+        let mut grantees = vec![self.parse_grantee()?];
+        while self.eat(&TokenKind::Comma) {
+            grantees.push(self.parse_grantee()?);
+        }
+        Ok(grantees)
+    }
+
+    /// Parse one grantee: `PUBLIC` (context-sensitive) or a role name.
+    fn parse_grantee(&mut self) -> Result<Grantee> {
+        if self.eat_ident_kw("public") {
+            Ok(Grantee::Public)
+        } else {
+            Ok(Grantee::Role(self.parse_ident()?))
+        }
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -2098,6 +2527,45 @@ mod tests {
         let second = parse(&printed);
         assert_eq!(first, second, "round-trip mismatch: {src:?} -> {printed:?}");
         first
+    }
+
+    #[test]
+    fn roles_and_grants_round_trip() {
+        round_trip("CREATE ROLE analyst");
+        round_trip("CREATE ROLE admin SUPERUSER CREATEROLE");
+        round_trip("CREATE USER alice LOGIN PASSWORD 'secret'");
+        round_trip("CREATE USER bob NOLOGIN BYPASSRLS");
+        round_trip("ALTER ROLE alice NOSUPERUSER PASSWORD NULL");
+        round_trip("DROP ROLE analyst");
+        round_trip("DROP ROLE IF EXISTS analyst");
+        round_trip("GRANT SELECT ON t TO analyst");
+        round_trip("GRANT SELECT, INSERT, UPDATE ON t TO alice, bob");
+        round_trip("GRANT ALL ON t TO PUBLIC");
+        round_trip("GRANT SELECT ON t TO analyst WITH GRANT OPTION");
+        round_trip("GRANT admin TO alice");
+        round_trip("REVOKE SELECT ON t FROM analyst");
+        round_trip("REVOKE admin FROM alice");
+        round_trip("SET ROLE admin");
+        round_trip("SET ROLE NONE");
+        // `role`, `user`, `public` stay usable as identifiers (non-reserved).
+        round_trip("SELECT role, public FROM t");
+    }
+
+    #[test]
+    fn grant_all_parses_optional_privileges_word() {
+        // `ALL PRIVILEGES` and bare `ALL` are equivalent.
+        assert_eq!(
+            parse("GRANT ALL PRIVILEGES ON t TO r"),
+            parse("GRANT ALL ON t TO r")
+        );
+    }
+
+    #[test]
+    fn create_user_defaults_to_login() {
+        let Statement::CreateRole { is_user, .. } = parse("CREATE USER u") else {
+            panic!("expected CreateRole");
+        };
+        assert!(is_user);
     }
 
     #[test]

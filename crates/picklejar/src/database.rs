@@ -25,7 +25,7 @@
 //! open the sidecar is read back to rebuild the catalog and descriptors, so a
 //! table and its rows survive closing and reopening the database.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -37,8 +37,8 @@ use picklejar_planner::{bind, explain, plan, Catalog, ColumnStats};
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use picklejar_sql::statement::{
-    AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Join, OnConflict, OrderItem,
-    RefAction, Select, SelectItem, TableConstraint, TableRef,
+    AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Grantee, Join, OnConflict,
+    OrderItem, Privilege, RefAction, RoleOption, Select, SelectItem, TableConstraint, TableRef,
 };
 use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use picklejar_storage::{BufferPool, FileManager, PageId};
@@ -48,6 +48,7 @@ use picklejar_wal::{WalSyncHandle, WalWriter};
 use crate::error::{DbError, Result};
 use crate::index::Index;
 use crate::persist::{self, TableRecord};
+use crate::security::{self, RoleAttrs, SecurityCatalog};
 
 /// Buffer pool size in pages. Generous for the capstone's working set.
 const POOL_PAGES: usize = 256;
@@ -158,6 +159,16 @@ pub struct Database {
     cons_path: PathBuf,
     /// Sidecar file recording the `SERIAL` columns.
     seq_path: PathBuf,
+    /// Roles, privileges, memberships, and table ownership.
+    security: SecurityCatalog,
+    /// The role the session authenticated as (what `RESET ROLE` returns to and
+    /// what `session_user` reports).
+    session_user: String,
+    /// The role privileges are currently checked against (changed by `SET ROLE`,
+    /// reported by `current_user` / `current_role`).
+    current_role: String,
+    /// Sidecar file recording roles, grants, memberships, and ownership.
+    acl_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -184,6 +195,7 @@ impl Database {
         let view_path = base.with_extension("view");
         let cons_path = base.with_extension("cons");
         let seq_path = base.with_extension("seq");
+        let acl_path = base.with_extension("acl");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -203,11 +215,16 @@ impl Database {
             view_path,
             cons_path,
             seq_path,
+            security: SecurityCatalog::new(),
+            session_user: security::BOOTSTRAP_SUPERUSER.to_string(),
+            current_role: security::BOOTSTRAP_SUPERUSER.to_string(),
+            acl_path,
         };
         db.load_catalog()?;
         db.load_views()?;
         db.load_constraints()?;
         db.load_serials()?;
+        db.load_security()?;
         // Register the read-only information_schema views so introspection
         // queries bind. They are catalog-only (no physical store) and are built
         // on demand by `EngineSource`, so they are never persisted.
@@ -402,6 +419,73 @@ impl Database {
         Ok(())
     }
 
+    /// Load the security catalog (roles, grants, memberships, ownership) from its
+    /// sidecar, rebuilding on top of the default bootstrap superuser.
+    fn load_security(&mut self) -> Result<()> {
+        let acl = persist::load_acl(&self.acl_path)?;
+        for (name, [su, login, cr, brls, pw]) in acl.roles {
+            self.security.put_role(
+                &name,
+                RoleAttrs {
+                    superuser: su,
+                    login,
+                    createrole: cr,
+                    bypassrls: brls,
+                    has_password: pw,
+                },
+            );
+        }
+        for (grantee, table, bits) in acl.grants {
+            self.security.grant(&grantee, &table, bits);
+        }
+        for (member, group) in acl.members {
+            self.security.add_member(&member, &group);
+        }
+        for (table, owner) in acl.owners {
+            self.security.set_owner(&table, &owner);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the security catalog into its sidecar.
+    fn save_security(&self) -> Result<()> {
+        let acl = persist::AclData {
+            roles: self
+                .security
+                .roles()
+                .map(|(name, a)| {
+                    (
+                        name.clone(),
+                        [
+                            a.superuser,
+                            a.login,
+                            a.createrole,
+                            a.bypassrls,
+                            a.has_password,
+                        ],
+                    )
+                })
+                .collect(),
+            grants: self
+                .security
+                .grants()
+                .map(|(g, t, b)| (g.clone(), t.clone(), *b))
+                .collect(),
+            members: self
+                .security
+                .memberships()
+                .map(|(m, g)| (m.clone(), g.clone()))
+                .collect(),
+            owners: self
+                .security
+                .owners()
+                .map(|(t, o)| (t.clone(), o.clone()))
+                .collect(),
+        };
+        persist::save_acl(&self.acl_path, &acl)?;
+        Ok(())
+    }
+
     /// Register the `information_schema` views in the catalog so introspection
     /// queries bind. They carry no physical store; [`EngineSource`] materializes
     /// their rows from the live catalog on each scan.
@@ -489,6 +573,7 @@ impl Database {
             self.mgr.next_xid(),
             &self.mgr.aborted_xids(),
         )?;
+        self.save_security()?;
         Ok(())
     }
 
@@ -504,11 +589,47 @@ impl Database {
         // Inline any WITH common table expressions into the body before routing,
         // so the rest of the engine only sees plain queries and derived tables.
         let stmt = expand_ctes(stmt)?;
+        // Publish the active role names so `current_user` / `session_user`
+        // expressions (and, later, RLS policies) resolve to the right role.
+        picklejar_executor::set_session_identity(&self.current_role, &self.session_user);
+        // Authorize the statement against the current role before running it.
+        // A superuser session (the default) passes every check, so an
+        // unconfigured database is unaffected.
+        self.check_permission(&stmt)?;
         match stmt {
             // Transaction control.
             Statement::Begin => self.begin_txn(),
             Statement::Commit => self.commit_txn(),
             Statement::Rollback => self.rollback_txn(),
+            // Roles, privileges, and session role. These manage the security
+            // catalog and persist it immediately, like other DDL.
+            Statement::CreateRole {
+                ref name,
+                is_user,
+                ref options,
+            } => self.create_role(name, is_user, options),
+            Statement::AlterRole {
+                ref name,
+                ref options,
+            } => self.alter_role(name, options),
+            Statement::DropRole {
+                if_exists,
+                ref name,
+            } => self.drop_role(if_exists, name),
+            Statement::Grant {
+                ref privileges,
+                ref table,
+                ref roles,
+                ref grantees,
+                ..
+            } => self.run_grant(privileges, table.as_deref(), roles, grantees, true),
+            Statement::Revoke {
+                ref privileges,
+                ref table,
+                ref roles,
+                ref grantees,
+            } => self.run_grant(privileges, table.as_deref(), roles, grantees, false),
+            Statement::SetRole { ref name } => self.set_role(name.as_deref()),
             // DDL auto-commits: it persists immediately regardless of any open
             // transaction.
             Statement::CreateTable { .. } => self.create_table(&stmt),
@@ -583,6 +704,301 @@ impl Database {
             .ok_or_else(|| DbError::Unsupported("ROLLBACK without an open transaction".into()))?;
         self.mgr.abort(&txn);
         Ok(QueryOutcome::Message("ROLLBACK"))
+    }
+
+    // --- roles, privileges, and authorization ---
+
+    /// Run the session as `user` (e.g. the role the wire server authenticated),
+    /// resetting both `session_user` and the current role. An unknown role falls
+    /// back to the bootstrap superuser, so a database with no roles defined stays
+    /// fully open (trust behaviour). This fully resets the session identity on
+    /// every call, which the wire server relies on to keep connections that share
+    /// one engine from inheriting each other's role.
+    pub fn set_session_user(&mut self, user: &str) {
+        let role = if self.security.role_exists(user) {
+            user
+        } else {
+            security::BOOTSTRAP_SUPERUSER
+        };
+        self.session_user = role.to_string();
+        self.current_role = role.to_string();
+    }
+
+    /// The role the session authenticated as (`session_user`).
+    #[must_use]
+    pub fn session_user(&self) -> &str {
+        &self.session_user
+    }
+
+    /// The role privileges are currently checked against (`current_user`).
+    #[must_use]
+    pub fn current_role(&self) -> &str {
+        &self.current_role
+    }
+
+    /// `CREATE ROLE` / `CREATE USER`.
+    fn create_role(
+        &mut self,
+        name: &str,
+        is_user: bool,
+        options: &[RoleOption],
+    ) -> Result<QueryOutcome> {
+        if self.security.role_exists(name) {
+            return Err(DbError::Constraint(format!(
+                "role \"{name}\" already exists"
+            )));
+        }
+        let mut attrs = RoleAttrs {
+            login: is_user,
+            ..RoleAttrs::default()
+        };
+        apply_role_options(&mut attrs, options);
+        self.security.put_role(name, attrs);
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `ALTER ROLE`.
+    fn alter_role(&mut self, name: &str, options: &[RoleOption]) -> Result<QueryOutcome> {
+        let mut attrs = self
+            .security
+            .attrs(name)
+            .cloned()
+            .ok_or_else(|| DbError::Unsupported(format!("role \"{name}\" does not exist")))?;
+        apply_role_options(&mut attrs, options);
+        self.security.put_role(name, attrs);
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `DROP ROLE [IF EXISTS]`.
+    fn drop_role(&mut self, if_exists: bool, name: &str) -> Result<QueryOutcome> {
+        if name == security::BOOTSTRAP_SUPERUSER {
+            return Err(DbError::PermissionDenied(
+                "the bootstrap superuser cannot be dropped".into(),
+            ));
+        }
+        if !self.security.role_exists(name) {
+            if if_exists {
+                return Ok(QueryOutcome::Ddl);
+            }
+            return Err(DbError::Unsupported(format!(
+                "role \"{name}\" does not exist"
+            )));
+        }
+        self.security.remove_role(name);
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `GRANT` / `REVOKE`, for both table privileges and role membership.
+    /// `grant` is `true` for `GRANT`, `false` for `REVOKE`.
+    fn run_grant(
+        &mut self,
+        privileges: &[Privilege],
+        table: Option<&str>,
+        roles: &[String],
+        grantees: &[Grantee],
+        grant: bool,
+    ) -> Result<QueryOutcome> {
+        if let Some(table) = table {
+            // A privilege grant: the grantor must own the table (or be a
+            // superuser, already short-circuited by check_permission).
+            if !self.security.is_superuser(&self.current_role)
+                && !self.security.owns(&self.current_role, table)
+            {
+                return Err(DbError::PermissionDenied(format!(
+                    "must own table \"{table}\" to grant privileges on it"
+                )));
+            }
+            if !self.tables.contains_key(table) {
+                return Err(DbError::UnknownTable(table.to_string()));
+            }
+            let bits = privileges
+                .iter()
+                .fold(0u8, |acc, p| acc | security::priv_bits(*p));
+            for grantee in grantees {
+                let who = grantee_name(grantee);
+                if grant {
+                    self.security.grant(&who, table, bits);
+                } else {
+                    self.security.revoke(&who, table, bits);
+                }
+            }
+        } else {
+            // Role membership.
+            for role in roles {
+                if !self.security.role_exists(role) {
+                    return Err(DbError::Unsupported(format!(
+                        "role \"{role}\" does not exist"
+                    )));
+                }
+                for grantee in grantees {
+                    let member = grantee_name(grantee);
+                    if grant {
+                        self.security.add_member(&member, role);
+                    } else {
+                        self.security.remove_member(&member, role);
+                    }
+                }
+            }
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `SET ROLE name` / `SET ROLE NONE` / `RESET ROLE`.
+    fn set_role(&mut self, name: Option<&str>) -> Result<QueryOutcome> {
+        match name {
+            None => {
+                self.current_role = self.session_user.clone();
+            }
+            Some(role) => {
+                if !self.security.role_exists(role) {
+                    return Err(DbError::Unsupported(format!(
+                        "role \"{role}\" does not exist"
+                    )));
+                }
+                // A session may assume a role it is a member of (or is).
+                let allowed = self.security.is_superuser(&self.session_user)
+                    || self.session_user == role
+                    || self.security.is_member_of(&self.session_user, role);
+                if !allowed {
+                    return Err(DbError::PermissionDenied(format!(
+                        "permission denied to set role \"{role}\""
+                    )));
+                }
+                self.current_role = role.to_string();
+            }
+        }
+        Ok(QueryOutcome::Message("SET"))
+    }
+
+    /// Authorize `stmt` against the current role. A superuser passes everything;
+    /// role-management statements are checked in their handlers.
+    fn check_permission(&self, stmt: &Statement) -> Result<()> {
+        if self.security.is_superuser(&self.current_role) {
+            return Ok(());
+        }
+        match stmt {
+            Statement::Select(_) | Statement::Union { .. } | Statement::With { .. } => {
+                self.require_select(&referenced_tables(stmt))?;
+            }
+            Statement::Insert {
+                table,
+                source,
+                rows,
+                ..
+            } => {
+                self.require_priv(table, security::PRIV_INSERT)?;
+                let mut reads = HashSet::new();
+                if let Some(src) = source {
+                    collect_stmt_tables(src, &mut reads);
+                }
+                for row in rows {
+                    for e in row {
+                        collect_expr_tables(e, &mut reads);
+                    }
+                }
+                self.require_select(&reads)?;
+            }
+            Statement::Update { table, .. } => {
+                self.require_priv(table, security::PRIV_UPDATE)?;
+                self.require_select(&others(referenced_tables(stmt), table))?;
+            }
+            Statement::Delete { table, .. } => {
+                self.require_priv(table, security::PRIV_DELETE)?;
+                self.require_select(&others(referenced_tables(stmt), table))?;
+            }
+            Statement::Truncate { table } => {
+                self.require_owner_or_priv(table, security::PRIV_TRUNCATE)?;
+            }
+            Statement::Copy { table, to, .. } => {
+                let needed = if *to {
+                    security::PRIV_SELECT
+                } else {
+                    security::PRIV_INSERT
+                };
+                self.require_priv(table, needed)?;
+            }
+            Statement::CreateTableAs { query, .. } | Statement::CreateView { query, .. } => {
+                self.require_select(&referenced_tables(query))?;
+            }
+            Statement::DropTable { name: t, .. }
+            | Statement::AlterTable { table: t, .. }
+            | Statement::Analyze { table: Some(t) }
+            | Statement::Vacuum { table: Some(t) } => self.require_owner(t)?,
+            Statement::Explain { statement, .. } => self.check_permission(statement)?,
+            // Role management and role-membership grants require CREATEROLE (a
+            // superuser was already cleared above). Table GRANT/REVOKE checks
+            // ownership in its handler.
+            Statement::CreateRole { .. }
+            | Statement::AlterRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant { table: None, .. }
+            | Statement::Revoke { table: None, .. }
+                if !self.security.can_create_role(&self.current_role) =>
+            {
+                return Err(DbError::PermissionDenied(
+                    "permission denied to manage roles".into(),
+                ));
+            }
+            // CREATE TABLE / INDEX, DROP VIEW, bare ANALYZE/VACUUM, transaction
+            // control, table GRANT/REVOKE (checked in the handler), and SET ROLE
+            // (checked in its handler) need no table-level privilege here.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Require `SELECT` on every table in `tables` (skipping non-base names).
+    fn require_select(&self, tables: &HashSet<String>) -> Result<()> {
+        for t in tables {
+            self.require_priv(t, security::PRIV_SELECT)?;
+        }
+        Ok(())
+    }
+
+    /// Require `needed` on `table`. Names with no physical store (views, system
+    /// catalogs, derived/CTE names) are not enforced here.
+    fn require_priv(&self, table: &str, needed: security::PrivSet) -> Result<()> {
+        if !self.tables.contains_key(table) {
+            return Ok(());
+        }
+        if self
+            .security
+            .has_privilege(&self.current_role, table, needed)
+        {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "permission denied for table \"{table}\""
+            )))
+        }
+    }
+
+    /// Require ownership (or superuser) of `table`.
+    fn require_owner(&self, table: &str) -> Result<()> {
+        if !self.tables.contains_key(table) {
+            return Ok(());
+        }
+        if self.security.is_superuser(&self.current_role)
+            || self.security.owns(&self.current_role, table)
+        {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "must be owner of table \"{table}\""
+            )))
+        }
+    }
+
+    /// Require ownership of `table` or the `needed` privilege on it.
+    fn require_owner_or_priv(&self, table: &str, needed: security::PrivSet) -> Result<()> {
+        if self.require_owner(table).is_ok() {
+            return Ok(());
+        }
+        self.require_priv(table, needed)
     }
 
     /// Run a DML or SELECT statement inside the open transaction, or, in
@@ -942,6 +1358,10 @@ impl Database {
             self.serial_cols.insert(name.clone(), serials);
             self.save_serials()?;
         }
+        // The creating role owns the new table (and so holds every privilege on
+        // it). `persist` writes the ownership through `save_security`.
+        let owner = self.current_role.clone();
+        self.security.set_owner(name, &owner);
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -1491,6 +1911,8 @@ impl Database {
             self.serial_cols.insert(to.to_string(), serials);
             self.save_serials()?;
         }
+        // Move ownership and grants to the new name.
+        self.security.rename_table(from, to);
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -1740,6 +2162,8 @@ impl Database {
         if self.serial_cols.remove(name).is_some() {
             self.save_serials()?;
         }
+        // Forget the table's ownership and any grants on it.
+        self.security.clear_owner(name);
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -3493,6 +3917,180 @@ fn ctas_column_name(col: &str) -> String {
     col.rsplit('.').next().unwrap_or(col).to_string()
 }
 
+/// Apply parsed role attributes onto `attrs`, last write winning.
+fn apply_role_options(attrs: &mut RoleAttrs, options: &[RoleOption]) {
+    for opt in options {
+        match opt {
+            RoleOption::Superuser(on) => attrs.superuser = *on,
+            RoleOption::Login(on) => attrs.login = *on,
+            RoleOption::CreateRole(on) => attrs.createrole = *on,
+            RoleOption::BypassRls(on) => attrs.bypassrls = *on,
+            // The password value itself is not stored (wire authentication is
+            // handled by the server); only whether one is set.
+            RoleOption::Password(p) => attrs.has_password = p.is_some(),
+        }
+    }
+}
+
+/// The catalog key for a grantee: a role's name, or `"public"` for `PUBLIC`.
+fn grantee_name(grantee: &Grantee) -> String {
+    match grantee {
+        Grantee::Role(name) => name.clone(),
+        Grantee::Public => "public".to_string(),
+    }
+}
+
+/// `set` with `victim` removed (used to split an UPDATE/DELETE target, which
+/// needs a write privilege, from the other tables it reads).
+fn others(mut set: HashSet<String>, victim: &str) -> HashSet<String> {
+    set.remove(victim);
+    set
+}
+
+/// Every base-table name a statement reads, for privilege checks. Walks
+/// `FROM` / `JOIN`, derived tables, and subqueries in expressions. Names with no
+/// physical store (views, CTEs, system catalogs) are harmless: the privilege
+/// check skips them.
+fn referenced_tables(stmt: &Statement) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_stmt_tables(stmt, &mut out);
+    out
+}
+
+/// Accumulate the base tables a statement reads into `out`.
+fn collect_stmt_tables(stmt: &Statement, out: &mut HashSet<String>) {
+    match stmt {
+        Statement::Select(select) => collect_select_tables(select, out),
+        Statement::Union { left, right, .. } => {
+            collect_stmt_tables(left, out);
+            collect_stmt_tables(right, out);
+        }
+        Statement::With { body, ctes, .. } => {
+            collect_stmt_tables(body, out);
+            for cte in ctes {
+                collect_stmt_tables(&cte.query, out);
+            }
+        }
+        Statement::Insert { source, rows, .. } => {
+            if let Some(src) = source {
+                collect_stmt_tables(src, out);
+            }
+            for row in rows {
+                for e in row {
+                    collect_expr_tables(e, out);
+                }
+            }
+        }
+        Statement::Update {
+            table,
+            assignments,
+            where_clause,
+            ..
+        } => {
+            out.insert(table.clone());
+            for (_, e) in assignments {
+                collect_expr_tables(e, out);
+            }
+            if let Some(w) = where_clause {
+                collect_expr_tables(w, out);
+            }
+        }
+        Statement::Delete {
+            table,
+            where_clause,
+            ..
+        } => {
+            out.insert(table.clone());
+            if let Some(w) = where_clause {
+                collect_expr_tables(w, out);
+            }
+        }
+        Statement::Explain { statement, .. }
+        | Statement::CreateTableAs {
+            query: statement, ..
+        } => {
+            collect_stmt_tables(statement, out);
+        }
+        Statement::CreateView { query, .. } => collect_stmt_tables(query, out),
+        _ => {}
+    }
+}
+
+/// Accumulate the base tables a `SELECT` reads: its `FROM`, joins, and any
+/// subqueries in its clauses.
+fn collect_select_tables(select: &Select, out: &mut HashSet<String>) {
+    collect_table_ref(&select.from, out);
+    for join in &select.joins {
+        collect_table_ref(&join.table, out);
+        collect_expr_tables(&join.on, out);
+    }
+    for item in &select.projections {
+        if let SelectItem::Expr(e, _) = item {
+            collect_expr_tables(e, out);
+        }
+    }
+    if let Some(w) = &select.where_clause {
+        collect_expr_tables(w, out);
+    }
+    for e in &select.group_by {
+        collect_expr_tables(e, out);
+    }
+    if let Some(h) = &select.having {
+        collect_expr_tables(h, out);
+    }
+    for o in &select.order_by {
+        collect_expr_tables(&o.expr, out);
+    }
+}
+
+/// Add a table reference: a base name directly, or recurse into a derived-table
+/// subquery.
+fn collect_table_ref(table: &TableRef, out: &mut HashSet<String>) {
+    if let Some(sub) = &table.subquery {
+        collect_stmt_tables(sub, out);
+    } else {
+        out.insert(table.name.clone());
+    }
+}
+
+/// Accumulate base tables referenced by subqueries inside an expression.
+fn collect_expr_tables(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Subquery(s) | Expr::Exists(s) => collect_stmt_tables(s, out),
+        Expr::InSubquery { expr, query, .. } => {
+            collect_expr_tables(expr, out);
+            collect_stmt_tables(query, out);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_expr_tables(left, out);
+            collect_expr_tables(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => collect_expr_tables(expr, out),
+        Expr::Func { args, .. } | Expr::Window { args, .. } => {
+            for a in args {
+                collect_expr_tables(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_expr_tables(op, out);
+            }
+            for (w, t) in whens {
+                collect_expr_tables(w, out);
+                collect_expr_tables(t, out);
+            }
+            if let Some(e) = else_result {
+                collect_expr_tables(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parse a CSV file body into records of string fields (RFC-4180 style: fields
 /// are comma-separated; a `"`-quoted field may contain commas, newlines, and
 /// `""`-escaped quotes). A trailing newline does not add an empty record.
@@ -4369,6 +4967,168 @@ mod tests {
 
     fn names(cols: &[String]) -> Vec<&str> {
         cols.iter().map(String::as_str).collect()
+    }
+
+    // --- roles, privileges, and ownership ---
+
+    /// The bootstrap superuser, used to switch a test session back to full
+    /// rights after acting as a restricted role.
+    const SUPER: &str = security::BOOTSTRAP_SUPERUSER;
+
+    #[test]
+    fn table_privileges_are_enforced_for_non_superusers() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("CREATE ROLE alice").unwrap();
+
+        db.set_session_user("alice");
+        // With no grant, every access is refused.
+        assert!(matches!(
+            db.execute("SELECT * FROM t").unwrap_err(),
+            DbError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            db.execute("INSERT INTO t VALUES (3, 'c')").unwrap_err(),
+            DbError::PermissionDenied(_)
+        ));
+
+        // The owner (superuser) grants SELECT.
+        db.set_session_user(SUPER);
+        db.execute("GRANT SELECT ON t TO alice").unwrap();
+        db.set_session_user("alice");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // SELECT does not imply INSERT.
+        assert!(db.execute("INSERT INTO t VALUES (3, 'c')").is_err());
+
+        // Grant INSERT too, then it works; REVOKE takes it back.
+        db.set_session_user(SUPER);
+        db.execute("GRANT INSERT ON t TO alice").unwrap();
+        db.set_session_user("alice");
+        db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        db.set_session_user(SUPER);
+        db.execute("REVOKE INSERT ON t FROM alice").unwrap();
+        db.set_session_user("alice");
+        assert!(db.execute("INSERT INTO t VALUES (4, 'd')").is_err());
+    }
+
+    #[test]
+    fn creator_owns_its_table_and_holds_every_privilege() {
+        let (_d, mut db) = db();
+        db.execute("CREATE ROLE carol LOGIN").unwrap();
+        db.set_session_user("carol");
+        // CREATE TABLE is allowed for any role; the creator owns the result.
+        db.execute("CREATE TABLE c (id INT)").unwrap();
+        db.execute("INSERT INTO c VALUES (1), (2)").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id FROM c ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // The owner can even drop it.
+        db.execute("DROP TABLE c").unwrap();
+    }
+
+    #[test]
+    fn public_and_membership_grants_reach_a_role() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("CREATE ROLE readers").unwrap();
+        db.execute("CREATE ROLE dave").unwrap();
+        db.execute("GRANT SELECT ON t TO readers").unwrap();
+        db.execute("GRANT readers TO dave").unwrap();
+
+        // dave inherits readers' SELECT through membership.
+        db.set_session_user("dave");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t");
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+
+        // A PUBLIC grant reaches an unrelated role.
+        db.set_session_user(SUPER);
+        db.execute("CREATE ROLE erin").unwrap();
+        db.execute("GRANT SELECT ON t TO PUBLIC").unwrap();
+        db.set_session_user("erin");
+        assert_eq!(
+            query(&mut db, "SELECT id FROM t").1,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    /// Create a one-row table readable by everyone, for evaluating niladic
+    /// session functions (the parser requires a `FROM` clause).
+    fn one_row_public(db: &mut Database) {
+        db.execute("CREATE TABLE one (x INT)").unwrap();
+        db.execute("INSERT INTO one VALUES (1)").unwrap();
+        db.execute("GRANT SELECT ON one TO PUBLIC").unwrap();
+    }
+
+    #[test]
+    fn session_functions_report_the_active_role() {
+        let (_d, mut db) = db();
+        one_row_public(&mut db);
+        db.execute("CREATE ROLE frank LOGIN").unwrap();
+        db.set_session_user("frank");
+        assert_eq!(
+            query(&mut db, "SELECT current_user FROM one").1,
+            vec![vec![Value::Text("frank".into())]]
+        );
+        assert_eq!(
+            query(&mut db, "SELECT session_user, current_role FROM one").1,
+            vec![vec![
+                Value::Text("frank".into()),
+                Value::Text("frank".into())
+            ]]
+        );
+    }
+
+    #[test]
+    fn set_role_changes_current_user_but_not_session_user() {
+        let (_d, mut db) = db();
+        one_row_public(&mut db);
+        db.execute("CREATE ROLE grace LOGIN").unwrap();
+        // A superuser session may assume any role.
+        db.execute("SET ROLE grace").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT current_user, session_user FROM one").1,
+            vec![vec![Value::Text("grace".into()), Value::Text(SUPER.into())]]
+        );
+        db.execute("RESET ROLE").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT current_user FROM one").1,
+            vec![vec![Value::Text(SUPER.into())]]
+        );
+    }
+
+    #[test]
+    fn roles_and_grants_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("acl.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            db.execute("CREATE ROLE heidi").unwrap();
+            db.execute("GRANT SELECT ON t TO heidi").unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        // The role, its grant, and the table's ownership all reload.
+        db.set_session_user("heidi");
+        assert_eq!(
+            query(&mut db, "SELECT id FROM t").1,
+            vec![vec![Value::Int(1)]]
+        );
+        assert!(db.execute("INSERT INTO t VALUES (2)").is_err());
+    }
+
+    #[test]
+    fn non_superuser_cannot_create_roles() {
+        let (_d, mut db) = db();
+        db.execute("CREATE ROLE ivan LOGIN").unwrap();
+        db.set_session_user("ivan");
+        assert!(matches!(
+            db.execute("CREATE ROLE mallory").unwrap_err(),
+            DbError::PermissionDenied(_)
+        ));
     }
 
     #[test]

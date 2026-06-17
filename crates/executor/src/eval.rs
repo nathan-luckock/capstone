@@ -13,6 +13,34 @@ use picklejar_sql::{BinOp, Expr, UnOp, Value};
 
 use crate::error::{ExecError, Result};
 
+thread_local! {
+    /// The `(current_user, session_user)` the niladic session functions report.
+    /// The engine sets this before running a statement; it defaults to empty.
+    static SESSION_IDENTITY: std::cell::RefCell<(String, String)> =
+        const { std::cell::RefCell::new((String::new(), String::new())) };
+}
+
+/// Set the role names the niladic session functions report on this thread.
+///
+/// `current_user` / `current_role` report the first, `session_user` the second.
+/// The engine calls this before each statement so authorization-aware
+/// expressions (and RLS policies) see the active role.
+pub fn set_session_identity(current_user: &str, session_user: &str) {
+    SESSION_IDENTITY.with(|id| {
+        *id.borrow_mut() = (current_user.to_string(), session_user.to_string());
+    });
+}
+
+/// The current user (what `current_user` / `current_role` evaluate to).
+fn current_user() -> String {
+    SESSION_IDENTITY.with(|id| id.borrow().0.clone())
+}
+
+/// The session user (what `session_user` evaluates to).
+fn session_user() -> String {
+    SESSION_IDENTITY.with(|id| id.borrow().1.clone())
+}
+
 /// Evaluates a subquery expression (`Expr::Subquery`, `Expr::InSubquery`, or
 /// `Expr::Exists`) against the row currently being evaluated, so a correlated
 /// subquery can see the outer query's columns.
@@ -156,6 +184,9 @@ fn eval_scalar_func(
     runner: Option<&dyn SubqueryRunner>,
 ) -> Result<Option<Value>> {
     match name {
+        // Niladic session functions report the active role names.
+        "CURRENT_USER" | "CURRENT_ROLE" => Ok(Some(Value::Text(current_user()))),
+        "SESSION_USER" => Ok(Some(Value::Text(session_user()))),
         // COALESCE returns the first non-NULL argument; it evaluates lazily.
         "COALESCE" => {
             for a in args {
