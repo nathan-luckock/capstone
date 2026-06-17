@@ -346,27 +346,31 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 
 ### Supported SQL surface
 
-DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` column
-constraints), `CREATE INDEX`, and `DROP TABLE`. DML is `INSERT` (multi-row),
-`UPDATE`, and `DELETE`. Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`.
-`SELECT` covers:
+DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` constraints
+and `DEFAULT <constant>` per column), `CREATE INDEX`, `DROP TABLE`, and
+`TRUNCATE TABLE`. DML is `INSERT` (multi-row, omitted columns take their
+default), `UPDATE`, and `DELETE`. Transaction control is `BEGIN` / `COMMIT` /
+`ROLLBACK`. `SELECT` covers:
 
 - Projections with `AS` aliases, `*`, and arbitrary expressions.
 - `WHERE` over the full expression grammar.
-- `INNER JOIN` and `LEFT JOIN` with `ON`.
+- `INNER JOIN`, `LEFT JOIN`, and `CROSS JOIN` (and comma joins) with `ON`.
 - `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (including
   `COUNT(DISTINCT ...)`), and `HAVING`.
-- `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`), `LIMIT`, and `OFFSET`.
+- `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`, and by output ordinal or
+  alias), `LIMIT`, and `OFFSET`.
 - `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.
-- Uncorrelated scalar subqueries `(SELECT ...)` and `expr [NOT] IN (SELECT ...)`.
+- Uncorrelated scalar subqueries `(SELECT ...)`, `expr [NOT] IN (SELECT ...)`,
+  and `EXISTS (SELECT ...)`.
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
 arithmetic with int-to-float promotion, comparison and boolean logic with
 three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
 `IS NULL` (each negatable), `CASE` (searched and simple), string concatenation
-(`||`), and the scalar functions `LENGTH`, `UPPER`, `LOWER`, `ABS`, `ROUND`,
-`CONCAT`, `COALESCE`, and `NULLIF`.
+(`||`), and the scalar functions `LENGTH`, `UPPER`, `LOWER`, `TRIM` / `LTRIM` /
+`RTRIM`, `SUBSTR`, `REPLACE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`,
+`SQRT`, `CONCAT`, `COALESCE`, and `NULLIF`.
 
 ### Scope and deferrals
 
