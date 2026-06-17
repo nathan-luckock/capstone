@@ -7,11 +7,16 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 
 - **DDL** — `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` /
   `DEFAULT` / `SERIAL`, plus `CHECK` and single-column `FOREIGN KEY`
-  constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`,
-  `CREATE INDEX`, `CREATE VIEW` / `DROP VIEW`, and
-  `CREATE TABLE name AS <query>` (build and populate a table from a query
-  result, inferring its columns). `CREATE TABLE IF NOT EXISTS` and
-  `DROP TABLE` / `DROP VIEW ... IF EXISTS` make a schema script re-runnable.
+  constraints), `DROP TABLE`, `TRUNCATE TABLE`, `CREATE INDEX`,
+  `CREATE VIEW` / `DROP VIEW`, and `CREATE TABLE name AS <query>` (build and
+  populate a table from a query result, inferring its columns).
+  `CREATE TABLE IF NOT EXISTS` and `DROP TABLE` / `DROP VIEW ... IF EXISTS`
+  make a schema script re-runnable.
+- **`ALTER TABLE`** — `ADD COLUMN` (existing rows take the column's `DEFAULT`
+  or NULL), `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN a TO b`, and
+  `RENAME TO new_name`. Add and drop rewrite the table into fresh storage; a
+  drop or rename is refused when a `CHECK` or `FOREIGN KEY` constraint names
+  the column, so no constraint is left pointing at a stale name.
 - **Auto-increment** — a `SERIAL` column fills in the next id (running max plus
   one) when an `INSERT` omits it; the set of serial columns survives a restart
   in a `.seq` sidecar.

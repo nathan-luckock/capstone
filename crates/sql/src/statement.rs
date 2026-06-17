@@ -302,6 +302,46 @@ impl fmt::Display for TableConstraint {
     }
 }
 
+/// A single `ALTER TABLE` change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AlterAction {
+    /// `ADD [COLUMN] c TYPE ...`: append a column.
+    AddColumn(ColumnDef),
+    /// `DROP [COLUMN] [IF EXISTS] c`: remove a column.
+    DropColumn {
+        /// The column to remove.
+        name: String,
+        /// `IF EXISTS`: a missing column is a no-op, not an error.
+        if_exists: bool,
+    },
+    /// `RENAME [COLUMN] from TO to`: rename a column.
+    RenameColumn {
+        /// The current column name.
+        from: String,
+        /// The new column name.
+        to: String,
+    },
+    /// `RENAME TO name`: rename the table itself.
+    RenameTable {
+        /// The new table name.
+        to: String,
+    },
+}
+
+impl fmt::Display for AlterAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddColumn(column) => write!(f, "ADD COLUMN {column}"),
+            Self::DropColumn { name, if_exists } => {
+                let guard = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP COLUMN {guard}{name}")
+            }
+            Self::RenameColumn { from, to } => write!(f, "RENAME COLUMN {from} TO {to}"),
+            Self::RenameTable { to } => write!(f, "RENAME TO {to}"),
+        }
+    }
+}
+
 /// A set operation combining two queries.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SetOp {
@@ -477,12 +517,13 @@ pub enum Statement {
         /// Whether the file has (import) or should get (export) a header row.
         header: bool,
     },
-    /// `ALTER TABLE t ADD COLUMN c TYPE ...`: append a column.
-    AlterTableAddColumn {
+    /// `ALTER TABLE t <action>`: add, drop, or rename a column, or rename the
+    /// table itself.
+    AlterTable {
         /// Target table.
         table: String,
-        /// The new column's definition.
-        column: ColumnDef,
+        /// What to change.
+        action: AlterAction,
     },
     /// `BEGIN`: start an explicit transaction.
     Begin,
@@ -766,8 +807,8 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::AlterTableAddColumn { table, column } => {
-                write!(f, "ALTER TABLE {table} ADD COLUMN {column}")
+            Self::AlterTable { table, action } => {
+                write!(f, "ALTER TABLE {table} {action}")
             }
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
@@ -884,12 +925,8 @@ impl Parser {
                 self.advance();
                 self.expect_keyword(Keyword::Table)?;
                 let table = self.parse_ident()?;
-                self.expect_keyword(Keyword::Add)?;
-                self.eat_keyword(Keyword::Column); // optional COLUMN keyword
-                                                   // Inline constraints on an added column are not yet enforced;
-                                                   // accept the column definition and ignore them.
-                let (column, _inline) = self.parse_column_def()?;
-                Statement::AlterTableAddColumn { table, column }
+                let action = self.parse_alter_action()?;
+                Statement::AlterTable { table, action }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::With) => self.parse_with()?,
@@ -1488,6 +1525,43 @@ impl Parser {
         })
     }
 
+    /// Parse the action after `ALTER TABLE name`: `ADD`, `DROP`, or `RENAME`.
+    fn parse_alter_action(&mut self) -> Result<AlterAction> {
+        if self.eat_keyword(Keyword::Add) {
+            self.eat_keyword(Keyword::Column); // optional COLUMN keyword
+                                               // Inline constraints on an added column are not yet enforced;
+                                               // accept the column definition and ignore them.
+            let (column, _inline) = self.parse_column_def()?;
+            Ok(AlterAction::AddColumn(column))
+        } else if self.eat_keyword(Keyword::Drop) {
+            self.eat_keyword(Keyword::Column); // optional COLUMN keyword
+            let if_exists = self.parse_if_exists()?;
+            let name = self.parse_ident()?;
+            Ok(AlterAction::DropColumn { name, if_exists })
+        } else if self.eat_ident_kw("rename") {
+            // `RENAME TO new` renames the table; `RENAME [COLUMN] from TO to`
+            // renames a column.
+            if self.eat_ident_kw("to") {
+                Ok(AlterAction::RenameTable {
+                    to: self.parse_ident()?,
+                })
+            } else {
+                self.eat_keyword(Keyword::Column); // optional COLUMN keyword
+                let from = self.parse_ident()?;
+                if !self.eat_ident_kw("to") {
+                    return Err(SqlError::parse("expected TO in RENAME COLUMN", self.span()));
+                }
+                let to = self.parse_ident()?;
+                Ok(AlterAction::RenameColumn { from, to })
+            }
+        } else {
+            Err(SqlError::parse(
+                "expected ADD, DROP, or RENAME after ALTER TABLE name",
+                self.span(),
+            ))
+        }
+    }
+
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
         if self.eat_keyword(Keyword::View) {
@@ -1861,7 +1935,37 @@ mod tests {
     fn alter_and_truncate_round_trip() {
         round_trip("ALTER TABLE t ADD COLUMN c INT DEFAULT 0");
         round_trip("ALTER TABLE t ADD COLUMN flag BOOL NOT NULL DEFAULT TRUE");
+        round_trip("ALTER TABLE t DROP COLUMN c");
+        round_trip("ALTER TABLE t DROP COLUMN IF EXISTS c");
+        round_trip("ALTER TABLE t RENAME COLUMN a TO b");
+        round_trip("ALTER TABLE t RENAME TO u");
         round_trip("TRUNCATE TABLE t");
+    }
+
+    #[test]
+    fn alter_actions_parse_to_the_right_variant() {
+        let Statement::AlterTable { action, .. } = parse("ALTER TABLE t DROP COLUMN IF EXISTS c")
+        else {
+            panic!("expected ALTER TABLE");
+        };
+        assert_eq!(
+            action,
+            AlterAction::DropColumn {
+                name: "c".into(),
+                if_exists: true,
+            }
+        );
+        let Statement::AlterTable { action, .. } = parse("ALTER TABLE t RENAME a TO b") else {
+            panic!("expected ALTER TABLE");
+        };
+        // The COLUMN keyword is optional in RENAME.
+        assert_eq!(
+            action,
+            AlterAction::RenameColumn {
+                from: "a".into(),
+                to: "b".into(),
+            }
+        );
     }
 
     #[test]
