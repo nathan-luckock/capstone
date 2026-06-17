@@ -41,7 +41,8 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 - **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots;
   auto-commit otherwise.
 - **`EXPLAIN`** — the cost-annotated physical plan, showing the planner's scan
-  and join choices.
+  and join choices. `EXPLAIN ANALYZE` also runs the query and appends the
+  actual row count and wall-clock time.
 - **`ANALYZE [table]`** — scan the live rows and record real per-column
   statistics (distinct count and integer min/max) so the cost model estimates
   selectivity from data instead of defaults; a range bound now uses the

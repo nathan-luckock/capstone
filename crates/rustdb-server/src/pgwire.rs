@@ -269,7 +269,7 @@ fn handle_bind<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8]) 
         Statement::Select(_)
             | Statement::Union { .. }
             | Statement::With { .. }
-            | Statement::Explain(_)
+            | Statement::Explain { .. }
     );
     session.portals.insert(
         portal_name,

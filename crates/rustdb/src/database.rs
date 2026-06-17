@@ -516,8 +516,8 @@ impl Database {
                 ref table,
                 ref column,
             } => self.alter_add_column(table, column),
-            // EXPLAIN only plans; it touches no data.
-            Statement::Explain(_) => self.run_explain(&stmt),
+            // EXPLAIN plans; EXPLAIN ANALYZE also runs the query.
+            Statement::Explain { .. } => self.run_explain(&stmt),
             // DML and SELECT run inside the open transaction, or a fresh
             // auto-commit one. `expand_ctes` inlined any non-recursive WITH;
             // only a recursive WITH reaches here, evaluated against a snapshot.
@@ -2186,18 +2186,28 @@ impl Database {
     }
 
     fn run_explain(&self, stmt: &Statement) -> Result<QueryOutcome> {
-        let Statement::Explain(inner) = stmt else {
+        let Statement::Explain { analyze, statement } = stmt else {
             unreachable!("guarded by execute");
         };
-        match inner.as_ref() {
+        match statement.as_ref() {
             Statement::Select(_) | Statement::Union { .. } => {
                 // Fold subqueries under a transient read snapshot so EXPLAIN
                 // plans the same query the executor would run.
                 let txn = self.mgr.begin();
-                let folded = self.fold_query(&txn, inner)?;
+                let folded = self.fold_query(&txn, statement)?;
                 let logical = bind(&self.catalog, &folded)?;
                 let physical = plan(&logical, &self.catalog)?;
-                Ok(QueryOutcome::Explain(explain(&physical)))
+                let mut out = explain(&physical);
+                if *analyze {
+                    // ANALYZE actually runs the query and reports the real row
+                    // count and wall-clock time alongside the estimates above.
+                    use std::fmt::Write as _;
+                    let start = std::time::Instant::now();
+                    let (_columns, rows) = self.execute_query(&txn, &folded)?;
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let _ = write!(out, "Execution: actual rows={} time={ms:.3}ms", rows.len());
+                }
+                Ok(QueryOutcome::Explain(out))
             }
             _ => Err(DbError::Unsupported(
                 "EXPLAIN of a non-query statement".into(),
@@ -2540,7 +2550,10 @@ fn expand_ctes(stmt: Statement) -> Result<Statement> {
             ctes,
             body,
         } => inline_with(&ctes, &body),
-        Statement::Explain(inner) => Ok(Statement::Explain(Box::new(expand_ctes(*inner)?))),
+        Statement::Explain { analyze, statement } => Ok(Statement::Explain {
+            analyze,
+            statement: Box::new(expand_ctes(*statement)?),
+        }),
         other => Ok(other),
     }
 }
@@ -4027,6 +4040,31 @@ mod tests {
         );
         // A named, unknown table is an error.
         assert!(db.execute("ANALYZE ghost").is_err());
+    }
+
+    #[test]
+    fn explain_analyze_reports_actual_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        // EXPLAIN ANALYZE runs the query and appends the real row count.
+        let plan = match db
+            .execute("EXPLAIN ANALYZE SELECT id FROM t WHERE id > 1")
+            .unwrap()
+        {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(
+            plan.contains("Execution: actual rows=2"),
+            "plan was:\n{plan}"
+        );
+        // Plain EXPLAIN never runs the query, so it has no execution line.
+        let bare = match db.execute("EXPLAIN SELECT id FROM t").unwrap() {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(!bare.contains("Execution:"), "plan was:\n{bare}");
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---
