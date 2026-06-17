@@ -46,6 +46,8 @@ const fn type_tag(t: DataType) -> &'static str {
         DataType::Float => "FLOAT",
         DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
+        DataType::Date => "DATE",
+        DataType::Timestamp => "TIMESTAMP",
     }
 }
 
@@ -55,6 +57,8 @@ fn parse_type(s: &str) -> Option<DataType> {
         "FLOAT" => Some(DataType::Float),
         "BOOL" => Some(DataType::Bool),
         "TEXT" => Some(DataType::Text),
+        "DATE" => Some(DataType::Date),
+        "TIMESTAMP" => Some(DataType::Timestamp),
         _ => None,
     }
 }
@@ -68,6 +72,8 @@ fn encode_default(default: Option<&Value>) -> String {
         Some(Value::Int(n)) => format!("i{n}"),
         Some(Value::Float(x)) => format!("f{}", x.to_bits()),
         Some(Value::Bool(b)) => format!("B{}", u8::from(*b)),
+        Some(Value::Date(n)) => format!("d{n}"),
+        Some(Value::Timestamp(n)) => format!("t{n}"),
         Some(Value::Text(s)) => {
             let mut out = String::from("s");
             for b in s.bytes() {
@@ -89,6 +95,8 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
         'i' => Value::Int(rest.parse().map_err(|_| invalid())?),
         'f' => Value::Float(f64::from_bits(rest.parse().map_err(|_| invalid())?)),
         'B' => Value::Bool(rest == "1"),
+        'd' => Value::Date(rest.parse().map_err(|_| invalid())?),
+        't' => Value::Timestamp(rest.parse().map_err(|_| invalid())?),
         's' => {
             if rest.len() % 2 != 0 {
                 return Err(invalid());

@@ -32,6 +32,8 @@ const fn value_type_name(v: &Value) -> &'static str {
         Value::Float(_) => "FLOAT",
         Value::Text(_) => "TEXT",
         Value::Bool(_) => "BOOL",
+        Value::Date(_) => "DATE",
+        Value::Timestamp(_) => "TIMESTAMP",
         Value::Null => "NULL",
     }
 }
@@ -43,6 +45,8 @@ const fn data_type_name(t: DataType) -> &'static str {
         DataType::Float => "FLOAT",
         DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
+        DataType::Date => "DATE",
+        DataType::Timestamp => "TIMESTAMP",
     }
 }
 
@@ -68,6 +72,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>> {
             Value::Int(n) if ty == DataType::Int => bytes.extend_from_slice(&n.to_le_bytes()),
             Value::Float(x) if ty == DataType::Float => bytes.extend_from_slice(&x.to_le_bytes()),
             Value::Bool(b) if ty == DataType::Bool => bytes.push(u8::from(*b)),
+            // DATE and TIMESTAMP store their epoch offset as a little-endian i64.
+            Value::Date(n) if ty == DataType::Date => bytes.extend_from_slice(&n.to_le_bytes()),
+            Value::Timestamp(n) if ty == DataType::Timestamp => {
+                bytes.extend_from_slice(&n.to_le_bytes());
+            }
             Value::Text(s) if ty == DataType::Text => {
                 let len = u32::try_from(s.len()).map_err(|_| ExecError::RowType {
                     column: i,
@@ -121,6 +130,16 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                 let raw = rest.first().ok_or(ExecError::RowTruncated { column: i })?;
                 out.push(Value::Bool(*raw != 0));
                 rest = &rest[1..];
+            }
+            DataType::Date | DataType::Timestamp => {
+                let raw = rest.get(..8).ok_or(ExecError::RowTruncated { column: i })?;
+                let n = i64::from_le_bytes(raw.try_into().expect("checked 8 bytes"));
+                out.push(if ty == DataType::Date {
+                    Value::Date(n)
+                } else {
+                    Value::Timestamp(n)
+                });
+                rest = &rest[8..];
             }
             DataType::Text => {
                 let len_bytes = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;

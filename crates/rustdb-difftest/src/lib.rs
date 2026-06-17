@@ -393,7 +393,9 @@ fn run_rustdb(prog: &Program) -> Result<Vec<String>, String> {
 fn canon_rustdb(v: &Value) -> String {
     match v {
         Value::Null => "N".to_string(),
-        Value::Int(n) => format!("i{n}"),
+        // The generator does not emit DATE / TIMESTAMP columns, so the temporal
+        // arms never reach the comparison; they fold in with INT for compactness.
+        Value::Int(n) | Value::Date(n) | Value::Timestamp(n) => format!("i{n}"),
         Value::Text(s) => format!("t{s}"),
         Value::Bool(b) => format!("i{}", i64::from(*b)),
         Value::Float(x) => canon_float(*x),

@@ -200,6 +200,10 @@ pub enum DataType {
     Bool,
     /// Variable-length text.
     Text,
+    /// A calendar date (no time of day).
+    Date,
+    /// A date and time of day (UTC, no time zone), microsecond resolution.
+    Timestamp,
 }
 
 impl fmt::Display for DataType {
@@ -209,6 +213,8 @@ impl fmt::Display for DataType {
             Self::Float => "FLOAT",
             Self::Bool => "BOOL",
             Self::Text => "TEXT",
+            Self::Date => "DATE",
+            Self::Timestamp => "TIMESTAMP",
         })
     }
 }
@@ -1440,10 +1446,23 @@ impl Parser {
                 self.advance();
                 DataType::Text
             }
+            // DATE / TIMESTAMP are not reserved words (so `date` stays usable as
+            // a column name), so they are matched here as plain identifiers.
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("date") => {
+                self.advance();
+                DataType::Date
+            }
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("timestamp") || s.eq_ignore_ascii_case("datetime") =>
+            {
+                self.advance();
+                DataType::Timestamp
+            }
             other => {
                 return Err(SqlError::parse(
                     format!(
-                        "expected a column type (INT, SERIAL, FLOAT, BOOL, or TEXT), found {other:?}"
+                        "expected a column type (INT, SERIAL, FLOAT, BOOL, TEXT, DATE, or \
+                         TIMESTAMP), found {other:?}"
                     ),
                     self.span(),
                 ));
@@ -1966,6 +1985,20 @@ mod tests {
                 to: "b".into(),
             }
         );
+    }
+
+    #[test]
+    fn date_and_timestamp_types_and_literals_round_trip() {
+        round_trip("CREATE TABLE t (d DATE, ts TIMESTAMP)");
+        round_trip("SELECT (a > DATE '2024-01-15') FROM t");
+        round_trip("SELECT (a >= TIMESTAMP '2024-01-15 10:30:00') FROM t");
+        // `date` stays usable as a column name (the words are not reserved).
+        round_trip("SELECT date FROM t");
+        // An invalid literal is a parse error.
+        assert!(Parser::from_sql("SELECT DATE '2024-13-40'")
+            .expect("lex")
+            .parse_statement()
+            .is_err());
     }
 
     #[test]
