@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rustdb_storage::{BufferPool, HeapPage, PageHeader, PageId, PageType, SlotId};
+use picklejar_storage::{BufferPool, HeapPage, PageHeader, PageId, PageType, SlotId};
 
 use crate::error::Result;
 use crate::lsn::{Lsn, TxnId};
@@ -345,7 +345,7 @@ fn read_all(wal_path: impl AsRef<Path>) -> Result<HashMap<u64, (RecordHeader, Lo
 /// Map a storage error into a WAL error. Recovery surfaces storage failures
 /// as I/O errors since they all mean "the page layer could not complete a
 /// recovery operation".
-fn to_io(e: rustdb_storage::StorageError) -> crate::error::WalError {
+fn to_io(e: picklejar_storage::StorageError) -> crate::error::WalError {
     crate::error::WalError::Io(std::io::Error::other(e))
 }
 
@@ -354,7 +354,7 @@ mod tests {
     use super::*;
     use crate::lsn::TxnId;
     use crate::writer::WalWriter;
-    use rustdb_storage::{FileManager, SlotId, PAGE_SIZE};
+    use picklejar_storage::{FileManager, SlotId, PAGE_SIZE};
     use tempfile::TempDir;
 
     /// Build a WAL on disk from a list of `(record, txn, prev_lsn)`

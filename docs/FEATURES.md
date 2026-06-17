@@ -51,7 +51,7 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 - **Dump / restore** — the CLI's `\dump [file]` writes a self-contained SQL
   script (tables in foreign-key-safe order with their constraints, then
   explicit indexes, views, and an `INSERT` per table) that recreates the whole
-  database when run on an empty one. This is rustdb's `pg_dump`.
+  database when run on an empty one. This is picklejar's `pg_dump`.
 - **Temporal types** — `DATE` and `TIMESTAMP` columns, with `DATE '2024-01-15'`
   / `TIMESTAMP '2024-01-15 10:30:00'` typed literals (a bare string is coerced
   into a temporal column). Stored as an epoch offset (days / microseconds) so
@@ -104,7 +104,7 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 
 ## Correctness and crash safety
 
-The graded requirement is "forced crash, no committed data loss." rustdb proves
+The graded requirement is "forced crash, no committed data loss." picklejar proves
 it three ways:
 
 1. **In-process recovery tests** — drive a workload, drop the buffer pool
@@ -130,11 +130,11 @@ recovery skips undo for a transaction that already logged `Abort`. The fix makes
 rollback log compensation records so redo reproduces it. The write-up is in
 [design.md](design.md#crash-model-and-the-torture-test).
 
-For query correctness, a separate **differential tester checks rustdb against
+For query correctness, a separate **differential tester checks picklejar against
 SQLite**. Each seed generates random SQL (joins, `GROUP BY` / `HAVING`,
 `DISTINCT`, set operations, three-valued NULL logic) in a dialect-shared subset
 and runs the identical query through both engines, comparing results as a sorted
-multiset. SQLite is the independent oracle, so any divergence is a rustdb bug.
+multiset. SQLite is the independent oracle, so any divergence is a picklejar bug.
 
 ```bash
 cargo run --release --bin difftest -- 100000   # 100k queries vs SQLite
@@ -151,18 +151,18 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 | [`sql`](../crates/sql/) | SQL lexer and recursive-descent parser |
 | [`planner`](../crates/planner/) | Logical plan, cost model, physical plan, EXPLAIN |
 | [`executor`](../crates/executor/) | Volcano operators and the row codec |
-| [`rustdb`](../crates/rustdb/) | The embedded engine that wires every layer together |
-| [`rustdb-cli`](../crates/rustdb-cli/) | The interactive shell |
-| [`rustdb-server`](../crates/rustdb-server/) | The PostgreSQL-wire-protocol server (`rustdb-pg`) and an HTTP/JSON API |
-| [`rustdb-difftest`](../crates/rustdb-difftest/) | Differential testing of the engine against SQLite |
+| [`picklejar`](../crates/picklejar/) | The embedded engine that wires every layer together |
+| [`picklejar-cli`](../crates/picklejar-cli/) | The interactive shell |
+| [`picklejar-server`](../crates/picklejar-server/) | The PostgreSQL-wire-protocol server (`picklejar-pg`) and an HTTP/JSON API |
+| [`picklejar-difftest`](../crates/picklejar-difftest/) | Differential testing of the engine against SQLite |
 
 ## Build and test
 
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run --bin rustdb         # the psql-style CLI
-cargo run --bin rustdb-pg      # the PostgreSQL-wire-protocol server
+cargo run --bin picklejar         # the psql-style CLI
+cargo run --bin picklejar-pg      # the PostgreSQL-wire-protocol server
 cargo run --release --bin dst  # deterministic crash-recovery simulations
 ```
 

@@ -7,8 +7,8 @@
 //! that never reached disk. Recovery must rebuild committed state from the
 //! WAL and roll back anything uncommitted.
 
-use rustdb_storage::{BufferPool, FileManager, HeapPage, PageId, SlotId, PAGE_SIZE};
-use rustdb_wal::{recover, MiniHeap, WalSyncHandle, WalWriter};
+use picklejar_storage::{BufferPool, FileManager, HeapPage, PageId, SlotId, PAGE_SIZE};
+use picklejar_wal::{recover, MiniHeap, WalSyncHandle, WalWriter};
 
 /// Open a buffer pool over `data` with `wal`'s hook installed.
 fn pool_with_wal(data: &std::path::Path, wal: &WalSyncHandle, frames: usize) -> BufferPool {

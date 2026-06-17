@@ -28,7 +28,7 @@
 
 use std::cell::Cell;
 
-use rustdb_storage::{BufferPool, HeapPage, PageHeader, PageId, SlotId};
+use picklejar_storage::{BufferPool, HeapPage, PageHeader, PageId, SlotId};
 
 use crate::error::Result;
 use crate::hook::WalSyncHandle;
@@ -89,7 +89,7 @@ pub struct MiniHeap<'p> {
 impl<'p> MiniHeap<'p> {
     /// Create a new table: allocate one empty heap page as the insert
     /// target. The `pool` must already have `wal`'s hook installed (via
-    /// [`BufferPool::with_wal`](rustdb_storage::BufferPool::with_wal)) so
+    /// [`BufferPool::with_wal`](picklejar_storage::BufferPool::with_wal)) so
     /// page flushes respect WAL ordering.
     pub fn create(pool: &'p BufferPool, wal: WalSyncHandle) -> Result<Self> {
         let (cur_page, mut guard) = pool.new_page().map_err(to_io)?;
@@ -258,7 +258,7 @@ impl<'p> MiniHeap<'p> {
     /// Read a slot's current bytes through the pool.
     pub fn read_slot(&self, page: PageId, slot: SlotId) -> Result<Option<Vec<u8>>> {
         let guard = self.pool.fetch_page(page).map_err(to_io)?;
-        let mut buf = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+        let mut buf = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
         buf.copy_from_slice(guard.page());
         let heap = HeapPage::from_bytes(&mut buf).map_err(to_io)?;
         Ok(heap.get(slot).map(<[u8]>::to_vec))
@@ -302,7 +302,7 @@ impl<'p> MiniHeap<'p> {
     /// Slot count of a page (number of slots, live + tombstoned).
     fn slot_count(&self, page: PageId) -> Result<u16> {
         let guard = self.pool.fetch_page(page).map_err(to_io)?;
-        let mut buf = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+        let mut buf = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
         buf.copy_from_slice(guard.page());
         let heap = HeapPage::from_bytes(&mut buf).map_err(to_io)?;
         Ok(heap.slot_count())
@@ -311,11 +311,11 @@ impl<'p> MiniHeap<'p> {
     /// Return a page that has room for a `tuple_len`-byte tuple, allocating
     /// and initializing a fresh page if the current one is full.
     fn page_with_room(&self, tuple_len: usize) -> Result<PageId> {
-        let needed = u16::try_from(tuple_len + rustdb_storage::SLOT_SIZE).unwrap_or(u16::MAX);
+        let needed = u16::try_from(tuple_len + picklejar_storage::SLOT_SIZE).unwrap_or(u16::MAX);
         let cur = self.cur_page.get();
         let have = {
             let guard = self.pool.fetch_page(cur).map_err(to_io)?;
-            let mut buf = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+            let mut buf = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
             buf.copy_from_slice(guard.page());
             let heap = HeapPage::from_bytes(&mut buf).map_err(to_io)?;
             heap.free_space()
@@ -333,12 +333,12 @@ impl<'p> MiniHeap<'p> {
 }
 
 /// Stamp a page header's LSN in place.
-fn stamp_lsn(buf: &mut rustdb_storage::Page, lsn: Lsn) {
+fn stamp_lsn(buf: &mut picklejar_storage::Page, lsn: Lsn) {
     let mut h = PageHeader::read(buf).expect("heap header present");
     h.lsn = lsn.get();
     h.write(buf);
 }
 
-fn to_io(e: rustdb_storage::StorageError) -> crate::error::WalError {
+fn to_io(e: picklejar_storage::StorageError) -> crate::error::WalError {
     crate::error::WalError::Io(std::io::Error::other(e))
 }

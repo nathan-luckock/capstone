@@ -3,14 +3,14 @@
 //! Wraps a [`WalWriter`] behind an `Rc<RefCell<>>` and implements
 //! [`WalSyncHook`] so the buffer pool can call `fsync_through` before
 //! flushing dirty pages without taking a direct dependency on
-//! `rustdb-wal`.
+//! `picklejar-wal`.
 //!
-//! [`WalSyncHook`]: rustdb_storage::WalSyncHook
+//! [`WalSyncHook`]: picklejar_storage::WalSyncHook
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rustdb_storage::WalSyncHook;
+use picklejar_storage::WalSyncHook;
 
 use crate::error::WalError;
 use crate::lsn::Lsn;
@@ -27,7 +27,7 @@ pub struct WalSyncHandle {
 impl WalSyncHandle {
     /// Wrap `writer` in a shared handle. The handle implements
     /// [`WalSyncHook`] and can be installed on a `BufferPool` via
-    /// [`BufferPool::with_wal`](rustdb_storage::BufferPool::with_wal).
+    /// [`BufferPool::with_wal`](picklejar_storage::BufferPool::with_wal).
     #[must_use]
     pub fn new(writer: WalWriter) -> Self {
         Self {

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=800&size=58&duration=2200&pause=1200&color=CE422B&center=true&vCenter=true&repeat=false&width=520&height=95&lines=rustdb" alt="rustdb" />
+<img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=800&size=58&duration=2200&pause=1200&color=CE422B&center=true&vCenter=true&repeat=false&width=520&height=95&lines=picklejar" alt="picklejar" />
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=18&duration=3200&pause=900&color=768390&center=true&vCenter=true&width=660&height=40&lines=a+relational+database%2C+from+the+bytes+up;disk+%E2%86%92+WAL+%E2%86%92+MVCC+%E2%86%92+planner+%E2%86%92+Postgres+wire;no+SQLite.+no+parser+crate.+every+layer+lives+here." alt="a relational database, built from the bytes up, in Rust" />
 
@@ -23,14 +23,14 @@
 ## ⚡ Quickstart
 
 ```bash
-cargo run --bin rustdb -- --database mydb.db
+cargo run --bin picklejar -- --database mydb.db
 ```
 
 ```sql
-rustdb> CREATE TABLE customers (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
-rustdb> INSERT INTO customers (name) VALUES ('alice'), ('bob') RETURNING id, name;
-rustdb> SELECT c.name, SUM(o.total) FROM orders o JOIN customers c ON o.cid = c.id GROUP BY c.name;
-rustdb> EXPLAIN SELECT name FROM customers WHERE id = 1;   -- the cost-annotated plan
+picklejar> CREATE TABLE customers (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+picklejar> INSERT INTO customers (name) VALUES ('alice'), ('bob') RETURNING id, name;
+picklejar> SELECT c.name, SUM(o.total) FROM orders o JOIN customers c ON o.cid = c.id GROUP BY c.name;
+picklejar> EXPLAIN SELECT name FROM customers WHERE id = 1;   -- the cost-annotated plan
 ```
 
 Close the file, reopen it, and your schema and rows are still there.
@@ -40,7 +40,7 @@ Close the file, reopen it, and your schema and rows are still there.
 No shim. The server implements the PostgreSQL v3 wire protocol, so the actual `psql` binary connects straight to the from-scratch engine:
 
 ```bash
-cargo run --release --bin rustdb-pg -- --database mydb.db --port 5433
+cargo run --release --bin picklejar-pg -- --database mydb.db --port 5433
 psql -h 127.0.0.1 -p 5433 -U postgres
 ```
 
@@ -57,7 +57,7 @@ That correlated subquery, the aggregate, and `EXPLAIN` all run through the engin
 
 ## 🧩 What's inside
 
-A toy "build a database" project stops at a key-value store or wraps an existing engine. rustdb implements the parts that actually make a database a database:
+A toy "build a database" project stops at a key-value store or wraps an existing engine. picklejar implements the parts that actually make a database a database:
 
 | | |
 |---|---|
@@ -101,9 +101,9 @@ cargo run --release --bin difftest -- 100000   # 100k queries checked against SQ
 ## 🗺️ Architecture
 
 ```text
-   psql / drivers ──TCP──▶ rustdb-pg  (PostgreSQL v3 wire)
+   psql / drivers ──TCP──▶ picklejar-pg  (PostgreSQL v3 wire)
                                 │
-   rustdb-cli (REPL) ──────────┤   Database::execute(sql)
+   picklejar-cli (REPL) ──────────┤   Database::execute(sql)
                                 ▼
         sql ▸ parser, AST   →   planner ▸ logical/physical plan, cost model, EXPLAIN
                                 ▼
@@ -125,7 +125,7 @@ cargo run --release --bin difftest -- 100000   # 100k queries checked against SQ
 
 ## 👋 About
 
-I'm Nathan - 20, and I've been getting paid to write software since I was in high school. rustdb is my senior capstone (CSE 499). I wanted to know if I could build a *real* database instead of a toy, so I wrote every layer myself: the bytes on disk, crash recovery, the optimizer, the Postgres wire protocol. It's open source because the best way to learn how a database works is to read one that was built on purpose, end to end. Still shipping.
+I'm Nathan - 20, and I've been getting paid to write software since I was in high school. picklejar is my senior capstone (CSE 499). I wanted to know if I could build a *real* database instead of a toy, so I wrote every layer myself: the bytes on disk, crash recovery, the optimizer, the Postgres wire protocol. It's open source because the best way to learn how a database works is to read one that was built on purpose, end to end. Still shipping.
 
 ## 📄 License
 

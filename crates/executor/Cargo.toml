@@ -1,18 +1,18 @@
 [package]
-name = "rustdb-executor"
+name = "picklejar-executor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Iterator-style query executor for rustdb."
+description = "Iterator-style query executor for picklejar."
 
 [dependencies]
-rustdb-planner.workspace = true
-rustdb-sql.workspace = true
-rustdb-storage.workspace = true
-rustdb-txn.workspace = true
+picklejar-planner.workspace = true
+picklejar-sql.workspace = true
+picklejar-storage.workspace = true
+picklejar-txn.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

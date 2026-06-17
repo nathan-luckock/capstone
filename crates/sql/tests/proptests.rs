@@ -7,11 +7,11 @@
 //! check that the printer and parser are exact inverses.
 
 use proptest::prelude::*;
-use rustdb_sql::ast::{BinOp, Expr, UnOp, Value};
-use rustdb_sql::statement::{
+use picklejar_sql::ast::{BinOp, Expr, UnOp, Value};
+use picklejar_sql::statement::{
     ColumnDef, DataType, Join, JoinKind, OrderItem, Select, SelectItem, Statement, TableRef,
 };
-use rustdb_sql::Parser;
+use picklejar_sql::Parser;
 
 // --- generators ---
 

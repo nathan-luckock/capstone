@@ -6,7 +6,7 @@
 //! table and column exists. A single-table WHERE is placed directly above
 //! the Scan (predicate pushdown); with joins it sits above the join tree.
 
-use rustdb_sql::{Expr, Select, SelectItem, Statement, TableRef, Value};
+use picklejar_sql::{Expr, Select, SelectItem, Statement, TableRef, Value};
 
 use crate::catalog::Catalog;
 use crate::error::{PlanError, Result};
@@ -519,7 +519,7 @@ fn resolve_qualified_column(qualifier: &str, column: &str, scope: &[ScopeEntry])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
     fn stmt(src: &str) -> Statement {
         Parser::from_sql(src)

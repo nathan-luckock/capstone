@@ -29,7 +29,7 @@
 //!    - Slot IDs of survived live tuples are stable across `compact`.
 
 use proptest::prelude::*;
-use rustdb_storage::{
+use picklejar_storage::{
     compute_checksum, recompute_checksum, verify_checksum, BTree, BufferPool, FileManager,
     HeapPage, Page, PageHeader, PageId, PageType, SlotId, StorageError, TupleRef, FLAG_DIRTY,
     FLAG_NEEDS_VACUUM, HEADER_SIZE, HEADER_SIZE_U16, MAX_TUPLE_SIZE, PAGE_SIZE, PAGE_SIZE_U16,

@@ -17,8 +17,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use rustdb_storage::{BufferPool, FileManager};
-use rustdb_wal::{MiniHeap, WalSyncHandle, WalWriter};
+use picklejar_storage::{BufferPool, FileManager};
+use picklejar_wal::{MiniHeap, WalSyncHandle, WalWriter};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

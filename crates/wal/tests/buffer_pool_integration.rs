@@ -5,8 +5,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rustdb_storage::{header::PageHeader, BufferPool, FileManager, PageId, WalSyncHook, PAGE_SIZE};
-use rustdb_wal::{LogRecord, Lsn, TxnId, WalSyncHandle, WalWriter};
+use picklejar_storage::{header::PageHeader, BufferPool, FileManager, PageId, WalSyncHook, PAGE_SIZE};
+use picklejar_wal::{LogRecord, Lsn, TxnId, WalSyncHandle, WalWriter};
 
 /// Test double that records every `fsync_through` call. Lets tests
 /// assert WAL ordering happened with the expected LSN.

@@ -1,15 +1,15 @@
 [package]
-name = "rustdb-wal"
+name = "picklejar-wal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Write-ahead log and ARIES-style crash recovery for rustdb."
+description = "Write-ahead log and ARIES-style crash recovery for picklejar."
 
 [dependencies]
-rustdb-storage.workspace = true
+picklejar-storage.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tempfile = "3"

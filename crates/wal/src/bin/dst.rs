@@ -1,7 +1,7 @@
 //! Deterministic simulation testing (DST) runner for crash recovery.
 //!
 //! Each seed drives one fully reproducible crash-and-recover scenario (see
-//! [`rustdb_wal::sim`]). This binary sweeps a range of seeds and reports the
+//! [`picklejar_wal::sim`]). This binary sweeps a range of seeds and reports the
 //! first that breaks an invariant, so it can be replayed exactly.
 //!
 //! ```text
@@ -12,7 +12,7 @@
 
 use std::process::ExitCode;
 
-use rustdb_wal::run_seed;
+use picklejar_wal::run_seed;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();

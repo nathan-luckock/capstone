@@ -1,0 +1,25 @@
+[package]
+name = "picklejar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Top-level picklejar library - embeds storage, WAL, txn, SQL, planner, and executor."
+
+[dependencies]
+picklejar-storage.workspace = true
+picklejar-wal.workspace = true
+picklejar-txn.workspace = true
+picklejar-sql.workspace = true
+picklejar-planner.workspace = true
+picklejar-executor.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

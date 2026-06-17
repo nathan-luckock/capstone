@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use rustdb_storage::{
+use picklejar_storage::{
     BufferPool, Disk, HeapPage, Page, PageId, Result as StorageResult, SlotId, StorageError,
     PAGE_SIZE,
 };

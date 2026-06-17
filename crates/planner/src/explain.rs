@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use rustdb_sql::JoinKind;
+use picklejar_sql::JoinKind;
 
 use crate::physical::PhysicalPlan;
 
@@ -186,9 +186,9 @@ mod tests {
     use crate::binder::bind;
     use crate::catalog::{Catalog, ColumnStats};
     use crate::physical::plan;
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
-    fn stmt(src: &str) -> rustdb_sql::Statement {
+    fn stmt(src: &str) -> picklejar_sql::Statement {
         Parser::from_sql(src).unwrap().parse_statement().unwrap()
     }
 

@@ -10,9 +10,9 @@
 //! transaction whose in-memory rollback was lost in the crash could resurrect
 //! its row, because recovery skips undo for a transaction that already logged
 //! `Abort`. The fix makes `abort` log its rollback as CLRs so redo reproduces
-//! it. See [`rustdb_wal::sim`].
+//! it. See [`picklejar_wal::sim`].
 
-use rustdb_wal::run_seed;
+use picklejar_wal::run_seed;
 
 #[test]
 fn many_seeds_recover_consistently() {

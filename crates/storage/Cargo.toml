@@ -1,12 +1,12 @@
 [package]
-name = "rustdb-storage"
+name = "picklejar-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Page manager, buffer pool, and B+ tree for the rustdb engine."
+description = "Page manager, buffer pool, and B+ tree for the picklejar engine."
 
 [dependencies]
 thiserror.workspace = true

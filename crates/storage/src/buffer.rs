@@ -57,9 +57,9 @@ use crate::page::{Page, PageId, PAGE_SIZE};
 /// guarantees every WAL record with LSN `<= page_lsn` is durable before
 /// returning.
 ///
-/// Implementors live in the WAL crate (see `rustdb-wal::WalSyncHandle`).
+/// Implementors live in the WAL crate (see `picklejar-wal::WalSyncHandle`).
 /// This trait lives in storage so the buffer pool can call it without
-/// taking a dependency on `rustdb-wal`, which would create a dependency
+/// taking a dependency on `picklejar-wal`, which would create a dependency
 /// cycle.
 pub trait WalSyncHook: std::fmt::Debug {
     /// Make every WAL record with LSN less than or equal to `page_lsn`

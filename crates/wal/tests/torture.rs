@@ -15,8 +15,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustdb_storage::{BufferPool, FileManager, HeapPage, PageId, SlotId, PAGE_SIZE};
-use rustdb_wal::recover;
+use picklejar_storage::{BufferPool, FileManager, HeapPage, PageId, SlotId, PAGE_SIZE};
+use picklejar_wal::recover;
 
 /// Number of independent kill/recover rounds.
 const ROUNDS: usize = 4;

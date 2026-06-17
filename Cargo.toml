@@ -7,10 +7,10 @@ members = [
     "crates/sql",
     "crates/planner",
     "crates/executor",
-    "crates/rustdb",
-    "crates/rustdb-cli",
-    "crates/rustdb-server",
-    "crates/rustdb-difftest",
+    "crates/picklejar",
+    "crates/picklejar-cli",
+    "crates/picklejar-server",
+    "crates/picklejar-difftest",
 ]
 
 [workspace.package]
@@ -23,13 +23,13 @@ authors = ["Nathan Luckock <nathanluckock@gmail.com>"]
 
 [workspace.dependencies]
 # Internal crates
-rustdb-storage = { path = "crates/storage" }
-rustdb-wal = { path = "crates/wal" }
-rustdb-txn = { path = "crates/txn" }
-rustdb-sql = { path = "crates/sql" }
-rustdb-planner = { path = "crates/planner" }
-rustdb-executor = { path = "crates/executor" }
-rustdb = { path = "crates/rustdb" }
+picklejar-storage = { path = "crates/storage" }
+picklejar-wal = { path = "crates/wal" }
+picklejar-txn = { path = "crates/txn" }
+picklejar-sql = { path = "crates/sql" }
+picklejar-planner = { path = "crates/planner" }
+picklejar-executor = { path = "crates/executor" }
+picklejar = { path = "crates/picklejar" }
 
 # Plumbing only. Nothing storage/parser/planner-related is allowed here.
 # The graded must-haves are hand-written (see docs/design.md ground rules).

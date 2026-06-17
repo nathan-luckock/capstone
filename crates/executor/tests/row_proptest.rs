@@ -4,9 +4,9 @@
 //! strings, and extreme integers), `decode_row(encode_row(r)) == r`.
 
 use proptest::prelude::*;
-use rustdb_executor::{decode_row, encode_row};
-use rustdb_sql::statement::DataType;
-use rustdb_sql::Value;
+use picklejar_executor::{decode_row, encode_row};
+use picklejar_sql::statement::DataType;
+use picklejar_sql::Value;
 
 /// A column type paired with a strategy for a value of that type (or NULL).
 fn column() -> impl Strategy<Value = (DataType, Value)> {

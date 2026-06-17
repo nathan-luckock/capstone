@@ -12,7 +12,7 @@ pub enum WalError {
     /// A storage-layer error escaped through the WAL surface (typically a
     /// page-header read failure when walking the page LSN).
     #[error("storage error: {0}")]
-    Storage(#[from] rustdb_storage::StorageError),
+    Storage(#[from] picklejar_storage::StorageError),
 
     /// The record's `length` field is shorter than the minimum header
     /// size. Indicates either a malformed write or on-disk corruption.

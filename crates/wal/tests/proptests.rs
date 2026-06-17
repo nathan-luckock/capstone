@@ -5,7 +5,7 @@
 //! at arbitrary offsets.
 
 use proptest::prelude::*;
-use rustdb_wal::{LogRecord, Lsn, TxnId, WalReader, WalWriter};
+use picklejar_wal::{LogRecord, Lsn, TxnId, WalReader, WalWriter};
 use std::io::Write;
 
 // --- strategies ---

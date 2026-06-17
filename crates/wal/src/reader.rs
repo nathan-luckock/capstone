@@ -133,7 +133,7 @@ mod tests {
     use crate::lsn::{Lsn, TxnId};
     use crate::record::TRAILER_BYTES;
     use crate::writer::WalWriter;
-    use rustdb_storage::crc32::crc32;
+    use picklejar_storage::crc32::crc32;
     use std::io::Write;
     use tempfile::TempDir;
 
