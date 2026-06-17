@@ -401,6 +401,115 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "picklejar"
+version = "0.0.1"
+dependencies = [
+ "picklejar-executor",
+ "picklejar-planner",
+ "picklejar-sql",
+ "picklejar-storage",
+ "picklejar-txn",
+ "picklejar-wal",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "picklejar-cli"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "picklejar",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "picklejar-difftest"
+version = "0.0.1"
+dependencies = [
+ "picklejar",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
+name = "picklejar-executor"
+version = "0.0.1"
+dependencies = [
+ "picklejar-planner",
+ "picklejar-sql",
+ "picklejar-storage",
+ "picklejar-txn",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "picklejar-planner"
+version = "0.0.1"
+dependencies = [
+ "picklejar-sql",
+ "picklejar-storage",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "picklejar-server"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "picklejar",
+ "picklejar-sql",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "picklejar-sql"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "picklejar-storage"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "picklejar-txn"
+version = "0.0.1"
+dependencies = [
+ "picklejar-storage",
+ "picklejar-wal",
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "picklejar-wal"
+version = "0.0.1"
+dependencies = [
+ "picklejar-storage",
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,115 +662,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
-]
-
-[[package]]
-name = "rustdb"
-version = "0.0.1"
-dependencies = [
- "rustdb-executor",
- "rustdb-planner",
- "rustdb-sql",
- "rustdb-storage",
- "rustdb-txn",
- "rustdb-wal",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "rustdb-cli"
-version = "0.0.1"
-dependencies = [
- "clap",
- "rustdb",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rustdb-difftest"
-version = "0.0.1"
-dependencies = [
- "rusqlite",
- "rustdb",
- "tempfile",
-]
-
-[[package]]
-name = "rustdb-executor"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "rustdb-planner",
- "rustdb-sql",
- "rustdb-storage",
- "rustdb-txn",
- "thiserror",
-]
-
-[[package]]
-name = "rustdb-planner"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "rustdb-sql",
- "rustdb-storage",
- "thiserror",
-]
-
-[[package]]
-name = "rustdb-server"
-version = "0.0.1"
-dependencies = [
- "clap",
- "rustdb",
- "rustdb-sql",
- "tempfile",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rustdb-sql"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "thiserror",
-]
-
-[[package]]
-name = "rustdb-storage"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "rustdb-txn"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "rustdb-storage",
- "rustdb-wal",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "rustdb-wal"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "rustdb-storage",
- "tempfile",
- "thiserror",
- "tracing",
 ]
 
 [[package]]

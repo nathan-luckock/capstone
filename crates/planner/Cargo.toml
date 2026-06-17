@@ -1,16 +1,16 @@
 [package]
-name = "rustdb-planner"
+name = "picklejar-planner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Logical and physical planning + cost-based query optimization for rustdb."
+description = "Logical and physical planning + cost-based query optimization for picklejar."
 
 [dependencies]
-rustdb-sql.workspace = true
-rustdb-storage.workspace = true
+picklejar-sql.workspace = true
+picklejar-storage.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

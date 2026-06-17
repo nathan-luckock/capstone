@@ -33,11 +33,11 @@ Squash-merge once it is green.
 
 | Crate | Responsibility |
 |---|---|
-| `rustdb-storage` | Pages, buffer pool, B+ tree |
-| `rustdb-wal` | Write-ahead log and ARIES recovery |
-| `rustdb-txn` | Transactions and MVCC |
-| `rustdb-sql` | SQL lexer and parser |
-| `rustdb-planner` | Logical plan, cost model, physical plan, EXPLAIN |
-| `rustdb-executor` | Volcano operators and row codec |
-| `rustdb` | The embedded engine that wires it together |
-| `rustdb-cli` | The interactive shell |
+| `picklejar-storage` | Pages, buffer pool, B+ tree |
+| `picklejar-wal` | Write-ahead log and ARIES recovery |
+| `picklejar-txn` | Transactions and MVCC |
+| `picklejar-sql` | SQL lexer and parser |
+| `picklejar-planner` | Logical plan, cost model, physical plan, EXPLAIN |
+| `picklejar-executor` | Volcano operators and row codec |
+| `picklejar` | The embedded engine that wires it together |
+| `picklejar-cli` | The interactive shell |

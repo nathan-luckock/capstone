@@ -1,4 +1,4 @@
-# rustdb - Design Document
+# picklejar - Design Document
 
 > Living design document. It records the architecture and the rationale behind each major decision, including the alternatives that were considered and rejected, so that a reviewer can reconstruct why the engine is shaped the way it is from this single file.
 
@@ -44,7 +44,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 ```
     +--------------------------+
-    |    rustdb-cli (REPL)     |
+    |    picklejar-cli (REPL)     |
     +--------------------------+
                  |  Database::execute(sql)
                  v
@@ -90,11 +90,11 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 **Decision: 8 KiB.** Matches Postgres default. Big enough to amortize per-page overhead, small enough that buffer-pool memory ratio is reasonable.
 
-Exposed as `rustdb_storage::PAGE_SIZE` (`usize`) and `PAGE_SIZE_U16` (typed mirror for `u16` arithmetic in the slot directory). A compile-time assertion in `page.rs` keeps them in sync.
+Exposed as `picklejar_storage::PAGE_SIZE` (`usize`) and `PAGE_SIZE_U16` (typed mirror for `u16` arithmetic in the slot directory). A compile-time assertion in `page.rs` keeps them in sync.
 
 ### File manager (Sprint 1 - shipped)
 
-`rustdb_storage::FileManager` owns the database file and exposes page-granular I/O. Single source of truth for raw page reads and writes; higher layers (buffer pool, WAL flush path) go through it.
+`picklejar_storage::FileManager` owns the database file and exposes page-granular I/O. Single source of truth for raw page reads and writes; higher layers (buffer pool, WAL flush path) go through it.
 
 ```rust
 impl FileManager {
@@ -161,7 +161,7 @@ Every page starts with a 24-byte header, little-endian:
 
 Slot directory entry (4 bytes, little-endian): `(offset: u16, length: u16)`. Length 0 = tombstoned.
 
-`rustdb_storage::HeapPage<'a>` wraps a `&'a mut Page` and exposes `init` / `from_bytes` / `insert` / `get` / `delete` / `compact` / `free_space` / `slot_count` / `tuple_count`.
+`picklejar_storage::HeapPage<'a>` wraps a `&'a mut Page` and exposes `init` / `from_bytes` / `insert` / `get` / `delete` / `compact` / `free_space` / `slot_count` / `tuple_count`.
 
 **Decisions:**
 
@@ -220,7 +220,7 @@ Forward `Iterator<Item = Result<(RecordHeader, LogRecord)>>`. Clean `None` on EO
 - **Lsn::INVALID = u64::MAX** sentinel (not 0); zero-init bugs would otherwise look like valid LSNs.
 - **Update carries both before and after images.** Before for undo, after for redo.
 - **Tail-truncation tolerance** in both the writer (on reopen) and reader (during iteration). A crash during fsync can leave a partial record at EOF; recovery treats everything after the last complete record as if it was never appended.
-- **WAL ordering hook trait lives in `rustdb-storage`** to avoid a circular dependency on `rustdb-wal`.
+- **WAL ordering hook trait lives in `picklejar-storage`** to avoid a circular dependency on `picklejar-wal`.
 
 ### Rejected
 
@@ -274,7 +274,7 @@ A dirty page cannot be flushed before its corresponding log records are fsync'd.
 
 ## Transactions + MVCC (Sprint 5 - shipped)
 
-Implemented in the `rustdb-txn` crate. Snapshot isolation is the default; Read Committed is also available.
+Implemented in the `picklejar-txn` crate. Snapshot isolation is the default; Read Committed is also available.
 
 ### Transaction manager (`manager.rs`)
 
@@ -334,7 +334,7 @@ The page header's `reserved: u32` field remains available for an on-page version
 
 ## SQL parser (Sprint 7 - shipped)
 
-No `sqlparser-rs`; implemented in `rustdb-sql`.
+No `sqlparser-rs`; implemented in `picklejar-sql`.
 
 ### Lexer (`lexer.rs`, `token.rs`)
 
@@ -551,7 +551,7 @@ scope for the must-have M6.
 
 ## Executor and engine (Sprint 9 - M1)
 
-The executor runs a physical plan against stored data, and the `rustdb`
+The executor runs a physical plan against stored data, and the `picklejar`
 engine ties every layer together so a SQL string produces rows. This is
 requirement M1 (CREATE / INSERT / SELECT with WHERE).
 
@@ -594,7 +594,7 @@ columns under their bare names.
 
 ### Engine glue
 
-`rustdb::Database` owns the storage stack (file manager, buffer pool, WAL,
+`picklejar::Database` owns the storage stack (file manager, buffer pool, WAL,
 transaction manager), an in-memory catalog, and a descriptor per table.
 `execute` parses and routes: DDL updates the catalog and creates or drops the
 backing `MvccTable`; `INSERT` encodes each row and stores it under an
@@ -717,13 +717,13 @@ the planner can cost an `IndexScan`, and persists its root page in the sidecar.
 
 ### CLI
 
-`rustdb-cli` is a psql-style REPL: SQL terminated by `;` prints an aligned
+`picklejar-cli` is a psql-style REPL: SQL terminated by `;` prints an aligned
 table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 (`\dt`, `\d <table>`, `\q`) introspect and exit. This is the M1 demo surface.
 
 ### HTTP API server
 
-`rustdb-server` exposes the engine over HTTP/JSON so a browser studio can use
+`picklejar-server` exposes the engine over HTTP/JSON so a browser studio can use
 it. Because the engine is `!Send` (the buffer pool holds `Rc`), the server is
 single-threaded: one accept loop owns one `Database` and processes requests in
 order. The HTTP layer and the JSON writer are hand-written, so the database and
@@ -742,7 +742,7 @@ This is the boundary the studio UI is built on: a SQL editor posts to
 
 ### PostgreSQL wire protocol
 
-`rustdb-pg` (in the `rustdb-server` crate, module `pgwire`) serves the engine
+`picklejar-pg` (in the `picklejar-server` crate, module `pgwire`) serves the engine
 over the real PostgreSQL v3 frontend/backend protocol, so the actual `psql`
 client, GUI tools, and language drivers connect to it directly. It serves
 **many connections concurrently** (see "Concurrency: the engine actor" below):
@@ -807,7 +807,7 @@ serial, hence correct, just not yet concurrent.
 - **Property tests** via `proptest` in `crates/storage/tests/proptests.rs`. Covers header round-trip, a full checksum bit-flip sweep (8 KiB x 8 bits = 65K flips per case), insert/delete/compact op-sequence invariants against an oracle, and file-manager durability across reopen.
 - **Crash-recovery torture test** (Sprint 4, shipped): `crates/wal/tests/torture.rs` spawns the `crash_harness` binary, force-kills it mid-write, recovers, and asserts no committed row is lost. Runs several rounds. A polish pass in Sprint 10 will extend the run length and add a long-soak variant.
 - **Deterministic simulation testing** (`crates/wal/src/sim.rs`, the `dst` binary): seeded, reproducible crash-recovery exploration over a durability-modeling fault disk. Found and fixed a real undo bug. See [Crash model and the torture test](#crash-model-and-the-torture-test).
-- **Differential testing against SQLite** (`crates/rustdb-difftest`, the `difftest` binary): for each seed, a generator emits random SQL in a dialect-shared subset (INT/TEXT columns, type-correct predicates, integer aggregates, no `ORDER BY` reliance) and runs the identical SQL through both rustdb and SQLite, comparing results as a sorted multiset. SQLite is the independent oracle: any divergence is a rustdb bug. Thousands of seeds covering joins, `GROUP BY` / `HAVING`, `DISTINCT`, and three-valued NULL logic agree with SQLite. The generator is deliberately type-correct, since rustdb (like Postgres) rejects cross-type comparisons that SQLite's dynamic typing would coerce; that difference is by design, not a bug. The generated subset will widen over time (more operators and types) to push the comparison further.
+- **Differential testing against SQLite** (`crates/picklejar-difftest`, the `difftest` binary): for each seed, a generator emits random SQL in a dialect-shared subset (INT/TEXT columns, type-correct predicates, integer aggregates, no `ORDER BY` reliance) and runs the identical SQL through both picklejar and SQLite, comparing results as a sorted multiset. SQLite is the independent oracle: any divergence is a picklejar bug. Thousands of seeds covering joins, `GROUP BY` / `HAVING`, `DISTINCT`, and three-valued NULL logic agree with SQLite. The generator is deliberately type-correct, since picklejar (like Postgres) rejects cross-type comparisons that SQLite's dynamic typing would coerce; that difference is by design, not a bug. The generated subset will widen over time (more operators and types) to push the comparison further.
 - CI bumps `PROPTEST_CASES=512` (local default 256).
 
 ---

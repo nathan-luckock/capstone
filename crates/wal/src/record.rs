@@ -19,7 +19,7 @@
 //! understanding its payload, and lets the recovery torture test handle
 //! tail truncation cleanly.
 
-use rustdb_storage::crc32::crc32;
+use picklejar_storage::crc32::crc32;
 
 use crate::error::{Result, WalError};
 use crate::lsn::{Lsn, TxnId};

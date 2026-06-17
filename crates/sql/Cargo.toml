@@ -1,12 +1,12 @@
 [package]
-name = "rustdb-sql"
+name = "picklejar-sql"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "SQL lexer and parser for rustdb. No sqlparser-rs."
+description = "SQL lexer and parser for picklejar. No sqlparser-rs."
 
 [dependencies]
 thiserror.workspace = true

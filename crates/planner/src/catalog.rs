@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use rustdb_sql::{DataType, Statement};
+use picklejar_sql::{DataType, Statement};
 
 use crate::error::{PlanError, Result};
 
@@ -136,7 +136,7 @@ impl Catalog {
         }
     }
 
-    fn create_table(&mut self, name: &str, columns: &[rustdb_sql::ColumnDef]) -> Result<()> {
+    fn create_table(&mut self, name: &str, columns: &[picklejar_sql::ColumnDef]) -> Result<()> {
         if self.tables.contains_key(name) {
             return Err(PlanError::TableExists(name.to_string()));
         }
@@ -222,7 +222,7 @@ impl Catalog {
     /// # Errors
     ///
     /// Returns an error if the table is unknown or the column already exists.
-    pub fn add_column(&mut self, table: &str, col: &rustdb_sql::ColumnDef) -> Result<()> {
+    pub fn add_column(&mut self, table: &str, col: &picklejar_sql::ColumnDef) -> Result<()> {
         let meta = self
             .tables
             .get_mut(table)
@@ -349,7 +349,7 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
     fn ddl(src: &str) -> Statement {
         Parser::from_sql(src)

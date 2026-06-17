@@ -25,7 +25,7 @@
 //! is a fixed-offset 8-byte write ([`set_xmax`]), so it never changes the
 //! version's size and never needs the slot to be relocated.
 
-use rustdb_storage::{PageId, SlotId, TupleRef};
+use picklejar_storage::{PageId, SlotId, TupleRef};
 
 use crate::error::{Result, TxnError};
 

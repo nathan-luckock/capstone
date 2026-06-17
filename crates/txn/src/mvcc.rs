@@ -40,8 +40,8 @@
 use std::cell::Cell;
 use std::ops::Bound;
 
-use rustdb_storage::{BTree, BufferPool, HeapPage, Page, PageHeader, PageId, SlotId, TupleRef};
-use rustdb_wal::{LogRecord, Lsn, TxnId, WalSyncHandle};
+use picklejar_storage::{BTree, BufferPool, HeapPage, Page, PageHeader, PageId, SlotId, TupleRef};
+use picklejar_wal::{LogRecord, Lsn, TxnId, WalSyncHandle};
 
 use crate::error::{Result, TxnError};
 use crate::manager::{IsolationLevel, Snapshot, Transaction, TransactionManager};
@@ -288,7 +288,7 @@ impl<'env> MvccTable<'env> {
     /// Copy a version's raw bytes out of its heap slot.
     fn read_version_bytes(&self, at: TupleRef) -> Result<Vec<u8>> {
         let guard = self.pool.fetch_page(at.page_id)?;
-        let mut buf: Box<Page> = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+        let mut buf: Box<Page> = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
         buf.copy_from_slice(guard.page());
         let heap = HeapPage::from_bytes(&mut buf)?;
         heap.get(at.slot_id).map(<[u8]>::to_vec).ok_or(
@@ -303,18 +303,18 @@ impl<'env> MvccTable<'env> {
 
     fn slot_count(&self, page: PageId) -> Result<u16> {
         let guard = self.pool.fetch_page(page)?;
-        let mut buf: Box<Page> = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+        let mut buf: Box<Page> = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
         buf.copy_from_slice(guard.page());
         let heap = HeapPage::from_bytes(&mut buf)?;
         Ok(heap.slot_count())
     }
 
     fn page_with_room(&self, len: usize) -> Result<PageId> {
-        let needed = u16::try_from(len + rustdb_storage::SLOT_SIZE).unwrap_or(u16::MAX);
+        let needed = u16::try_from(len + picklejar_storage::SLOT_SIZE).unwrap_or(u16::MAX);
         let cur = self.version_page.get();
         let have = {
             let guard = self.pool.fetch_page(cur)?;
-            let mut buf: Box<Page> = Box::new([0u8; rustdb_storage::PAGE_SIZE]);
+            let mut buf: Box<Page> = Box::new([0u8; picklejar_storage::PAGE_SIZE]);
             buf.copy_from_slice(guard.page());
             HeapPage::from_bytes(&mut buf)?.free_space()
         };
@@ -343,8 +343,8 @@ pub const DEFAULT_ISOLATION: IsolationLevel = IsolationLevel::RepeatableRead;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdb_storage::FileManager;
-    use rustdb_wal::WalWriter;
+    use picklejar_storage::FileManager;
+    use picklejar_wal::WalWriter;
     use tempfile::TempDir;
 
     struct Env {

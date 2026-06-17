@@ -20,8 +20,8 @@
 //! - `BOOL`  -> 1 byte, `0` or `1`.
 //! - `TEXT`  -> 4-byte little-endian length prefix, then that many UTF-8 bytes.
 
-use rustdb_sql::statement::DataType;
-use rustdb_sql::Value;
+use picklejar_sql::statement::DataType;
+use picklejar_sql::Value;
 
 use crate::error::{ExecError, Result};
 

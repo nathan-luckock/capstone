@@ -19,7 +19,7 @@
 //! - `NOT a` -> `1 - sel(a)`.
 //! - anything else -> `0.5` (no information).
 
-use rustdb_sql::{BinOp, Expr, UnOp};
+use picklejar_sql::{BinOp, Expr, UnOp};
 
 use crate::catalog::TableMeta;
 
@@ -135,7 +135,7 @@ const fn flip(op: BinOp) -> BinOp {
 /// The `i64` value of an integer literal expression, if it is one.
 const fn int_literal(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Literal(rustdb_sql::Value::Int(n)) => Some(*n),
+        Expr::Literal(picklejar_sql::Value::Int(n)) => Some(*n),
         _ => None,
     }
 }
@@ -217,7 +217,7 @@ pub fn index_scan_cost(rows: u64, selectivity: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnStats};
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
     fn table(distinct_id: u64) -> TableMeta {
         let mut c = Catalog::new();

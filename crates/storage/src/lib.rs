@@ -1,10 +1,10 @@
-//! Storage layer for the rustdb engine.
+//! Storage layer for the picklejar engine.
 //!
 //! Provides page-based on-disk storage, a buffer pool with pin/unpin
 //! semantics (Sprint 2), and a B+ tree index (Sprint 2). Everything above
 //! this crate (WAL, MVCC, SQL) treats storage as the canonical source of
 //! truth for committed data - but mutations flow through the WAL first
-//! (see `rustdb-wal`).
+//! (see `picklejar-wal`).
 //!
 //! # Layout
 //!

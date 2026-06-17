@@ -1,4 +1,4 @@
-# Sprint plan - rustdb
+# Sprint plan - picklejar
 
 Each sprint is roughly one week. Every sprint maps to a GitHub milestone, and
 every task to a pull request that is squash-merged once CI-equivalent checks

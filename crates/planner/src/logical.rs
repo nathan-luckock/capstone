@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use rustdb_sql::{Expr, JoinKind, SelectItem, SetOp};
+use picklejar_sql::{Expr, JoinKind, SelectItem, SetOp};
 
 /// A node in the logical plan tree.
 #[derive(Clone, Debug, Eq, PartialEq)]

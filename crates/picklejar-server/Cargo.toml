@@ -1,0 +1,34 @@
+[package]
+name = "picklejar-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Servers for the picklejar engine: a PostgreSQL wire-protocol server and an HTTP/JSON API for the studio UI."
+
+[lib]
+name = "picklejar_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "picklejar-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "picklejar-pg"
+path = "src/bin/picklejar-pg.rs"
+
+[dependencies]
+picklejar.workspace = true
+picklejar-sql.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

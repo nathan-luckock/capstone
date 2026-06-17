@@ -14,9 +14,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-use rustdb_planner::PhysicalPlan;
-use rustdb_sql::statement::SelectItem;
-use rustdb_sql::{BinOp, Expr, JoinKind, SetOp, Value};
+use picklejar_planner::PhysicalPlan;
+use picklejar_sql::statement::SelectItem;
+use picklejar_sql::{BinOp, Expr, JoinKind, SetOp, Value};
 
 use crate::error::{ExecError, Result};
 use crate::eval::{eval, eval_with, is_truthy, SubqueryRunner};

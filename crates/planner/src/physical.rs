@@ -9,7 +9,7 @@
 //! Every node carries `est_rows` and `est_cost` so EXPLAIN can show them and
 //! parent operators can cost themselves from their children.
 
-use rustdb_sql::{BinOp, Expr, JoinKind, SelectItem, SetOp};
+use picklejar_sql::{BinOp, Expr, JoinKind, SelectItem, SetOp};
 
 use crate::catalog::Catalog;
 use crate::cost::{estimate_rows, index_scan_cost, sargable_index, selectivity, seq_scan_cost};
@@ -512,9 +512,9 @@ mod tests {
     use super::*;
     use crate::binder::bind;
     use crate::catalog::{Catalog, ColumnStats};
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
-    fn stmt(src: &str) -> rustdb_sql::Statement {
+    fn stmt(src: &str) -> picklejar_sql::Statement {
         Parser::from_sql(src).unwrap().parse_statement().unwrap()
     }
 

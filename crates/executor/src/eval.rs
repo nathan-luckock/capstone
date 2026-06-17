@@ -8,8 +8,8 @@
 
 use std::cmp::Ordering;
 
-use rustdb_sql::statement::DataType;
-use rustdb_sql::{BinOp, Expr, UnOp, Value};
+use picklejar_sql::statement::DataType;
+use picklejar_sql::{BinOp, Expr, UnOp, Value};
 
 use crate::error::{ExecError, Result};
 
@@ -286,7 +286,7 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
 /// Split a `DATE` or `TIMESTAMP` value into (epoch days, microseconds into the
 /// day). A `DATE` is at midnight.
 fn temporal_parts(v: &Value) -> Result<(i64, i64)> {
-    use rustdb_sql::datetime::MICROS_PER_DAY;
+    use picklejar_sql::datetime::MICROS_PER_DAY;
     match v {
         Value::Date(d) => Ok((*d, 0)),
         Value::Timestamp(m) => Ok((m.div_euclid(MICROS_PER_DAY), m.rem_euclid(MICROS_PER_DAY))),
@@ -299,7 +299,7 @@ fn temporal_parts(v: &Value) -> Result<(i64, i64)> {
 /// `DATE_PART(field, value)` / `EXTRACT(field FROM value)`: a numeric component
 /// of a temporal value.
 fn date_part(field: &str, v: &Value) -> Result<Value> {
-    use rustdb_sql::datetime::{civil_from_days, days_from_civil};
+    use picklejar_sql::datetime::{civil_from_days, days_from_civil};
     let (days, tod) = temporal_parts(v)?;
     let (year, month, day) = civil_from_days(days);
     let secs = tod / 1_000_000;
@@ -322,7 +322,7 @@ fn date_part(field: &str, v: &Value) -> Result<Value> {
 /// `DATE_TRUNC(field, value)`: the temporal value floored to the start of the
 /// given field, always returned as a `TIMESTAMP`.
 fn date_trunc(field: &str, v: &Value) -> Result<Value> {
-    use rustdb_sql::datetime::{civil_from_days, days_from_civil, MICROS_PER_DAY};
+    use picklejar_sql::datetime::{civil_from_days, days_from_civil, MICROS_PER_DAY};
     let (days, tod) = temporal_parts(v)?;
     let (year, month, _) = civil_from_days(days);
     let secs = tod / 1_000_000;
@@ -471,7 +471,7 @@ fn eval_binary(
 /// parse as the target type.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
-    use rustdb_sql::datetime;
+    use picklejar_sql::datetime;
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -531,8 +531,8 @@ fn value_text(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(x) => x.to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::Date(days) => rustdb_sql::datetime::format_date(*days),
-        Value::Timestamp(micros) => rustdb_sql::datetime::format_timestamp(*micros),
+        Value::Date(days) => picklejar_sql::datetime::format_date(*days),
+        Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
         Value::Null => String::new(),
     }
 }
@@ -712,7 +712,7 @@ pub const fn is_truthy(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdb_sql::Parser;
+    use picklejar_sql::Parser;
 
     fn cols() -> Vec<String> {
         vec!["id".into(), "name".into()]

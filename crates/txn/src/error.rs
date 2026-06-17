@@ -14,11 +14,11 @@ pub enum TxnError {
 
     /// A storage-layer operation failed underneath the MVCC layer.
     #[error("storage error: {0}")]
-    Storage(#[from] rustdb_storage::StorageError),
+    Storage(#[from] picklejar_storage::StorageError),
 
     /// A WAL operation failed underneath the MVCC layer.
     #[error("wal error: {0}")]
-    Wal(#[from] rustdb_wal::WalError),
+    Wal(#[from] picklejar_wal::WalError),
 
     /// An update or delete targeted a key with no version visible to the
     /// transaction.

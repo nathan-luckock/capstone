@@ -5,8 +5,8 @@
 //! EXPLAIN rendering. The EXPLAIN strings are full snapshots so the demo
 //! output format is pinned.
 
-use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats, PhysicalPlan};
-use rustdb_sql::{Parser, Statement};
+use picklejar_planner::{bind, explain, plan, Catalog, ColumnStats, PhysicalPlan};
+use picklejar_sql::{Parser, Statement};
 
 /// Parse one statement.
 fn stmt(src: &str) -> Statement {
