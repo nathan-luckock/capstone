@@ -295,7 +295,8 @@ impl Database {
             Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }
-            | Statement::Select(_) => self.run_in_txn(&stmt),
+            | Statement::Select(_)
+            | Statement::Union { .. } => self.run_in_txn(&stmt),
         }
     }
 
@@ -371,7 +372,7 @@ impl Database {
                 table,
                 where_clause,
             } => self.run_delete(txn, table, where_clause.as_ref()),
-            Statement::Select(_) => self.run_select(txn, stmt),
+            Statement::Select(_) | Statement::Union { .. } => self.run_select(txn, stmt),
             other => Err(DbError::Unsupported(format!("cannot run: {other}"))),
         }
     }
@@ -734,13 +735,13 @@ impl Database {
             unreachable!("guarded by execute");
         };
         match inner.as_ref() {
-            Statement::Select(_) => {
+            Statement::Select(_) | Statement::Union { .. } => {
                 let logical = bind(&self.catalog, inner)?;
                 let physical = plan(&logical, &self.catalog)?;
                 Ok(QueryOutcome::Explain(explain(&physical)))
             }
             _ => Err(DbError::Unsupported(
-                "EXPLAIN of a non-SELECT statement".into(),
+                "EXPLAIN of a non-query statement".into(),
             )),
         }
     }
@@ -1808,5 +1809,55 @@ mod tests {
             .unwrap();
         let (_c, rows) = query(&mut db, "SELECT COUNT(DISTINCT c) FROM t");
         assert_eq!(rows, vec![vec![Value::Int(3)]]);
+    }
+
+    // --- UNION / UNION ALL ---
+
+    #[test]
+    fn union_dedups_and_union_all_keeps_duplicates() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2), (3)").unwrap();
+        db.execute("INSERT INTO b VALUES (3), (4)").unwrap();
+        // UNION removes the duplicate 3.
+        let (_c, u) = query(&mut db, "SELECT x FROM a UNION SELECT y FROM b ORDER BY x");
+        assert_eq!(id_set(&u), vec![1, 2, 3, 4]);
+        // UNION ALL keeps it (two 3s).
+        let (_c, ua) = query(&mut db, "SELECT x FROM a UNION ALL SELECT y FROM b");
+        let mut got: Vec<i64> = id_set(&ua);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 3, 4]);
+    }
+
+    #[test]
+    fn union_takes_left_column_names_and_explains() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+        let (cols, _r) = query(&mut db, "SELECT x FROM a UNION SELECT y FROM b");
+        assert_eq!(names(&cols), ["x"]); // output names come from the left query
+        let plan = match db
+            .execute("EXPLAIN SELECT x FROM a UNION ALL SELECT y FROM b")
+            .unwrap()
+        {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("Union ALL"), "plan was:\n{plan}");
+    }
+
+    #[test]
+    fn union_arity_mismatch_errors() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT, y INT)").unwrap();
+        db.execute("CREATE TABLE b (z INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 2)").unwrap();
+        db.execute("INSERT INTO b VALUES (3)").unwrap();
+        assert!(db
+            .execute("SELECT x, y FROM a UNION SELECT z FROM b")
+            .is_err());
     }
 }

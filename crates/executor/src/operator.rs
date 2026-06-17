@@ -311,6 +311,42 @@ impl Executor for Distinct {
     }
 }
 
+/// Concatenate two inputs (`UNION ALL`), optionally removing rows seen across
+/// either side (`UNION`). Output columns are the left input's.
+struct Union {
+    left: Box<dyn Executor>,
+    right: Box<dyn Executor>,
+    columns: Vec<String>,
+    all: bool,
+    seen: HashSet<Vec<u8>>,
+    on_left: bool,
+}
+
+impl Executor for Union {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        loop {
+            let row = if self.on_left {
+                let Some(r) = self.left.next()? else {
+                    self.on_left = false;
+                    continue;
+                };
+                r
+            } else {
+                let Some(r) = self.right.next()? else {
+                    return Ok(None);
+                };
+                r
+            };
+            if self.all || self.seen.insert(group_key_bytes(&row)) {
+                return Ok(Some(row));
+            }
+        }
+    }
+}
+
 /// Join two inputs by iterating the right side once per left row.
 ///
 /// This backs both the `NestedLoopJoin` and the `HashJoin` physical nodes: the
@@ -683,6 +719,7 @@ impl Executor for Aggregate {
 ///
 /// Returns an error for plan nodes or expressions the executor does not run
 /// yet, or if a base table cannot be read.
+#[allow(clippy::too_many_lines)]
 pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Executor>> {
     match plan {
         PhysicalPlan::SeqScan {
@@ -745,6 +782,28 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             input: build(input, source)?,
             seen: HashSet::new(),
         })),
+        PhysicalPlan::Union {
+            all, left, right, ..
+        } => {
+            let left = build(left, source)?;
+            let right = build(right, source)?;
+            let columns = left.columns().to_vec();
+            if right.columns().len() != columns.len() {
+                return Err(ExecError::Unsupported(format!(
+                    "UNION requires matching column counts ({} vs {})",
+                    columns.len(),
+                    right.columns().len()
+                )));
+            }
+            Ok(Box::new(Union {
+                left,
+                right,
+                columns,
+                all: *all,
+                seen: HashSet::new(),
+                on_left: true,
+            }))
+        }
         // Both join algorithms run through the nested-loop executor; the hash
         // build/probe is a deferred runtime optimization (the planner's choice
         // is still shown by EXPLAIN).

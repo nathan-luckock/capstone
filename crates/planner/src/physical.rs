@@ -103,6 +103,19 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
+    /// Combine two queries (`UNION` / `UNION ALL`).
+    Union {
+        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        all: bool,
+        /// Left query plan.
+        left: Box<Self>,
+        /// Right query plan.
+        right: Box<Self>,
+        /// Estimated output rows.
+        est_rows: u64,
+        /// Estimated cost.
+        est_cost: f64,
+    },
     /// Group-by aggregate.
     Aggregate {
         /// Grouping keys.
@@ -163,6 +176,7 @@ impl PhysicalPlan {
             | Self::Sort { est_rows, .. }
             | Self::Limit { est_rows, .. }
             | Self::Distinct { est_rows, .. }
+            | Self::Union { est_rows, .. }
             | Self::Aggregate { est_rows, .. }
             | Self::NestedLoopJoin { est_rows, .. }
             | Self::HashJoin { est_rows, .. } => *est_rows,
@@ -180,6 +194,7 @@ impl PhysicalPlan {
             | Self::Sort { est_cost, .. }
             | Self::Limit { est_cost, .. }
             | Self::Distinct { est_cost, .. }
+            | Self::Union { est_cost, .. }
             | Self::Aggregate { est_cost, .. }
             | Self::NestedLoopJoin { est_cost, .. }
             | Self::HashJoin { est_cost, .. } => *est_cost,
@@ -280,6 +295,19 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
                 n: *n,
                 offset: *offset,
                 input: Box::new(child),
+                est_rows,
+                est_cost,
+            })
+        }
+        LogicalPlan::Union { all, left, right } => {
+            let l = plan(left, catalog)?;
+            let r = plan(right, catalog)?;
+            let est_rows = l.est_rows().saturating_add(r.est_rows());
+            let est_cost = l.est_cost() + r.est_cost();
+            Ok(PhysicalPlan::Union {
+                all: *all,
+                left: Box::new(l),
+                right: Box::new(r),
                 est_rows,
                 est_cost,
             })

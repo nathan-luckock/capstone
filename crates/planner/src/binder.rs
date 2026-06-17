@@ -25,6 +25,37 @@ struct ScopeEntry<'c> {
 pub fn bind(catalog: &Catalog, stmt: &Statement) -> Result<LogicalPlan> {
     match stmt {
         Statement::Select(select) => bind_select(catalog, select),
+        Statement::Union {
+            all,
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+        } => {
+            let mut plan = LogicalPlan::Union {
+                all: *all,
+                left: Box::new(bind(catalog, left)?),
+                right: Box::new(bind(catalog, right)?),
+            };
+            // ORDER BY / LIMIT bind the union output. The sort keys reference
+            // output columns (the left query's names), which the executor
+            // resolves by name, so there is no table scope to validate against.
+            if !order_by.is_empty() {
+                plan = LogicalPlan::Sort {
+                    keys: order_by.iter().map(|i| (i.expr.clone(), i.desc)).collect(),
+                    input: Box::new(plan),
+                };
+            }
+            if limit.is_some() || offset.is_some() {
+                plan = LogicalPlan::Limit {
+                    n: limit.unwrap_or(u64::MAX),
+                    offset: offset.unwrap_or(0),
+                    input: Box::new(plan),
+                };
+            }
+            Ok(plan)
+        }
         other => Err(PlanError::Unsupported(format!("cannot plan: {other}"))),
     }
 }
