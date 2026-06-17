@@ -10,6 +10,7 @@ pub mod database;
 pub mod error;
 pub mod index;
 pub mod persist;
+pub mod security;
 
 pub use database::{Database, QueryOutcome};
 pub use error::{DbError, Result};

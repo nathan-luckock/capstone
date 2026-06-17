@@ -529,6 +529,15 @@ impl Parser {
             // Qualified column: name '.' name.
             let col = self.parse_ident()?;
             Ok(Expr::QualifiedColumn(name, col))
+        } else if is_session_function(&name) {
+            // `current_user` / `session_user` / `current_role` are niladic
+            // functions that may be written without parentheses; normalize the
+            // bare form to a zero-argument call so evaluation has one shape.
+            Ok(Expr::Func {
+                name: name.to_ascii_uppercase(),
+                distinct: false,
+                args: Vec::new(),
+            })
         } else {
             Ok(Expr::Column(name))
         }
@@ -642,6 +651,15 @@ impl Parser {
         };
         Ok(Expr::Literal(value))
     }
+}
+
+/// Whether `name` is a niladic session function (`current_user`, `session_user`,
+/// `current_role`) that SQL allows without parentheses.
+fn is_session_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "current_user" | "session_user" | "current_role"
+    )
 }
 
 /// `NOT`'s operand binding power: above `AND` (3/4), at/below comparison (5).

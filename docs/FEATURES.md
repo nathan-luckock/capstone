@@ -134,6 +134,20 @@ tour, see the [README](../README.md).
   verifier, and the client proves knowledge of it through a challenge-response
   exchange. The SHA-256, HMAC, and PBKDF2 primitives are in-tree (no external
   crypto crate).
+- **Roles and privileges** - `CREATE ROLE` / `CREATE USER` (with `SUPERUSER`,
+  `LOGIN`, `CREATEROLE`, `BYPASSRLS`, `PASSWORD` attributes), `ALTER ROLE`,
+  `DROP ROLE`, role membership (`GRANT role TO role`), and table privileges
+  (`GRANT` / `REVOKE` `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE` /
+  `ALL` `ON t TO role | PUBLIC`). Every statement is authorized against the
+  session's current role: a superuser bypasses all checks, the table owner (the
+  role that created it) holds every privilege, and other roles need a grant made
+  directly, to `PUBLIC`, or to a group they belong to. `SET ROLE` / `RESET ROLE`
+  switch the active role; `current_user` / `current_role` / `session_user`
+  report it. A fresh database has a single bootstrap superuser and the default
+  session runs as it, so an unconfigured database stays fully open; enforcement
+  begins once roles exist and a session runs as a non-superuser. The wire server
+  runs each connection as the role it authenticated. Roles, grants, memberships,
+  and ownership persist across a restart.
 - **Concurrency** - the wire server handles many client connections at once: the
   single-threaded engine runs as an actor on its own thread, and each connection
   gets its own thread and session handle. Transaction exclusivity keeps explicit

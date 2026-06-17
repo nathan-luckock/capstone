@@ -80,23 +80,31 @@ pub fn serve_with_auth<S: Read + Write>(
     stream: &mut S,
     auth: &Auth,
 ) -> io::Result<()> {
-    if startup(db, stream, auth)? {
+    if let Some(user) = startup(db, stream, auth)? {
+        // Run the session as the role the client connected (and authenticated)
+        // as, so the engine's privilege checks apply.
+        db.set_user(&user);
         query_loop(db, stream)?;
     }
     Ok(())
 }
 
-/// Run the startup handshake. Returns `true` once an authenticated 3.0 session
-/// is ready for queries, or `false` if the client closed the connection, failed
-/// authentication, or only probed for SSL/cancel.
-fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S, auth: &Auth) -> io::Result<bool> {
+/// Run the startup handshake. Returns `Some(user)` once an authenticated 3.0
+/// session is ready for queries (the role the client connected as), or `None` if
+/// the client closed the connection, failed authentication, or only probed for
+/// SSL/cancel.
+fn startup<S: Read + Write>(
+    db: &dyn Engine,
+    stream: &mut S,
+    auth: &Auth,
+) -> io::Result<Option<String>> {
     let startup_params: Vec<u8>;
     loop {
         let Some(len) = read_i32_opt(stream)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if len < 8 {
-            return Ok(false);
+            return Ok(None);
         }
         let mut payload = vec![0u8; usize::try_from(len).unwrap_or(0).saturating_sub(4)];
         stream.read_exact(&mut payload)?;
@@ -108,23 +116,23 @@ fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S, auth: &Auth) -> io:
                 stream.flush()?;
             }
             // A cancel request carries no session; acknowledge by closing.
-            CANCEL_REQUEST => return Ok(false),
+            CANCEL_REQUEST => return Ok(None),
             PROTOCOL_3_0 => {
                 startup_params = payload[4..].to_vec();
                 break;
             }
             other => {
                 send_error(stream, &format!("unsupported protocol version {other}"))?;
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
 
+    let user = startup_param(&startup_params, "user").unwrap_or_default();
     // Authenticate before advertising the session.
     if let Auth::Scram(creds) = auth {
-        let user = startup_param(&startup_params, "user");
-        if !authenticate_scram(stream, creds, user.as_deref())? {
-            return Ok(false);
+        if !authenticate_scram(stream, creds, Some(user.as_str()))? {
+            return Ok(None);
         }
     }
 
@@ -146,7 +154,7 @@ fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S, auth: &Auth) -> io:
     key_data.extend_from_slice(&5678i32.to_be_bytes());
     write_message(stream, b'K', &key_data)?;
     ready_for_query(db, stream)?;
-    Ok(true)
+    Ok(Some(user))
 }
 
 /// Look up a startup parameter (e.g. `user`) in the `key\0value\0` list that
