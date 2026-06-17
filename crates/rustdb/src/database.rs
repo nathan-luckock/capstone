@@ -236,6 +236,7 @@ impl Database {
                 )
                 .collect();
             self.catalog.apply(&Statement::CreateTable {
+                if_not_exists: false,
                 name: r.name.clone(),
                 columns,
                 constraints: vec![],
@@ -412,6 +413,7 @@ impl Database {
                 })
                 .collect();
             let create = Statement::CreateTable {
+                if_not_exists: false,
                 name: name.to_string(),
                 columns,
                 constraints: Vec::new(),
@@ -508,12 +510,18 @@ impl Database {
                 self.persist()?;
                 Ok(QueryOutcome::Ddl)
             }
-            Statement::DropTable { ref name } => self.drop_table(&stmt, name),
+            Statement::DropTable {
+                if_exists,
+                ref name,
+            } => self.drop_table(&stmt, if_exists, name),
             Statement::CreateView {
                 ref name,
                 ref query,
             } => self.create_view(name, query),
-            Statement::DropView { ref name } => self.drop_view(name),
+            Statement::DropView {
+                if_exists,
+                ref name,
+            } => self.drop_view(if_exists, name),
             Statement::Truncate { ref table } => self.truncate_table(table),
             Statement::Analyze { ref table } => self.run_analyze(table.as_deref()),
             Statement::Vacuum { ref table } => self.run_vacuum(table.as_deref()),
@@ -665,6 +673,7 @@ impl Database {
 
     fn create_table(&mut self, stmt: &Statement) -> Result<QueryOutcome> {
         let Statement::CreateTable {
+            if_not_exists,
             name,
             columns,
             constraints,
@@ -672,6 +681,13 @@ impl Database {
         else {
             unreachable!("guarded by execute");
         };
+        // `IF NOT EXISTS`: if a table or view of this name is already here,
+        // succeed quietly without recreating it.
+        if *if_not_exists
+            && (self.catalog.get_table(name).is_some() || self.views.contains_key(name))
+        {
+            return Ok(QueryOutcome::Ddl);
+        }
         // Validate and resolve the table-level constraints before creating
         // anything, so a bad reference rejects the whole statement.
         let table_constraints = self.build_constraints(name, columns, constraints)?;
@@ -765,6 +781,7 @@ impl Database {
         // columns carry no constraints, so there are no secondary indexes to
         // maintain.
         let create = Statement::CreateTable {
+            if_not_exists: false,
             name: name.to_string(),
             columns: coldefs,
             constraints: Vec::new(),
@@ -1252,7 +1269,16 @@ impl Database {
         Ok(QueryOutcome::Ddl)
     }
 
-    fn drop_table(&mut self, stmt: &Statement, name: &str) -> Result<QueryOutcome> {
+    fn drop_table(
+        &mut self,
+        stmt: &Statement,
+        if_exists: bool,
+        name: &str,
+    ) -> Result<QueryOutcome> {
+        // `IF EXISTS`: a missing table is a no-op, not an error.
+        if if_exists && self.catalog.get_table(name).is_none() {
+            return Ok(QueryOutcome::Ddl);
+        }
         // Reject the drop if another table still has a foreign key into this one
         // (RESTRICT). The table's own constraints are dropped with it.
         if let Some(child) = self.referencing_table(name) {
@@ -1498,8 +1524,12 @@ impl Database {
     }
 
     /// Remove a view. Errors if no view by that name exists.
-    fn drop_view(&mut self, name: &str) -> Result<QueryOutcome> {
+    fn drop_view(&mut self, if_exists: bool, name: &str) -> Result<QueryOutcome> {
         if self.views.remove(name).is_none() {
+            // `IF EXISTS`: a missing view is a no-op, not an error.
+            if if_exists {
+                return Ok(QueryOutcome::Ddl);
+            }
             return Err(DbError::Constraint(format!("view {name} does not exist")));
         }
         self.save_views()?;
@@ -2947,9 +2977,11 @@ fn eval_in_catalog(
 /// the rows are served directly.
 fn register_relation(cat: &mut Catalog, name: &str, rel: &Relation) {
     let _ = cat.apply(&Statement::DropTable {
+        if_exists: true,
         name: name.to_string(),
     });
     let create = Statement::CreateTable {
+        if_not_exists: false,
         name: name.to_string(),
         columns: infer_columns(rel),
         constraints: Vec::new(),
@@ -3380,6 +3412,37 @@ mod tests {
         let (_dir, mut db) = db();
         db.execute("CREATE TABLE t (id INT)").unwrap();
         assert!(db.execute("CREATE TABLE t (id INT)").is_err());
+    }
+
+    #[test]
+    fn if_not_exists_is_idempotent() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        // A second CREATE with IF NOT EXISTS succeeds and leaves the table (and
+        // its row) untouched, even with a different column shape.
+        db.execute("CREATE TABLE IF NOT EXISTS t (other TEXT)")
+            .unwrap();
+        assert_eq!(db.table_count(), 1);
+        let (cols, rows) = query(&mut db, "SELECT id FROM t");
+        assert_eq!(names(&cols), ["id"]);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn drop_if_exists_is_a_noop_when_absent() {
+        let (_dir, mut db) = db();
+        // Dropping a table that was never created is an error normally...
+        assert!(db.execute("DROP TABLE ghost").is_err());
+        // ...but a no-op (Ddl, no error) under IF EXISTS.
+        assert!(matches!(
+            db.execute("DROP TABLE IF EXISTS ghost").unwrap(),
+            QueryOutcome::Ddl
+        ));
+        assert!(matches!(
+            db.execute("DROP VIEW IF EXISTS ghost_view").unwrap(),
+            QueryOutcome::Ddl
+        ));
     }
 
     #[test]

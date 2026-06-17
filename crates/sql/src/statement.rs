@@ -349,8 +349,11 @@ impl fmt::Display for Cte {
 /// A parsed SQL statement. Grows as SELECT and DML parsers land.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    /// `CREATE TABLE name (cols..., constraints...)`.
+    /// `CREATE TABLE [IF NOT EXISTS] name (cols..., constraints...)`.
     CreateTable {
+        /// `IF NOT EXISTS`: succeed without error (and without recreating it)
+        /// when a table of this name already exists.
+        if_not_exists: bool,
         /// Table name.
         name: String,
         /// Column definitions.
@@ -367,8 +370,10 @@ pub enum Statement {
         /// The query whose result becomes the table.
         query: Box<Self>,
     },
-    /// `DROP TABLE name`.
+    /// `DROP TABLE [IF EXISTS] name`.
     DropTable {
+        /// `IF EXISTS`: succeed without error when no such table exists.
+        if_exists: bool,
         /// Table name.
         name: String,
     },
@@ -389,8 +394,10 @@ pub enum Statement {
         /// The defining query (a `Select` or a `Union`).
         query: Box<Self>,
     },
-    /// `DROP VIEW name`.
+    /// `DROP VIEW [IF EXISTS] name`.
     DropView {
+        /// `IF EXISTS`: succeed without error when no such view exists.
+        if_exists: bool,
         /// View name.
         name: String,
     },
@@ -626,11 +633,13 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CreateTable {
+                if_not_exists,
                 name,
                 columns,
                 constraints,
             } => {
-                write!(f, "CREATE TABLE {name} (")?;
+                let guard = if *if_not_exists { "IF NOT EXISTS " } else { "" };
+                write!(f, "CREATE TABLE {guard}{name} (")?;
                 for (i, c) in columns.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -642,7 +651,10 @@ impl fmt::Display for Statement {
                 }
                 f.write_str(")")
             }
-            Self::DropTable { name } => write!(f, "DROP TABLE {name}"),
+            Self::DropTable { if_exists, name } => {
+                let guard = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP TABLE {guard}{name}")
+            }
             Self::CreateIndex {
                 name,
                 table,
@@ -650,7 +662,10 @@ impl fmt::Display for Statement {
             } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
             Self::CreateTableAs { name, query } => write!(f, "CREATE TABLE {name} AS {query}"),
             Self::CreateView { name, query } => write!(f, "CREATE VIEW {name} AS {query}"),
-            Self::DropView { name } => write!(f, "DROP VIEW {name}"),
+            Self::DropView { if_exists, name } => {
+                let guard = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP VIEW {guard}{name}")
+            }
             Self::Select(s) => write!(f, "{s}"),
             Self::Insert {
                 table,
@@ -1261,6 +1276,7 @@ impl Parser {
     }
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
         // `CREATE TABLE name AS <query>` builds the table from a query instead
         // of an explicit column list.
@@ -1303,10 +1319,32 @@ impl Parser {
             ));
         }
         Ok(Statement::CreateTable {
+            if_not_exists,
             name,
             columns,
             constraints,
         })
+    }
+
+    /// Parse an optional `IF NOT EXISTS` guard (after `CREATE TABLE`).
+    fn parse_if_not_exists(&mut self) -> Result<bool> {
+        if self.eat_ident_kw("if") {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parse an optional `IF EXISTS` guard (after `DROP TABLE` / `DROP VIEW`).
+    fn parse_if_exists(&mut self) -> Result<bool> {
+        if self.eat_ident_kw("if") {
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Parse a table-level `CHECK (expr)` or `FOREIGN KEY (col) REFERENCES
@@ -1453,12 +1491,14 @@ impl Parser {
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
         if self.eat_keyword(Keyword::View) {
+            let if_exists = self.parse_if_exists()?;
             let name = self.parse_ident()?;
-            return Ok(Statement::DropView { name });
+            return Ok(Statement::DropView { if_exists, name });
         }
         self.expect_keyword(Keyword::Table)?;
+        let if_exists = self.parse_if_exists()?;
         let name = self.parse_ident()?;
-        Ok(Statement::DropTable { name })
+        Ok(Statement::DropTable { if_exists, name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -2025,6 +2065,7 @@ mod tests {
         assert_eq!(
             s,
             Statement::CreateTable {
+                if_not_exists: false,
                 name: "t".into(),
                 columns: vec![ColumnDef {
                     name: "id".into(),
@@ -2063,9 +2104,37 @@ mod tests {
         assert_eq!(
             round_trip("DROP TABLE widgets"),
             Statement::DropTable {
+                if_exists: false,
                 name: "widgets".into()
             }
         );
+    }
+
+    #[test]
+    fn if_exists_guards_round_trip() {
+        assert_eq!(
+            round_trip("DROP TABLE IF EXISTS widgets"),
+            Statement::DropTable {
+                if_exists: true,
+                name: "widgets".into()
+            }
+        );
+        assert_eq!(
+            round_trip("DROP VIEW IF EXISTS v"),
+            Statement::DropView {
+                if_exists: true,
+                name: "v".into()
+            }
+        );
+    }
+
+    #[test]
+    fn create_table_if_not_exists_round_trips() {
+        let s = round_trip("CREATE TABLE IF NOT EXISTS t (id INT)");
+        let Statement::CreateTable { if_not_exists, .. } = s else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(if_not_exists);
     }
 
     #[test]

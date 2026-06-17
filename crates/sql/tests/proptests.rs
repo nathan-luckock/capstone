@@ -166,12 +166,16 @@ fn statement() -> impl Strategy<Value = Statement> {
     prop_oneof![
         (ident(), prop::collection::vec(column_def(), 1..4)).prop_map(|(name, columns)| {
             Statement::CreateTable {
+                if_not_exists: false,
                 name,
                 columns,
                 constraints: vec![],
             }
         }),
-        ident().prop_map(|name| Statement::DropTable { name }),
+        ident().prop_map(|name| Statement::DropTable {
+            if_exists: false,
+            name,
+        }),
         (ident(), ident(), ident()).prop_map(|(name, table, column)| Statement::CreateIndex {
             name,
             table,
