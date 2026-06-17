@@ -100,6 +100,13 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}Distinct  {stats}");
             render(input, depth + 1, out);
         }
+        PhysicalPlan::Union {
+            all, left, right, ..
+        } => {
+            let _ = writeln!(out, "{pad}Union{}  {stats}", if *all { " ALL" } else { "" });
+            render(left, depth + 1, out);
+            render(right, depth + 1, out);
+        }
         PhysicalPlan::Aggregate {
             group_by,
             aggregates,

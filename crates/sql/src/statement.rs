@@ -297,9 +297,28 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`: abort the current transaction.
     Rollback,
+    /// `left UNION [ALL] right`. `left` and `right` are queries (a `Select` or
+    /// a nested `Union`). Without `all`, duplicate rows are removed. A trailing
+    /// `ORDER BY` / `LIMIT` / `OFFSET` applies to the whole union and lives on
+    /// the outermost node (inner nodes of a chain leave them empty).
+    Union {
+        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        all: bool,
+        /// Left query.
+        left: Box<Self>,
+        /// Right query.
+        right: Box<Self>,
+        /// ORDER BY over the union output (empty if none).
+        order_by: Vec<OrderItem>,
+        /// LIMIT over the union (None if none).
+        limit: Option<u64>,
+        /// OFFSET over the union (None if none).
+        offset: Option<u64>,
+    },
 }
 
 impl fmt::Display for Statement {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CreateTable { name, columns } => {
@@ -382,6 +401,33 @@ impl fmt::Display for Statement {
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
+            Self::Union {
+                all,
+                left,
+                right,
+                order_by,
+                limit,
+                offset,
+            } => {
+                let kw = if *all { "UNION ALL" } else { "UNION" };
+                write!(f, "{left} {kw} {right}")?;
+                if !order_by.is_empty() {
+                    f.write_str(" ORDER BY ")?;
+                    for (i, o) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{o}")?;
+                    }
+                }
+                if let Some(n) = limit {
+                    write!(f, " LIMIT {n}")?;
+                }
+                if let Some(n) = offset {
+                    write!(f, " OFFSET {n}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -392,9 +438,7 @@ impl Parser {
         let stmt = match self.peek() {
             TokenKind::Keyword(Keyword::Create) => self.parse_create()?,
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop()?,
-            TokenKind::Keyword(Keyword::Select) => {
-                Statement::Select(Box::new(self.parse_select()?))
-            }
+            TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
             TokenKind::Keyword(Keyword::Update) => self.parse_update()?,
             TokenKind::Keyword(Keyword::Delete) => self.parse_delete()?,
@@ -427,6 +471,51 @@ impl Parser {
 
     /// Parse a SELECT query, including JOIN / WHERE / GROUP BY / ORDER BY /
     /// LIMIT.
+    /// Parse a query: a `SELECT`, optionally combined with more `SELECT`s via
+    /// `UNION` / `UNION ALL` (folded left-associatively), with any trailing
+    /// `ORDER BY` / `LIMIT` / `OFFSET` applying to the whole query.
+    fn parse_query(&mut self) -> Result<Statement> {
+        let mut query = Statement::Select(Box::new(self.parse_select()?));
+        while self.eat_keyword(Keyword::Union) {
+            let all = self.eat_keyword(Keyword::All);
+            let right = Statement::Select(Box::new(self.parse_select()?));
+            query = Statement::Union {
+                all,
+                left: Box::new(query),
+                right: Box::new(right),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        // A trailing ORDER BY / LIMIT / OFFSET binds the whole query. For a
+        // single SELECT it lives on the Select; for a union, on its node.
+        let order_by = self.parse_order_by()?;
+        let limit = self.parse_limit()?;
+        let offset = self.parse_offset()?;
+        match &mut query {
+            Statement::Select(s) => {
+                s.order_by = order_by;
+                s.limit = limit;
+                s.offset = offset;
+            }
+            Statement::Union {
+                order_by: o,
+                limit: l,
+                offset: off,
+                ..
+            } => {
+                *o = order_by;
+                *l = limit;
+                *off = offset;
+            }
+            _ => unreachable!("parse_query builds only Select or Union"),
+        }
+        Ok(query)
+    }
+
+    /// Parse one `SELECT` term, up to but not including any trailing `ORDER BY`
+    /// / `LIMIT` / `OFFSET` (those bind the whole query, see `parse_query`).
     fn parse_select(&mut self) -> Result<Select> {
         self.expect_keyword(Keyword::Select)?;
         let distinct = self.eat_keyword(Keyword::Distinct);
@@ -445,9 +534,8 @@ impl Parser {
         } else {
             None
         };
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        let offset = self.parse_offset()?;
+        // ORDER BY / LIMIT / OFFSET are parsed by the caller (parse_query), so
+        // they apply to the whole query, not just this term of a union.
         Ok(Select {
             distinct,
             projections,
@@ -456,9 +544,9 @@ impl Parser {
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
         })
     }
 
@@ -817,6 +905,14 @@ mod tests {
         let second = parse(&printed);
         assert_eq!(first, second, "round-trip mismatch: {src:?} -> {printed:?}");
         first
+    }
+
+    #[test]
+    fn union_round_trips() {
+        round_trip("SELECT a FROM t UNION SELECT b FROM u");
+        round_trip("SELECT a FROM t UNION ALL SELECT b FROM u");
+        // Left-associative chain.
+        round_trip("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v");
     }
 
     #[test]

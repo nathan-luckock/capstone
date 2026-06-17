@@ -81,6 +81,15 @@ pub enum LogicalPlan {
         /// Child plan.
         input: Box<Self>,
     },
+    /// Combine two queries (`UNION` / `UNION ALL`).
+    Union {
+        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        all: bool,
+        /// Left query plan.
+        left: Box<Self>,
+        /// Right query plan.
+        right: Box<Self>,
+    },
 }
 
 impl LogicalPlan {
@@ -155,6 +164,11 @@ impl LogicalPlan {
             Self::Distinct { input } => {
                 writeln!(f, "{pad}Distinct")?;
                 input.fmt_indented(f, depth + 1)
+            }
+            Self::Union { all, left, right } => {
+                writeln!(f, "{pad}Union{}", if *all { " ALL" } else { "" })?;
+                left.fmt_indented(f, depth + 1)?;
+                right.fmt_indented(f, depth + 1)
             }
         }
     }
