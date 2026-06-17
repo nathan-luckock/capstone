@@ -24,6 +24,7 @@ pub mod lsn;
 pub mod reader;
 pub mod record;
 pub mod recovery;
+pub mod sim;
 pub mod workload;
 pub mod writer;
 
@@ -33,5 +34,6 @@ pub use lsn::{Lsn, TxnId};
 pub use reader::WalReader;
 pub use record::{LogRecord, RecordHeader, RecordKind, HEADER_BYTES, MIN_RECORD_BYTES};
 pub use recovery::{analyze, recover, redo, undo, Analysis, RecoveryStats, TxnStatus};
+pub use sim::{run_seed, FaultDisk, Outcome};
 pub use workload::{MiniHeap, Txn};
 pub use writer::WalWriter;

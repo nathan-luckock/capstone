@@ -12,9 +12,9 @@ description = "Write-ahead log and ARIES-style crash recovery for rustdb."
 rustdb-storage.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 proptest = "1"
 
 [lints]

@@ -26,6 +26,48 @@ use tracing::debug;
 use crate::error::{Result, StorageError};
 use crate::page::{Page, PageId, PAGE_SIZE};
 
+/// A page-granular block device the buffer pool reads and writes through.
+///
+/// [`FileManager`] is the production implementation, a real file. The trait
+/// exists so the buffer pool can run over alternative backends - notably a
+/// fault-injecting in-memory disk for deterministic crash simulation - without
+/// the pool knowing which it is talking to. The method set is exactly what the
+/// pool needs and matches [`FileManager`]'s inherent methods.
+pub trait Disk {
+    /// Allocate a new zero-filled page at the end of the device, returning its
+    /// id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device cannot be extended.
+    fn allocate_page(&mut self) -> Result<PageId>;
+
+    /// Read the page with the given id into `buf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `id` is out of bounds or the read fails.
+    fn read_page(&mut self, id: PageId, buf: &mut Page) -> Result<()>;
+
+    /// Write `buf` to the page with the given id. Not durable until
+    /// [`fsync`](Disk::fsync).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `id` is out of bounds or the write fails.
+    fn write_page(&mut self, id: PageId, buf: &Page) -> Result<()>;
+
+    /// Force buffered writes to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying sync fails.
+    fn fsync(&mut self) -> Result<()>;
+
+    /// Number of pages currently allocated.
+    fn page_count(&self) -> u64;
+}
+
 /// Owns the database file and provides page-granular reads and writes.
 ///
 /// See the module-level docs for invariants and threading model.
@@ -33,6 +75,26 @@ use crate::page::{Page, PageId, PAGE_SIZE};
 pub struct FileManager {
     file: File,
     page_count: u64,
+}
+
+impl Disk for FileManager {
+    fn allocate_page(&mut self) -> Result<PageId> {
+        // Method-call syntax resolves to the inherent method (inherent items
+        // shadow trait items), so this delegates rather than recursing.
+        self.allocate_page()
+    }
+    fn read_page(&mut self, id: PageId, buf: &mut Page) -> Result<()> {
+        self.read_page(id, buf)
+    }
+    fn write_page(&mut self, id: PageId, buf: &Page) -> Result<()> {
+        self.write_page(id, buf)
+    }
+    fn fsync(&mut self) -> Result<()> {
+        self.fsync()
+    }
+    fn page_count(&self) -> u64 {
+        self.page_count()
+    }
 }
 
 impl FileManager {
