@@ -42,7 +42,7 @@ pub use btree::{
 };
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, WalSyncHook, K};
 pub use error::{Result, StorageError};
-pub use file::FileManager;
+pub use file::{Disk, FileManager};
 pub use header::{
     compute_checksum, recompute_checksum, verify_checksum, PageHeader, PageType, FLAG_DIRTY,
     FLAG_NEEDS_VACUUM, HEADER_SIZE, HEADER_SIZE_U16,

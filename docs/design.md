@@ -257,11 +257,14 @@ A CLR (compensation log record) is **redo-only**: redo replays it, undo never un
 
 ### Crash model and the torture test
 
-The graded requirement is a forced crash with no committed data loss. Two layers prove it:
+The graded requirement is a forced crash with no committed data loss. Three layers prove it:
 - **In-process** (`crates/wal/tests/recovery_integration.rs`): drive a `MiniHeap` workload, drop the buffer pool *without* flushing (dirty pages lost, only the fsync'd WAL survives - exactly what a kill does to unflushed pages), recover, assert committed rows survive and uncommitted rows are rolled back.
 - **Forced process kill** (`crates/wal/tests/torture.rs` + the `crash_harness` binary): spawn a child process that commits rows forever and records each durably-committed row to a ground-truth file *after* its commit is on disk, then hard-kill it (`TerminateProcess` on Windows / `SIGKILL`), recover, and assert every ground-truth row is present. Runs several rounds so the kill lands at different points.
+- **Deterministic simulation testing (DST)** (`crates/wal/src/sim.rs`, `crates/wal/tests/dst.rs`, and the `dst` binary): every run is driven by a single `u64` seed, so any failure replays exactly (`cargo run --bin dst -- --seed <n>`). The data file is a `FaultDisk`, an in-memory block device (over the new `Disk` trait the buffer pool writes through) that models durability explicitly: a `write_page` only stages bytes, and a crash keeps the last-`fsync`'d image and discards everything else. This is stricter than the in-process layer, where the OS page cache would still hand back un-fsynced writes and hide durability bugs. Each seed builds a random workload (committed / aborted / in-flight transactions) with a randomized durable-vs-lost split, crashes, recovers, and checks every committed row survives and every rolled-back row is gone. The `dst` binary routinely sweeps tens of thousands of seeds.
 
-`MiniHeap` (`crates/wal/src/workload.rs`) is the recoverable workload harness standing in for the not-yet-built SQL executor: begin / insert / update / delete / commit / abort, logging WAL-before-page and stamping each page's LSN exactly the way recovery expects to replay it.
+**A bug DST found.** The simulator immediately surfaced a real recovery defect: `MiniHeap::abort` reverted pages in process *without logging CLRs*, while recovery's undo skips any loser that already logged `Abort` (it assumes the rollback is durable). When a crash lost the in-memory revert but redo replayed the original insert, the aborted row resurrected. The fix makes `abort` write a fsync'd CLR per revert, exactly like recovery's undo, so the rollback is part of the replayable log; the skip-on-`Abort` optimization is sound only because aborts are now logged. This is the value of DST: a class of crash-timing bug that a few hand-written tests will not reliably hit, found and fixed reproducibly.
+
+`MiniHeap` (`crates/wal/src/workload.rs`) is the recoverable workload harness standing in for the SQL executor in the recovery tests: begin / insert / update / delete / commit / abort, logging WAL-before-page and stamping each page's LSN exactly the way recovery expects to replay it.
 
 ### Invariant (WAL ordering)
 

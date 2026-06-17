@@ -37,16 +37,30 @@ use crate::record::LogRecord;
 
 /// A handle to an in-flight transaction on a [`MiniHeap`].
 ///
-/// Tracks the undo chain (`last_lsn`) and the before-images needed for an
-/// in-process [`abort`](MiniHeap::abort).
+/// Tracks the undo chain (`last_lsn`) and the per-mutation before-images and
+/// `prev_lsn` links that [`abort`](MiniHeap::abort) needs to write chained CLRs.
 #[derive(Debug)]
 pub struct Txn {
     id: TxnId,
     last_lsn: Lsn,
-    /// `(page, slot, before_image)` for each mutation, in apply order. Used
-    /// by in-process abort to revert in reverse.
-    mutations: Vec<(PageId, SlotId, Vec<u8>)>,
+    /// One entry per mutation, in apply order. Used by [`abort`](MiniHeap::abort)
+    /// to roll back in reverse, writing a CLR per revert so the rollback is part
+    /// of the replayable log (and therefore crash-safe).
+    mutations: Vec<Mutation>,
     finished: bool,
+}
+
+/// A logged mutation, with the bookkeeping `abort` needs to write a correct,
+/// chained CLR for it.
+#[derive(Clone, Debug)]
+struct Mutation {
+    page: PageId,
+    slot: SlotId,
+    /// The slot's bytes before this mutation (the CLR's undo image).
+    before: Vec<u8>,
+    /// LSN of the transaction's previous record (this update's `prev_lsn`),
+    /// which the CLR's `undo_next` points at so a crash mid-abort can resume.
+    prev_lsn: Lsn,
 }
 
 impl Txn {
@@ -139,6 +153,7 @@ impl<'p> MiniHeap<'p> {
         // mutate so the WAL record (which carries slot_id) is written first.
         let slot_id = self.slot_count(page_id)?;
 
+        let prev_lsn = txn.last_lsn;
         let lsn = {
             let rec = LogRecord::Update {
                 page_id: page_id.get(),
@@ -146,7 +161,7 @@ impl<'p> MiniHeap<'p> {
                 before: Vec::new(),
                 after: tuple.to_vec(),
             };
-            self.wal.writer().append(&rec, txn.id, txn.last_lsn)?
+            self.wal.writer().append(&rec, txn.id, prev_lsn)?
         };
 
         // Apply to the page and stamp its LSN.
@@ -160,8 +175,12 @@ impl<'p> MiniHeap<'p> {
 
         self.wal.writer().fsync_through(lsn)?;
         txn.last_lsn = lsn;
-        txn.mutations
-            .push((page_id, SlotId::new(slot_id), Vec::new()));
+        txn.mutations.push(Mutation {
+            page: page_id,
+            slot: SlotId::new(slot_id),
+            before: Vec::new(),
+            prev_lsn,
+        });
         Ok((page_id, SlotId::new(slot_id)))
     }
 
@@ -193,27 +212,43 @@ impl<'p> MiniHeap<'p> {
         Ok(())
     }
 
-    /// Abort: revert this transaction's mutations in reverse (restoring
-    /// before-images) and log a durable `Abort`. If the process crashes
-    /// mid-abort, recovery treats the txn as a loser and finishes the
-    /// rollback, so this is safe without writing CLRs in-process.
+    /// Abort: roll back this transaction's mutations in reverse and log a
+    /// durable `Abort`.
+    ///
+    /// Each revert writes a CLR (compensation log record) carrying the slot's
+    /// before-image, fsync'd before the next, exactly as recovery's undo does.
+    /// Logging the rollback is what makes it crash-safe: redo replays the
+    /// `Update` then its CLR, reproducing the rolled-back state even when the
+    /// in-memory revert never reached disk. (An earlier version reverted pages
+    /// in-process without CLRs; a deterministic crash simulation showed that a
+    /// lost revert plus redo of the original insert could resurrect an aborted
+    /// row, because recovery skips undo for a transaction that already logged
+    /// `Abort`.)
     pub fn abort(&self, txn: &mut Txn) -> Result<()> {
         assert!(!txn.finished, "double finish");
-        let mutations: Vec<(PageId, SlotId, Vec<u8>)> =
-            txn.mutations.iter().rev().cloned().collect();
-        for (page, slot, before) in mutations {
-            let lsn = self.wal.writer().current_lsn();
+        let mutations: Vec<Mutation> = txn.mutations.iter().rev().cloned().collect();
+        let mut chain_tail = txn.last_lsn;
+        for m in mutations {
+            let clr = LogRecord::Clr {
+                page_id: m.page.get(),
+                slot_id: m.slot.get(),
+                undo_image: m.before.clone(),
+                undo_next: m.prev_lsn.get(),
+            };
+            let clr_lsn = self.wal.writer().append(&clr, txn.id, chain_tail)?;
+            self.wal.writer().fsync_through(clr_lsn)?;
             {
-                let mut guard = self.pool.fetch_page_mut(page).map_err(to_io)?;
+                let mut guard = self.pool.fetch_page_mut(m.page).map_err(to_io)?;
                 let mut heap = HeapPage::from_bytes(guard.page_mut()).map_err(to_io)?;
-                heap.recover_slot(slot, &before).map_err(to_io)?;
-                stamp_lsn(guard.page_mut(), lsn);
+                heap.recover_slot(m.slot, &m.before).map_err(to_io)?;
+                stamp_lsn(guard.page_mut(), clr_lsn);
             }
+            chain_tail = clr_lsn;
         }
         let lsn = self
             .wal
             .writer()
-            .append(&LogRecord::Abort, txn.id, txn.last_lsn)?;
+            .append(&LogRecord::Abort, txn.id, chain_tail)?;
         self.wal.writer().fsync_through(lsn)?;
         txn.last_lsn = lsn;
         txn.finished = true;
@@ -245,7 +280,8 @@ impl<'p> MiniHeap<'p> {
             before: before.to_vec(),
             after: after.to_vec(),
         };
-        let lsn = self.wal.writer().append(&rec, txn.id, txn.last_lsn)?;
+        let prev_lsn = txn.last_lsn;
+        let lsn = self.wal.writer().append(&rec, txn.id, prev_lsn)?;
         {
             let mut guard = self.pool.fetch_page_mut(page).map_err(to_io)?;
             let mut heap = HeapPage::from_bytes(guard.page_mut()).map_err(to_io)?;
@@ -254,7 +290,12 @@ impl<'p> MiniHeap<'p> {
         }
         self.wal.writer().fsync_through(lsn)?;
         txn.last_lsn = lsn;
-        txn.mutations.push((page, slot, before.to_vec()));
+        txn.mutations.push(Mutation {
+            page,
+            slot,
+            before: before.to_vec(),
+            prev_lsn,
+        });
         Ok(())
     }
 

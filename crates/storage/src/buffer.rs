@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::{Result, StorageError};
-use crate::file::FileManager;
+use crate::file::Disk;
 use crate::header::PageHeader;
 use crate::page::{Page, PageId, PAGE_SIZE};
 
@@ -162,7 +162,7 @@ impl Frame {
 ///
 /// See the module-level docs for invariants and the replacement policy.
 pub struct BufferPool {
-    file: RefCell<FileManager>,
+    file: RefCell<Box<dyn Disk>>,
     frames: Vec<Frame>,
     index: RefCell<HashMap<PageId, usize>>,
     clock: Cell<Timestamp>,
@@ -193,8 +193,8 @@ impl BufferPool {
     ///
     /// Panics if `pool_size == 0`. A pool with zero frames is useless.
     #[must_use]
-    pub fn new(file: FileManager, pool_size: usize) -> Self {
-        Self::build(file, pool_size, None)
+    pub fn new(file: impl Disk + 'static, pool_size: usize) -> Self {
+        Self::build(Box::new(file), pool_size, None)
     }
 
     /// Construct a buffer pool of `pool_size` frames over `file` with WAL
@@ -207,11 +207,15 @@ impl BufferPool {
     ///
     /// Panics if `pool_size == 0`.
     #[must_use]
-    pub fn with_wal(file: FileManager, pool_size: usize, wal_hook: Rc<dyn WalSyncHook>) -> Self {
-        Self::build(file, pool_size, Some(wal_hook))
+    pub fn with_wal(
+        file: impl Disk + 'static,
+        pool_size: usize,
+        wal_hook: Rc<dyn WalSyncHook>,
+    ) -> Self {
+        Self::build(Box::new(file), pool_size, Some(wal_hook))
     }
 
-    fn build(file: FileManager, pool_size: usize, wal: Option<Rc<dyn WalSyncHook>>) -> Self {
+    fn build(file: Box<dyn Disk>, pool_size: usize, wal: Option<Rc<dyn WalSyncHook>>) -> Self {
         assert!(pool_size > 0, "buffer pool size must be > 0");
         let frames = (0..pool_size).map(|_| Frame::empty()).collect();
         Self {
@@ -576,6 +580,7 @@ impl Drop for PageWriteGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::FileManager;
     use tempfile::TempDir;
 
     fn fresh_pool(pool_size: usize) -> (TempDir, BufferPool) {
