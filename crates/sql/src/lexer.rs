@@ -47,7 +47,7 @@ impl<'a> Lexer<'a> {
                 b';' => self.single(TokenKind::Semicolon),
                 b'.' => self.single(TokenKind::Dot),
                 b'+' => self.single(TokenKind::Plus),
-                b'-' => self.single(TokenKind::Minus),
+                b'-' => self.dash(),
                 b'*' => self.single(TokenKind::Star),
                 b'/' => self.single(TokenKind::Slash),
                 b'=' => self.single(TokenKind::Eq),
@@ -109,6 +109,23 @@ impl<'a> Lexer<'a> {
     }
 
     // --- token scanners ---
+
+    /// `-` is subtraction / unary minus, `->` is JSON get, `->>` is JSON get as
+    /// text. (Line comments `--` are removed earlier by `skip_trivia`.)
+    fn dash(&mut self) -> TokenKind {
+        self.bump();
+        if self.peek() == Some(b'>') {
+            self.bump();
+            if self.peek() == Some(b'>') {
+                self.bump();
+                TokenKind::ArrowText
+            } else {
+                TokenKind::Arrow
+            }
+        } else {
+            TokenKind::Minus
+        }
+    }
 
     /// `::` is the cast operator; a lone `:` is not valid in this dialect.
     fn colon(&mut self) -> Result<TokenKind> {

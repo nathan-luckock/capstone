@@ -5,7 +5,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use picklejar_storage::{header::PageHeader, BufferPool, FileManager, PageId, WalSyncHook, PAGE_SIZE};
+use picklejar_storage::{
+    header::PageHeader, BufferPool, FileManager, PageId, WalSyncHook, PAGE_SIZE,
+};
 use picklejar_wal::{LogRecord, Lsn, TxnId, WalSyncHandle, WalWriter};
 
 /// Test double that records every `fsync_through` call. Lets tests

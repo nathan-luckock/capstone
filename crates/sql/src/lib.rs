@@ -14,6 +14,7 @@
 pub mod ast;
 pub mod datetime;
 pub mod error;
+pub mod json;
 pub mod lexer;
 pub mod parser;
 pub mod statement;

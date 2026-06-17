@@ -41,6 +41,8 @@ const TEXT_OID: i32 = 25;
 const DATE_OID: i32 = 1082;
 /// `timestamp` (without time zone) type OID.
 const TIMESTAMP_OID: i32 = 1114;
+/// `json` type OID.
+const JSON_OID: i32 = 114;
 
 /// Protocol version 3.0, sent in the startup message.
 const PROTOCOL_3_0: i32 = 196_608;
@@ -702,7 +704,7 @@ fn value_text(value: &Value) -> Option<Vec<u8>> {
         Value::Timestamp(micros) => {
             Some(picklejar_sql::datetime::format_timestamp(*micros).into_bytes())
         }
-        Value::Text(s) => Some(s.clone().into_bytes()),
+        Value::Text(s) | Value::Json(s) => Some(s.clone().into_bytes()),
     }
 }
 
@@ -717,6 +719,7 @@ fn column_oid(rows: &[Vec<Value>], col: usize) -> i32 {
             Some(Value::Text(_)) => return TEXT_OID,
             Some(Value::Date(_)) => return DATE_OID,
             Some(Value::Timestamp(_)) => return TIMESTAMP_OID,
+            Some(Value::Json(_)) => return JSON_OID,
             _ => {}
         }
     }

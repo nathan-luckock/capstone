@@ -3267,7 +3267,7 @@ fn csv_field_from_value(value: &Value) -> String {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Date(days) => picklejar_sql::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.clone(),
     }
 }
 
@@ -3301,11 +3301,18 @@ fn value_from_csv_field(field: &str, ty: DataType) -> Result<Value> {
             picklejar_sql::datetime::parse_date(field)
                 .ok_or_else(|| DbError::Constraint(format!("invalid date in CSV: {field:?}")))?,
         ),
-        DataType::Timestamp => {
-            Value::Timestamp(picklejar_sql::datetime::parse_timestamp(field).ok_or_else(|| {
+        DataType::Timestamp => Value::Timestamp(
+            picklejar_sql::datetime::parse_timestamp(field).ok_or_else(|| {
                 DbError::Constraint(format!("invalid timestamp in CSV: {field:?}"))
-            })?)
-        }
+            })?,
+        ),
+        DataType::Json => Value::Json(if picklejar_sql::json::is_valid(field) {
+            field.to_string()
+        } else {
+            return Err(DbError::Constraint(format!(
+                "invalid json in CSV: {field:?}"
+            )));
+        }),
         DataType::Text => Value::Text(field.to_string()),
     })
 }
@@ -3317,6 +3324,7 @@ fn column_type(rows: &[Vec<Value>], i: usize) -> DataType {
         .find_map(|r| match r.get(i) {
             Some(Value::Int(_)) => Some(DataType::Int),
             Some(Value::Float(_)) => Some(DataType::Float),
+            Some(Value::Json(_)) => Some(DataType::Json),
             Some(Value::Text(_)) => Some(DataType::Text),
             Some(Value::Bool(_)) => Some(DataType::Bool),
             Some(Value::Date(_)) => Some(DataType::Date),
@@ -3365,6 +3373,10 @@ fn stat_key(value: &Value) -> Vec<u8> {
         }
         Value::Text(s) => {
             b.push(2);
+            b.extend_from_slice(s.as_bytes());
+        }
+        Value::Json(s) => {
+            b.push(8);
             b.extend_from_slice(s.as_bytes());
         }
         Value::Bool(x) => {
@@ -3419,6 +3431,7 @@ const fn sql_type_name(ty: DataType) -> &'static str {
         DataType::Text => "text",
         DataType::Date => "date",
         DataType::Timestamp => "timestamp without time zone",
+        DataType::Json => "json",
     }
 }
 
@@ -3782,6 +3795,14 @@ fn coerce_value(value: Value, ty: DataType) -> Result<Value> {
         (Value::Date(days), DataType::Timestamp) => Ok(Value::Timestamp(
             days * picklejar_sql::datetime::MICROS_PER_DAY,
         )),
+        // A text value into a JSON column is validated and stored.
+        (Value::Text(s), DataType::Json) => {
+            if picklejar_sql::json::is_valid(s) {
+                Ok(Value::Json(s.clone()))
+            } else {
+                Err(DbError::Constraint(format!("invalid json literal {s:?}")))
+            }
+        }
         _ => Ok(value),
     }
 }
@@ -6707,6 +6728,52 @@ mod tests {
             .unwrap();
         let (_c, n) = query(&mut db, "SELECT n FROM t WHERE x IS NULL");
         assert_eq!(n, vec![vec![Value::Int(7)]]);
+    }
+
+    #[test]
+    fn json_column_and_access_operators() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("j.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE docs (id INT, body JSON)").unwrap();
+            db.execute(
+                r#"INSERT INTO docs VALUES (1, '{"name": "ada", "tags": ["x", "y"], "age": 30}')"#,
+            )
+            .unwrap();
+            // -> returns JSON, ->> returns text; nested and indexed access.
+            let (cols, rows) = query(
+                &mut db,
+                "SELECT body ->> 'name', body -> 'tags' ->> 1, body ->> 'age', body -> 'missing' \
+                 FROM docs",
+            );
+            assert_eq!(cols.len(), 4);
+            assert_eq!(
+                rows[0],
+                vec![
+                    Value::Text("ada".into()),
+                    Value::Text("y".into()),
+                    Value::Text("30".into()),
+                    Value::Null,
+                ]
+            );
+            // A ->> result drives a WHERE predicate.
+            let (_c, hit) = query(&mut db, "SELECT id FROM docs WHERE body ->> 'name' = 'ada'");
+            assert_eq!(hit, vec![vec![Value::Int(1)]]);
+            // Invalid JSON is rejected on insert.
+            assert!(db
+                .execute("INSERT INTO docs VALUES (2, '{not json}')")
+                .is_err());
+        }
+        // The document survives a reopen and a `::json` cast works.
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, n) = query(
+            &mut db,
+            "SELECT body -> 'tags' ->> 0 FROM docs WHERE id = 1",
+        );
+        assert_eq!(n, vec![vec![Value::Text("x".into())]]);
+        let (_c, c) = query(&mut db, "SELECT ('[1,2,3]'::json) ->> 2 FROM docs");
+        assert_eq!(c, vec![vec![Value::Text("3".into())]]);
     }
 
     fn parse_day(s: &str) -> i64 {

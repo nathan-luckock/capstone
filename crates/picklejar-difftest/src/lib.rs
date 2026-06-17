@@ -380,7 +380,12 @@ fn run_picklejar(prog: &Program) -> Result<Vec<String>, String> {
         QueryOutcome::Rows { rows, .. } => {
             let mut out: Vec<String> = rows
                 .iter()
-                .map(|row| row.iter().map(canon_picklejar).collect::<Vec<_>>().join("|"))
+                .map(|row| {
+                    row.iter()
+                        .map(canon_picklejar)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
                 .collect();
             out.sort();
             Ok(out)
@@ -396,7 +401,8 @@ fn canon_picklejar(v: &Value) -> String {
         // The generator does not emit DATE / TIMESTAMP columns, so the temporal
         // arms never reach the comparison; they fold in with INT for compactness.
         Value::Int(n) | Value::Date(n) | Value::Timestamp(n) => format!("i{n}"),
-        Value::Text(s) => format!("t{s}"),
+        // The generator emits no JSON columns either; fold it in with text.
+        Value::Text(s) | Value::Json(s) => format!("t{s}"),
         Value::Bool(b) => format!("i{}", i64::from(*b)),
         Value::Float(x) => canon_float(*x),
     }
@@ -438,7 +444,12 @@ fn report(
         let _ = write!(out, "--- SQLite ({} rows) ---\n{}\n", e.len(), preview(e));
     }
     if let Some(a) = actual {
-        let _ = write!(out, "--- picklejar ({} rows) ---\n{}\n", a.len(), preview(a));
+        let _ = write!(
+            out,
+            "--- picklejar ({} rows) ---\n{}\n",
+            a.len(),
+            preview(a)
+        );
     }
     let _ = write!(out, "reproduce: cargo run --bin difftest -- --seed {seed}");
     out

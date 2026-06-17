@@ -48,6 +48,7 @@ const fn type_tag(t: DataType) -> &'static str {
         DataType::Text => "TEXT",
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
+        DataType::Json => "JSON",
     }
 }
 
@@ -59,6 +60,7 @@ fn parse_type(s: &str) -> Option<DataType> {
         "TEXT" => Some(DataType::Text),
         "DATE" => Some(DataType::Date),
         "TIMESTAMP" => Some(DataType::Timestamp),
+        "JSON" => Some(DataType::Json),
         _ => None,
     }
 }
@@ -74,8 +76,14 @@ fn encode_default(default: Option<&Value>) -> String {
         Some(Value::Bool(b)) => format!("B{}", u8::from(*b)),
         Some(Value::Date(n)) => format!("d{n}"),
         Some(Value::Timestamp(n)) => format!("t{n}"),
-        Some(Value::Text(s)) => {
-            let mut out = String::from("s");
+        Some(Value::Text(s) | Value::Json(s)) => {
+            // Text and JSON share the hex form; the leading tag records which.
+            let tag = if matches!(default, Some(Value::Json(_))) {
+                'j'
+            } else {
+                's'
+            };
+            let mut out = String::from(tag);
             for b in s.bytes() {
                 let _ = write!(out, "{b:02x}");
             }
@@ -97,7 +105,7 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
         'B' => Value::Bool(rest == "1"),
         'd' => Value::Date(rest.parse().map_err(|_| invalid())?),
         't' => Value::Timestamp(rest.parse().map_err(|_| invalid())?),
-        's' => {
+        's' | 'j' => {
             if rest.len() % 2 != 0 {
                 return Err(invalid());
             }
@@ -105,7 +113,12 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
                 .step_by(2)
                 .map(|j| u8::from_str_radix(&rest[j..j + 2], 16).map_err(|_| invalid()))
                 .collect::<io::Result<Vec<u8>>>()?;
-            Value::Text(String::from_utf8(bytes).map_err(|_| invalid())?)
+            let s = String::from_utf8(bytes).map_err(|_| invalid())?;
+            if tag == 'j' {
+                Value::Json(s)
+            } else {
+                Value::Text(s)
+            }
         }
         _ => return Err(invalid()),
     };

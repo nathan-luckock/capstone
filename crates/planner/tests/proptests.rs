@@ -7,10 +7,10 @@
 //!
 //! Oracle: `chosen_scan.est_cost() <= seq_scan_cost(row_count)`.
 
-use proptest::prelude::*;
 use picklejar_planner::cost::seq_scan_cost;
 use picklejar_planner::{bind, plan, Catalog, ColumnStats, PhysicalPlan};
 use picklejar_sql::{Parser, Statement};
+use proptest::prelude::*;
 
 fn stmt(src: &str) -> Statement {
     Parser::from_sql(src)

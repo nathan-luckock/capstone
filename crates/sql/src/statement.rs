@@ -204,6 +204,8 @@ pub enum DataType {
     Date,
     /// A date and time of day (UTC, no time zone), microsecond resolution.
     Timestamp,
+    /// A JSON document, stored as validated text.
+    Json,
 }
 
 impl fmt::Display for DataType {
@@ -215,6 +217,7 @@ impl fmt::Display for DataType {
             Self::Text => "TEXT",
             Self::Date => "DATE",
             Self::Timestamp => "TIMESTAMP",
+            Self::Json => "JSON",
         })
     }
 }
@@ -1949,6 +1952,17 @@ mod tests {
                 to: "b".into(),
             }
         );
+    }
+
+    #[test]
+    fn json_type_and_operators_round_trip() {
+        round_trip("CREATE TABLE t (id INT, body JSON)");
+        round_trip("SELECT (body -> 'a') FROM t");
+        round_trip("SELECT (body ->> 'a') FROM t");
+        // Chained access stays left-associative.
+        round_trip("SELECT (((body -> 'a') -> 'b') ->> 0) FROM t");
+        // -> binds tighter than arithmetic.
+        round_trip("SELECT ((j -> 'n') + 1) FROM t");
     }
 
     #[test]

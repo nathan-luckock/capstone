@@ -3,10 +3,10 @@
 //! Oracle: for any schema and any row matching it (including NULLs, empty
 //! strings, and extreme integers), `decode_row(encode_row(r)) == r`.
 
-use proptest::prelude::*;
 use picklejar_executor::{decode_row, encode_row};
 use picklejar_sql::statement::DataType;
 use picklejar_sql::Value;
+use proptest::prelude::*;
 
 /// A column type paired with a strategy for a value of that type (or NULL).
 fn column() -> impl Strategy<Value = (DataType, Value)> {

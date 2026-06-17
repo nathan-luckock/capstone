@@ -152,6 +152,7 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Text => "TEXT",
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
+        DataType::Json => "JSON",
     }
 }
 
@@ -219,7 +220,7 @@ fn fmt_value(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
         Value::Float(x) => x.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Date(days) => picklejar::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar::datetime::format_timestamp(*micros),

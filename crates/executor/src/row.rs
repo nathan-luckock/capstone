@@ -34,6 +34,7 @@ const fn value_type_name(v: &Value) -> &'static str {
         Value::Bool(_) => "BOOL",
         Value::Date(_) => "DATE",
         Value::Timestamp(_) => "TIMESTAMP",
+        Value::Json(_) => "JSON",
         Value::Null => "NULL",
     }
 }
@@ -47,6 +48,7 @@ const fn data_type_name(t: DataType) -> &'static str {
         DataType::Text => "TEXT",
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
+        DataType::Json => "JSON",
     }
 }
 
@@ -77,11 +79,21 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>> {
             Value::Timestamp(n) if ty == DataType::Timestamp => {
                 bytes.extend_from_slice(&n.to_le_bytes());
             }
+            // TEXT and JSON share the length-prefixed UTF-8 byte form.
             Value::Text(s) if ty == DataType::Text => {
                 let len = u32::try_from(s.len()).map_err(|_| ExecError::RowType {
                     column: i,
                     expected: data_type_name(ty),
                     found: "oversized TEXT",
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(s.as_bytes());
+            }
+            Value::Json(s) if ty == DataType::Json => {
+                let len = u32::try_from(s.len()).map_err(|_| ExecError::RowType {
+                    column: i,
+                    expected: data_type_name(ty),
+                    found: "oversized JSON",
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(s.as_bytes());
@@ -141,7 +153,7 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                 });
                 rest = &rest[8..];
             }
-            DataType::Text => {
+            DataType::Text | DataType::Json => {
                 let len_bytes = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;
                 let len =
                     u32::from_le_bytes(len_bytes.try_into().expect("checked 4 bytes")) as usize;
@@ -151,7 +163,11 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                     .ok_or(ExecError::RowTruncated { column: i })?;
                 let s =
                     std::str::from_utf8(str_bytes).map_err(|_| ExecError::RowUtf8 { column: i })?;
-                out.push(Value::Text(s.to_string()));
+                out.push(if ty == DataType::Json {
+                    Value::Json(s.to_string())
+                } else {
+                    Value::Text(s.to_string())
+                });
                 rest = &rest[len..];
             }
         }
