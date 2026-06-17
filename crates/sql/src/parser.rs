@@ -570,10 +570,15 @@ impl Parser {
             {
                 DataType::Timestamp
             }
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("jsonb") =>
+            {
+                DataType::Json
+            }
             other => {
                 return Err(SqlError::parse(
                     format!(
-                        "expected a type (INT, FLOAT, BOOL, TEXT, DATE, or TIMESTAMP), \
+                        "expected a type (INT, FLOAT, BOOL, TEXT, DATE, TIMESTAMP, or JSON), \
                          found {other:?}"
                     ),
                     self.span(),
@@ -630,6 +635,10 @@ const fn infix_binding_power(kind: &TokenKind) -> Option<(BinOp, u8, u8)> {
         TokenKind::Minus => (BinOp::Sub, 7),
         TokenKind::Star => (BinOp::Mul, 9),
         TokenKind::Slash => (BinOp::Div, 9),
+        // JSON access binds tighter than arithmetic: `j -> 'a' + 1` is
+        // `(j -> 'a') + 1`. Left-associative, so accesses chain.
+        TokenKind::Arrow => (BinOp::JsonGet, 11),
+        TokenKind::ArrowText => (BinOp::JsonGetText, 11),
         _ => return None,
     };
     Some((op, l_bp, l_bp + 1))

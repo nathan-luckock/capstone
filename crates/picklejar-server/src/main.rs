@@ -24,7 +24,11 @@ use crate::http::{read_request, write_response, Request};
 use crate::json::Json;
 
 #[derive(Debug, ClapParser)]
-#[command(name = "picklejar-server", version, about = "HTTP API server for picklejar")]
+#[command(
+    name = "picklejar-server",
+    version,
+    about = "HTTP API server for picklejar"
+)]
 struct Args {
     /// Path to the database file.
     #[arg(short, long, default_value = "picklejar.db")]
@@ -156,7 +160,8 @@ fn value_json(v: &Value) -> Json {
     match v {
         Value::Int(n) => Json::Int(*n),
         Value::Float(x) => Json::Float(*x),
-        Value::Text(s) => Json::Str(s.clone()),
+        // Text, and a JSON document as its raw text, both render as a string.
+        Value::Text(s) | Value::Json(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
         // JSON has no date type; render the canonical string form.
         Value::Date(days) => Json::Str(picklejar_sql::datetime::format_date(*days)),
@@ -199,6 +204,7 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Text => "TEXT",
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
+        DataType::Json => "JSON",
     }
 }
 

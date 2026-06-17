@@ -32,6 +32,8 @@ pub enum Value {
     Date(i64),
     /// A `TIMESTAMP`, as microseconds from the Unix epoch (UTC, no time zone).
     Timestamp(i64),
+    /// A `JSON` document, stored as its (validated) text.
+    Json(String),
     /// SQL `NULL`.
     Null,
 }
@@ -44,7 +46,7 @@ impl PartialEq for Value {
             | (Self::Date(a), Self::Date(b))
             | (Self::Timestamp(a), Self::Timestamp(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
-            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Text(a), Self::Text(b)) | (Self::Json(a), Self::Json(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Null, Self::Null) => true,
             _ => false,
@@ -84,6 +86,8 @@ impl fmt::Display for Value {
                     crate::datetime::format_timestamp(*micros)
                 )
             }
+            // A quoted-text cast, so the value re-parses through the JSON cast.
+            Self::Json(s) => write!(f, "'{}'::json", s.replace('\'', "''")),
             Self::Null => write!(f, "NULL"),
         }
     }
@@ -120,6 +124,10 @@ pub enum BinOp {
     Like,
     /// `||` string concatenation
     Concat,
+    /// `->` JSON member / element access, returning JSON.
+    JsonGet,
+    /// `->>` JSON member / element access, returning text.
+    JsonGetText,
 }
 
 impl fmt::Display for BinOp {
@@ -139,6 +147,8 @@ impl fmt::Display for BinOp {
             Self::Div => "/",
             Self::Like => "LIKE",
             Self::Concat => "||",
+            Self::JsonGet => "->",
+            Self::JsonGetText => "->>",
         };
         f.write_str(s)
     }

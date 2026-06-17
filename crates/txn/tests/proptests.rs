@@ -9,10 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use proptest::prelude::*;
 use picklejar_storage::{BufferPool, FileManager};
 use picklejar_txn::{IsolationLevel, MvccTable, TransactionManager};
 use picklejar_wal::{WalSyncHandle, WalWriter};
+use proptest::prelude::*;
 
 /// Small key space so collisions (and thus update / delete chains) are
 /// common.

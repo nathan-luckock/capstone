@@ -927,6 +927,10 @@ fn group_key_bytes(values: &[Value]) -> Vec<u8> {
                 b.push(6);
                 b.extend_from_slice(&n.to_le_bytes());
             }
+            Value::Json(s) => {
+                b.push(7);
+                b.extend_from_slice(s.as_bytes());
+            }
         }
     }
     b

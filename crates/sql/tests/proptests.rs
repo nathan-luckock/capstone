@@ -6,12 +6,12 @@
 //! clauses, this holds regardless of operator precedence - a structural
 //! check that the printer and parser are exact inverses.
 
-use proptest::prelude::*;
 use picklejar_sql::ast::{BinOp, Expr, UnOp, Value};
 use picklejar_sql::statement::{
     ColumnDef, DataType, Join, JoinKind, OrderItem, Select, SelectItem, Statement, TableRef,
 };
 use picklejar_sql::Parser;
+use proptest::prelude::*;
 
 // --- generators ---
 

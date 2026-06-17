@@ -60,10 +60,15 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   type words are not reserved. `EXTRACT(field FROM ts)` / `DATE_PART('field',
   ts)` pull out a component (year, month, day, hour, minute, second, dow, doy)
   and `DATE_TRUNC('field', ts)` floors to the start of one.
+- **JSON** — a `JSON` column (validated on write, stored as text) with the
+  `->` (returns JSON) and `->>` (returns text) access operators, navigating by
+  a text member name or an integer array index, and chainable
+  (`body -> 'a' ->> 0`). The JSON parser is in-tree (no external crate).
 - **Casts** — `CAST(expr AS type)` and the `expr::type` shorthand, converting
-  between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` (text is
-  parsed, a float rounds to an int, any value renders to text, a timestamp
-  truncates to a date). A cast over a constant folds at insert time.
+  between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` / `JSON`
+  (text is parsed, a float rounds to an int, any value renders to text, a
+  timestamp truncates to a date, text validates as JSON). A cast over a
+  constant folds at insert time.
 - **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
   arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`,
   `CASE`, string `||`, and a library of scalar functions: string (`LENGTH`,

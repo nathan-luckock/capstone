@@ -260,6 +260,10 @@ pub enum TokenKind {
     Dot,
     /// `::` (the cast operator)
     ColonColon,
+    /// `->` (JSON get, returning JSON)
+    Arrow,
+    /// `->>` (JSON get, returning text)
+    ArrowText,
     /// End of input.
     Eof,
 }

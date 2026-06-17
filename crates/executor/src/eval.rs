@@ -456,8 +456,38 @@ fn eval_binary(
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arithmetic(op, &l, &r),
         BinOp::Like => like(&l, &r),
         BinOp::Concat => Ok(Value::Text(value_text(&l) + &value_text(&r))),
+        BinOp::JsonGet | BinOp::JsonGetText => json_get(&l, &r, op == BinOp::JsonGetText),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// `json -> key` / `json ->> key`: navigate a JSON value by a text member name
+/// or an integer array index. `as_text` selects the `->>` form (scalar text);
+/// otherwise the result is JSON. A missing member or a non-JSON left side
+/// yields NULL.
+fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value> {
+    let Value::Json(text) = left else {
+        return Err(ExecError::Type(format!(
+            "the -> operator needs JSON on the left, found {left:?}"
+        )));
+    };
+    let Some(doc) = picklejar_sql::json::parse(text) else {
+        return Ok(Value::Null);
+    };
+    let found = match right {
+        Value::Text(key) => doc.get_key(key),
+        Value::Int(i) => doc.get_index(*i),
+        other => {
+            return Err(ExecError::Type(format!(
+                "the -> operator needs a text key or integer index, found {other:?}"
+            )))
+        }
+    };
+    Ok(match found {
+        None => Value::Null,
+        Some(v) if as_text => Value::Text(v.as_text()),
+        Some(v) => Value::Json(picklejar_sql::json::to_string(v)),
+    })
 }
 
 /// Convert a value to `ty`, the engine for `CAST(expr AS ty)` and `expr::ty`.
@@ -520,6 +550,13 @@ pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
             ),
             _ => return Err(bad()),
         },
+        DataType::Json => match v {
+            Value::Json(s) => Value::Json(s.clone()),
+            // Parse to validate, then store the original text.
+            Value::Text(s) if picklejar_sql::json::is_valid(s) => Value::Json(s.clone()),
+            Value::Text(s) => return Err(parse_fail("json", s)),
+            _ => return Err(bad()),
+        },
     };
     Ok(out)
 }
@@ -533,6 +570,7 @@ fn value_text(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Date(days) => picklejar_sql::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
+        Value::Json(s) => s.clone(),
         Value::Null => String::new(),
     }
 }

@@ -68,11 +68,16 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
             1.0 - 1.0 / d
         }),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => range_selectivity(op, left, right, table),
-        // LIKE has no cheap cardinality estimate, and the arithmetic and
-        // concatenation operators are not boolean predicates: all default.
-        BinOp::Like | BinOp::Concat | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-            UNKNOWN_SELECTIVITY
-        }
+        // LIKE has no cheap cardinality estimate, and the arithmetic, concat,
+        // and JSON-access operators are not boolean predicates: all default.
+        BinOp::Like
+        | BinOp::Concat
+        | BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::JsonGet
+        | BinOp::JsonGetText => UNKNOWN_SELECTIVITY,
     }
 }
 

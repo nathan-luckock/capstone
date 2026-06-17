@@ -4,8 +4,8 @@
 //! writer-reader durability under random workloads, and tail truncation
 //! at arbitrary offsets.
 
-use proptest::prelude::*;
 use picklejar_wal::{LogRecord, Lsn, TxnId, WalReader, WalWriter};
+use proptest::prelude::*;
 use std::io::Write;
 
 // --- strategies ---
