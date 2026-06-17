@@ -624,9 +624,13 @@ the planner can cost an `IndexScan`, and persists its root page in the sidecar.
   `UNIQUE`); see Secondary indexes above. Non-unique and TEXT predicates fall
   back to a sequential scan with a residual filter (correct, not yet faster),
   pending duplicate-key support and a TEXT hash.
-- Both join algorithms run through the nested-loop executor. The result is
-  correct and the planner's hash-vs-loop choice is shown by EXPLAIN; the hash
-  build/probe is a deferred runtime optimization, exactly like the index scan.
+- An equi-join the planner costs as a hash join runs through a real build/probe
+  hash join: the right (build) side is hashed by its join-key columns, each left
+  row finds matches in O(1), and the full `ON` predicate confirms each candidate
+  (so extra non-equi conditions still apply). This turns an O(n*m) join into
+  O(n+m). A join with no usable equality key (a theta join), or a node the
+  planner costs as a nested-loop, uses the nested-loop executor. NULL join keys
+  never match, and `LEFT` joins keep unmatched left rows padded with NULL.
 - Schema and data survive a clean restart (flush plus catalog sidecar). A
   reopen also restores MVCC visibility: the transaction watermark (the next
   xid) and the aborted-xid set are persisted, so on reopen every xid below the
