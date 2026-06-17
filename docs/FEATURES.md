@@ -10,7 +10,8 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`,
   `CREATE INDEX`, `CREATE VIEW` / `DROP VIEW`, and
   `CREATE TABLE name AS <query>` (build and populate a table from a query
-  result, inferring its columns).
+  result, inferring its columns). `CREATE TABLE IF NOT EXISTS` and
+  `DROP TABLE` / `DROP VIEW ... IF EXISTS` make a schema script re-runnable.
 - **Auto-increment** — a `SERIAL` column fills in the next id (running max plus
   one) when an `INSERT` omits it; the set of serial columns survives a restart
   in a `.seq` sidecar.
