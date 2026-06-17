@@ -36,8 +36,8 @@ use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use rustdb_sql::statement::{
-    ColumnDef, ConflictAction, Cte, DataType, Join, OnConflict, OrderItem, Select, SelectItem,
-    TableConstraint, TableRef,
+    AlterAction, ColumnDef, ConflictAction, Cte, DataType, Join, OnConflict, OrderItem, Select,
+    SelectItem, TableConstraint, TableRef,
 };
 use rustdb_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
@@ -525,10 +525,10 @@ impl Database {
             Statement::Truncate { ref table } => self.truncate_table(table),
             Statement::Analyze { ref table } => self.run_analyze(table.as_deref()),
             Statement::Vacuum { ref table } => self.run_vacuum(table.as_deref()),
-            Statement::AlterTableAddColumn {
+            Statement::AlterTable {
                 ref table,
-                ref column,
-            } => self.alter_add_column(table, column),
+                ref action,
+            } => self.alter_table(table, action),
             // EXPLAIN plans; EXPLAIN ANALYZE also runs the query.
             Statement::Explain { .. } => self.run_explain(&stmt),
             // DML and SELECT run inside the open transaction, or a fresh
@@ -1158,6 +1158,253 @@ impl Database {
             return Ok(QueryOutcome::Mutation { affected: 0 });
         }
         self.insert(txn, table, &[], &rows, None, &[])
+    }
+
+    /// Route an `ALTER TABLE` action to its handler.
+    fn alter_table(&mut self, table: &str, action: &AlterAction) -> Result<QueryOutcome> {
+        match action {
+            AlterAction::AddColumn(col) => self.alter_add_column(table, col),
+            AlterAction::DropColumn { name, if_exists } => {
+                self.alter_drop_column(table, name, *if_exists)
+            }
+            AlterAction::RenameColumn { from, to } => self.alter_rename_column(table, from, to),
+            AlterAction::RenameTable { to } => self.alter_rename_table(table, to),
+        }
+    }
+
+    /// `ALTER TABLE t DROP COLUMN c`: rewrite every row without the column into
+    /// fresh storage. Refused when the column is the table's only one or is used
+    /// by a `CHECK` or `FOREIGN KEY` constraint (whose reference would go stale).
+    fn alter_drop_column(
+        &mut self,
+        table: &str,
+        column: &str,
+        if_exists: bool,
+    ) -> Result<QueryOutcome> {
+        let meta = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let Some(idx) = meta.column_index(column) else {
+            // `IF EXISTS`: a missing column is a no-op, not an error.
+            if if_exists {
+                return Ok(QueryOutcome::Ddl);
+            }
+            return Err(DbError::Constraint(format!(
+                "column {column} does not exist on {table}"
+            )));
+        };
+        if meta.columns.len() == 1 {
+            return Err(DbError::Constraint(format!(
+                "cannot drop the only column of {table}"
+            )));
+        }
+        self.ensure_column_unconstrained(table, column)?;
+
+        // Read every row under the current schema, then drop the column's value
+        // from each and rebuild storage under the new (shorter) schema.
+        let old_schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+        let old_rows = self.scan_all_rows(table, &old_schema)?;
+        self.catalog.drop_column(table, column)?;
+        let new_rows: Vec<Vec<Value>> = old_rows
+            .into_iter()
+            .map(|mut r| {
+                r.remove(idx);
+                r
+            })
+            .collect();
+        self.rebuild_storage(table, &new_rows)?;
+
+        // Keep the positional defaults aligned, and forget the column if it was
+        // a serial.
+        if let Some(store) = self.tables.get_mut(table) {
+            if idx < store.defaults.len() {
+                store.defaults.remove(idx);
+            }
+        }
+        if let Some(list) = self.serial_cols.get_mut(table) {
+            list.retain(|n| n != column);
+            if list.is_empty() {
+                self.serial_cols.remove(table);
+            }
+            self.save_serials()?;
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `ALTER TABLE t RENAME COLUMN a TO b`: a metadata-only rename, since rows
+    /// are stored positionally. Refused when the column is named by a `CHECK` or
+    /// `FOREIGN KEY` constraint, which would otherwise reference a stale name.
+    fn alter_rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<QueryOutcome> {
+        let meta = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        if meta.column_index(from).is_none() {
+            return Err(DbError::Constraint(format!(
+                "column {from} does not exist on {table}"
+            )));
+        }
+        if meta.column_index(to).is_some() {
+            return Err(DbError::Constraint(format!(
+                "column {to} already exists on {table}"
+            )));
+        }
+        self.ensure_column_unconstrained(table, from)?;
+        self.catalog.rename_column(table, from, to)?;
+        if let Some(list) = self.serial_cols.get_mut(table) {
+            for name in list.iter_mut() {
+                if name == from {
+                    *name = to.to_string();
+                }
+            }
+            self.save_serials()?;
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `ALTER TABLE t RENAME TO u`: rename the table across the catalog and the
+    /// engine's name-keyed maps. Refused when another table holds a foreign key
+    /// into this one (the reference is by name), or the target name is taken.
+    fn alter_rename_table(&mut self, from: &str, to: &str) -> Result<QueryOutcome> {
+        if self.catalog.get_table(from).is_none() {
+            return Err(DbError::UnknownTable(from.to_string()));
+        }
+        if self.catalog.get_table(to).is_some() || self.views.contains_key(to) {
+            return Err(DbError::Constraint(format!("table {to} already exists")));
+        }
+        if let Some(child) = self.referencing_table(from) {
+            return Err(DbError::Constraint(format!(
+                "cannot rename table {from}: it is referenced by a foreign key on {child}"
+            )));
+        }
+        self.catalog.rename_table(from, to)?;
+        if let Some(store) = self.tables.remove(from) {
+            self.tables.insert(to.to_string(), store);
+        }
+        if let Some(constraints) = self.constraints.remove(from) {
+            self.constraints.insert(to.to_string(), constraints);
+            self.save_constraints()?;
+        }
+        if let Some(serials) = self.serial_cols.remove(from) {
+            self.serial_cols.insert(to.to_string(), serials);
+            self.save_serials()?;
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// Read every live row of `table` under `schema` (a snapshot scan), for an
+    /// `ALTER` rewrite.
+    fn scan_all_rows(&self, table: &str, schema: &[DataType]) -> Result<Vec<Vec<Value>>> {
+        let reader = self.mgr.begin();
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let rows = handle
+            .scan(&reader)?
+            .into_iter()
+            .map(|(_k, bytes)| decode_row(&bytes, schema))
+            .collect::<std::result::Result<_, _>>()?;
+        self.mgr.commit(&reader);
+        Ok(rows)
+    }
+
+    /// Rebuild `table`'s physical storage and secondary indexes from `rows`,
+    /// which must already be shaped to the table's *current* catalog columns.
+    /// Swaps the fresh anchors into the table's store and updates its row count.
+    fn rebuild_storage(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<()> {
+        let cols = self
+            .catalog
+            .get_table(table)
+            .expect("present")
+            .columns
+            .clone();
+        let new_schema: Vec<DataType> = cols.iter().map(|c| c.ty).collect();
+        let new_table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
+        let mut secondary = Vec::new();
+        for (i, c) in cols.iter().enumerate() {
+            if c.ty == DataType::Int && c.unique {
+                if self
+                    .catalog
+                    .get_table(table)
+                    .and_then(|m| m.index_on(&c.name))
+                    .is_none()
+                {
+                    self.catalog.apply(&Statement::CreateIndex {
+                        name: format!("{table}_{}_idx", c.name),
+                        table: table.to_string(),
+                        column: c.name.clone(),
+                    })?;
+                }
+                secondary.push(SecondaryIndex {
+                    column: i,
+                    root: Index::create(&self.pool)?.root(),
+                });
+            }
+        }
+        let writer = self.mgr.begin();
+        let mut rowid: u64 = 0;
+        for values in rows {
+            new_table.insert(&writer, rowid, &encode_row(values, &new_schema)?)?;
+            for sec in &mut secondary {
+                let index = Index::open(&self.pool, sec.root);
+                index.put(&values[sec.column], rowid)?;
+                sec.root = index.root();
+            }
+            rowid += 1;
+        }
+        self.mgr.commit(&writer);
+        let index_root = new_table.index_root();
+        let version_page = new_table.version_page();
+        let store = self.tables.get_mut(table).expect("present");
+        store.index_root = index_root;
+        store.version_page = version_page;
+        store.next_rowid = rowid;
+        store.secondary = secondary;
+        self.catalog.set_row_count(table, rowid)?;
+        Ok(())
+    }
+
+    /// Reject altering `column` of `table` when a stored `CHECK` or `FOREIGN KEY`
+    /// constraint names it (here or, as a foreign-key parent, in another table),
+    /// since the rename/drop would leave that constraint pointing at a stale name.
+    fn ensure_column_unconstrained(&self, table: &str, column: &str) -> Result<()> {
+        if let Some(tc) = self.constraints.get(table) {
+            if tc.checks.iter().any(|c| expr_mentions_column(c, column)) {
+                return Err(DbError::Constraint(format!(
+                    "cannot alter column {column}: it is used by a CHECK constraint on {table}"
+                )));
+            }
+            if tc.foreign_keys.iter().any(|fk| fk.column == column) {
+                return Err(DbError::Constraint(format!(
+                    "cannot alter column {column}: it is used by a foreign key on {table}"
+                )));
+            }
+        }
+        for (child, tc) in &self.constraints {
+            if child != table
+                && tc
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_table == table && fk.parent_column == column)
+            {
+                return Err(DbError::Constraint(format!(
+                    "cannot alter column {column}: it is referenced by a foreign key on {child}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Append a column to a table, rewriting every existing row into fresh
@@ -3263,6 +3510,45 @@ fn expr_is_column(expr: &Expr, col: &str) -> bool {
     }
 }
 
+/// Whether `expr` mentions the column `col` anywhere in its tree. Used to keep
+/// `ALTER TABLE` from renaming or dropping a column a `CHECK` predicate names.
+fn expr_mentions_column(expr: &Expr, col: &str) -> bool {
+    match expr {
+        Expr::Column(c) | Expr::QualifiedColumn(_, c) => c == col,
+        Expr::Binary { left, right, .. } => {
+            expr_mentions_column(left, col) || expr_mentions_column(right, col)
+        }
+        Expr::Unary { expr, .. } | Expr::InSubquery { expr, .. } => expr_mentions_column(expr, col),
+        Expr::Func { args, .. } => args.iter().any(|a| expr_mentions_column(a, col)),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_mentions_column(o, col))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_mentions_column(w, col) || expr_mentions_column(t, col))
+                || else_result
+                    .as_deref()
+                    .is_some_and(|e| expr_mentions_column(e, col))
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(|a| expr_mentions_column(a, col))
+                || partition_by.iter().any(|p| expr_mentions_column(p, col))
+                || order_by.iter().any(|o| expr_mentions_column(&o.expr, col))
+        }
+        _ => false,
+    }
+}
+
 /// Evaluate a constant expression (an `INSERT` value) with no row context.
 ///
 /// Handles literals and unary `-` / `NOT`. Column references and binary
@@ -5287,6 +5573,81 @@ mod tests {
                 vec![Value::Int(2), Value::Int(5)],
             ]
         );
+    }
+
+    #[test]
+    fn alter_drop_column_rewrites_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT, note TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+            .unwrap();
+        db.execute("ALTER TABLE t DROP COLUMN name").unwrap();
+        let (cols, rows) = query(&mut db, "SELECT id, note FROM t ORDER BY id");
+        assert_eq!(names(&cols), ["id", "note"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("x".into())],
+                vec![Value::Int(2), Value::Text("y".into())],
+            ]
+        );
+        // The dropped column is gone from the schema.
+        assert!(db.execute("SELECT name FROM t").is_err());
+        // DROP COLUMN IF EXISTS on the now-absent column is a no-op.
+        assert!(matches!(
+            db.execute("ALTER TABLE t DROP COLUMN IF EXISTS name")
+                .unwrap(),
+            QueryOutcome::Ddl
+        ));
+        // Dropping a missing column without IF EXISTS errors.
+        assert!(db.execute("ALTER TABLE t DROP COLUMN ghost").is_err());
+    }
+
+    #[test]
+    fn alter_drop_column_refused_when_constrained() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT CHECK (n > 0))")
+            .unwrap();
+        // The column n is named by a CHECK; dropping it is refused.
+        assert!(db.execute("ALTER TABLE t DROP COLUMN n").is_err());
+        // The only-column rule.
+        db.execute("CREATE TABLE one (a INT)").unwrap();
+        assert!(db.execute("ALTER TABLE one DROP COLUMN a").is_err());
+    }
+
+    #[test]
+    fn alter_rename_column_keeps_data() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN name TO label")
+            .unwrap();
+        let (cols, rows) = query(&mut db, "SELECT id, label FROM t");
+        assert_eq!(names(&cols), ["id", "label"]);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+        // The old name no longer resolves.
+        assert!(db.execute("SELECT name FROM t").is_err());
+    }
+
+    #[test]
+    fn alter_rename_table_moves_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rt.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+            db.execute("ALTER TABLE t RENAME TO users").unwrap();
+            // Old name gone, new name works.
+            assert!(db.execute("SELECT id FROM t").is_err());
+            let (_c, rows) = query(&mut db, "SELECT id, name FROM users");
+            assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+        }
+        // The rename survives a reopen.
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT id FROM users");
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
     }
 
     // --- RETURNING ---

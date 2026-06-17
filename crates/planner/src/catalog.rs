@@ -243,6 +243,87 @@ impl Catalog {
         Ok(())
     }
 
+    /// Remove a column from a table (for `ALTER TABLE DROP COLUMN`). Any index
+    /// and statistics on the column are dropped with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table or column is unknown.
+    pub fn drop_column(&mut self, table: &str, column: &str) -> Result<()> {
+        let meta = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| PlanError::UnknownTable(table.to_string()))?;
+        let idx = meta
+            .column_index(column)
+            .ok_or_else(|| PlanError::UnknownColumn {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        meta.columns.remove(idx);
+        meta.indexes.retain(|ix| ix.column != column);
+        meta.stats.columns.remove(column);
+        Ok(())
+    }
+
+    /// Rename a column (for `ALTER TABLE RENAME COLUMN`). Storage is positional,
+    /// so only the metadata (column name, any index on it, its statistics) moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table or source column is unknown, or the target
+    /// name is already taken.
+    pub fn rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<()> {
+        let meta = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| PlanError::UnknownTable(table.to_string()))?;
+        if meta.column_index(from).is_none() {
+            return Err(PlanError::UnknownColumn {
+                table: table.to_string(),
+                column: from.to_string(),
+            });
+        }
+        if meta.column_index(to).is_some() {
+            return Err(PlanError::Unsupported(format!(
+                "column {to} already exists"
+            )));
+        }
+        for c in &mut meta.columns {
+            if c.name == from {
+                c.name = to.to_string();
+            }
+        }
+        for ix in &mut meta.indexes {
+            if ix.column == from {
+                ix.column = to.to_string();
+            }
+        }
+        if let Some(stats) = meta.stats.columns.remove(from) {
+            meta.stats.columns.insert(to.to_string(), stats);
+        }
+        Ok(())
+    }
+
+    /// Rename a table (for `ALTER TABLE RENAME TO`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source table is unknown or the target name is
+    /// already taken.
+    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<()> {
+        if !self.tables.contains_key(from) {
+            return Err(PlanError::UnknownTable(from.to_string()));
+        }
+        if self.tables.contains_key(to) {
+            return Err(PlanError::TableExists(to.to_string()));
+        }
+        let mut meta = self.tables.remove(from).expect("checked present");
+        meta.name = to.to_string();
+        self.tables.insert(to.to_string(), meta);
+        Ok(())
+    }
+
     /// Set a column's statistics.
     pub fn set_column_stats(
         &mut self,
