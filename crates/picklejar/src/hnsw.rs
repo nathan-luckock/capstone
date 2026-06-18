@@ -239,6 +239,119 @@ impl Hnsw {
             .collect()
     }
 
+    /// Serialize the whole graph to a self-contained byte buffer that
+    /// [`from_bytes`](Self::from_bytes) restores exactly. This lets the index
+    /// survive a restart, the same as the rest of the durable memory layer,
+    /// rather than being rebuilt from scratch on every open.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PJHN");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for field in [
+            self.dim as u64,
+            self.m as u64,
+            self.m0 as u64,
+            self.ef_construction as u64,
+            self.ml.to_bits(),
+            self.rng.0,
+            self.max_level as u64,
+            self.entry.map_or(u64::MAX, |e| e as u64),
+            self.nodes.len() as u64,
+        ] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        for node in &self.nodes {
+            out.extend_from_slice(&(node.neighbors.len() as u64).to_le_bytes());
+            for &x in &node.vector {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            for layer in &node.neighbors {
+                out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
+                for &id in layer {
+                    out.extend_from_slice(&(id as u64).to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Restore an index from [`to_bytes`](Self::to_bytes) output. Returns `None`
+    /// if the bytes are not a version-1 index image or are truncated, so a
+    /// corrupt sidecar is rejected rather than trusted.
+    #[must_use]
+    #[allow(clippy::similar_names)] // the read_u32 / read_u64 / read_f32 readers are deliberately parallel
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.get(0..4)? != b"PJHN" {
+            return None;
+        }
+        let mut p = 4usize;
+        let read_u32 = |p: &mut usize| -> Option<u32> {
+            let b = bytes.get(*p..*p + 4)?;
+            *p += 4;
+            Some(u32::from_le_bytes(b.try_into().ok()?))
+        };
+        let read_u64 = |p: &mut usize| -> Option<u64> {
+            let b = bytes.get(*p..*p + 8)?;
+            *p += 8;
+            Some(u64::from_le_bytes(b.try_into().ok()?))
+        };
+        let read_f32 = |p: &mut usize| -> Option<f32> {
+            let b = bytes.get(*p..*p + 4)?;
+            *p += 4;
+            Some(f32::from_le_bytes(b.try_into().ok()?))
+        };
+        if read_u32(&mut p)? != 1 {
+            return None;
+        }
+        let dim = usize::try_from(read_u64(&mut p)?).ok()?;
+        let m = usize::try_from(read_u64(&mut p)?).ok()?;
+        let m0 = usize::try_from(read_u64(&mut p)?).ok()?;
+        let ef_construction = usize::try_from(read_u64(&mut p)?).ok()?;
+        let ml = f64::from_bits(read_u64(&mut p)?);
+        let rng = Rng(read_u64(&mut p)?);
+        let max_level = usize::try_from(read_u64(&mut p)?).ok()?;
+        let entry_raw = read_u64(&mut p)?;
+        let entry = if entry_raw == u64::MAX {
+            None
+        } else {
+            Some(usize::try_from(entry_raw).ok()?)
+        };
+        let node_count = usize::try_from(read_u64(&mut p)?).ok()?;
+        let mut nodes = Vec::new();
+        for _ in 0..node_count {
+            let layers = usize::try_from(read_u64(&mut p)?).ok()?;
+            if layers == 0 {
+                return None;
+            }
+            let mut vector = Vec::new();
+            for _ in 0..dim {
+                vector.push(read_f32(&mut p)?);
+            }
+            let mut neighbors = Vec::new();
+            for _ in 0..layers {
+                let count = usize::try_from(read_u64(&mut p)?).ok()?;
+                let mut layer = Vec::new();
+                for _ in 0..count {
+                    layer.push(usize::try_from(read_u64(&mut p)?).ok()?);
+                }
+                neighbors.push(layer);
+            }
+            nodes.push(Node { vector, neighbors });
+        }
+        Some(Self {
+            dim,
+            m,
+            m0,
+            ef_construction,
+            ml,
+            rng,
+            nodes,
+            entry,
+            max_level,
+        })
+    }
+
     /// Greedily walk from `from_level` down to just above `to_level`, hopping to
     /// a strictly closer neighbor until none improves, one layer at a time.
     fn greedy_descent(
@@ -444,6 +557,28 @@ mod tests {
         let recall =
             f64::from(u32::try_from(hits).unwrap()) / f64::from(u32::try_from(total).unwrap());
         assert!(recall > 0.90, "recall@10 was {recall:.3}, expected > 0.90");
+    }
+
+    #[test]
+    fn serialize_round_trips_and_rejects_garbage() {
+        let dim = 12;
+        let data = gen_vectors(400, dim, 31);
+        let mut index = Hnsw::new(dim, 16, 100, 8);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let bytes = index.to_bytes();
+        let restored = Hnsw::from_bytes(&bytes).expect("restore a valid image");
+        assert_eq!(restored.len(), index.len());
+        // The restored graph answers every query identically.
+        for q in 0..15 {
+            let query = &data[q * 11 % data.len()];
+            assert_eq!(index.search(query, 10, 64), restored.search(query, 10, 64));
+        }
+        // A truncated or unrecognized buffer is rejected, never panicked on.
+        assert!(Hnsw::from_bytes(&bytes[..bytes.len() / 2]).is_none());
+        assert!(Hnsw::from_bytes(b"nope").is_none());
+        assert!(Hnsw::from_bytes(&[]).is_none());
     }
 
     #[test]
