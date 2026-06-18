@@ -5,11 +5,14 @@
 //! real [`Database`], and proves the two properties the AI memory layer must hold
 //! *together*:
 //!
-//! - **Durability.** Every committed embedding is present and byte-for-byte
-//!   intact after a crash and reopen; every rolled-back embedding is gone.
+//! - **Durability.** After a crash and reopen, every committed embedding is
+//!   present and byte-for-byte intact, every updated embedding reflects its last
+//!   committed value, every deleted embedding is gone, and every rolled-back
+//!   change left no trace.
 //! - **Isolation.** After recovery, each tenant still sees exactly its own
-//!   embeddings and never another tenant's, enforced by row-level security in the
-//!   engine rather than by application code.
+//!   embeddings and never another tenant's, on both ordinary reads and
+//!   nearest-neighbor ranking, enforced by row-level security in the engine
+//!   rather than by application code.
 //!
 //! Every run is driven entirely by one `u64` seed, so any failure replays
 //! exactly. The on-disk location is process-unique (it does not affect the
@@ -20,6 +23,7 @@
 //! in-process recovery tests use. It is complementary to, not a replacement for,
 //! the stricter fault-disk model behind the storage-level `dst` simulator.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::{ast, Database, QueryOutcome, Value};
@@ -51,17 +55,33 @@ impl Rng {
 pub struct Outcome {
     /// Number of tenants in the run.
     pub tenants: usize,
-    /// Committed embeddings that had to survive the crash.
+    /// Committed operations (inserts, updates, and deletes) that had to take
+    /// effect.
     pub committed: usize,
-    /// Rolled-back embeddings that had to stay gone.
+    /// Rolled-back operations that had to leave no trace.
     pub rolled_back: usize,
+    /// Embeddings still live after the workload, all verified intact and
+    /// correctly isolated after the crash.
+    pub live: usize,
+}
+
+/// The live embedding for each id, per tenant: the oracle of what a correct
+/// database must hold after recovery.
+type Oracle = Vec<BTreeMap<i64, Vec<f32>>>;
+
+/// The oracle effect of one committed operation.
+enum Effect {
+    /// Insert or update an id to a new embedding.
+    Set(i64, Vec<f32>),
+    /// Remove an id.
+    Remove(i64),
 }
 
 /// Run one seeded crash-and-recover simulation of the vector memory layer.
 ///
 /// Returns the verified [`Outcome`], or an error string naming the first
-/// violated invariant (a missing or altered embedding, or a tenant seeing a row
-/// that is not its own).
+/// violated invariant (a missing, altered, or resurrected embedding, or a tenant
+/// seeing a row that is not its own).
 ///
 /// # Errors
 ///
@@ -77,15 +97,12 @@ pub fn run_seed(seed: u64) -> Result<Outcome, String> {
     result
 }
 
-/// One committed embedding the oracle expects to find, keyed by its tenant.
-type TenantRows = Vec<Vec<(i64, Vec<f32>)>>;
-
 #[allow(clippy::too_many_lines)]
 fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
     let mut rng = Rng::new(seed);
     let dim = usize::try_from(2 + rng.below(6)).expect("small");
     let tenants = usize::try_from(2 + rng.below(3)).expect("small");
-    let ops = 20 + rng.below(80);
+    let ops = 30 + rng.below(90);
 
     let path = dir.join("mem.db");
     let mut db = Database::open(&path).map_err(|e| format!("open: {e}"))?;
@@ -105,27 +122,32 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
     )?;
     exec(&mut db, "ALTER TABLE memories ENABLE ROW LEVEL SECURITY")?;
 
-    // Workload: random embeddings across tenants, a quarter of them rolled back.
-    let mut oracle: TenantRows = vec![Vec::new(); tenants];
+    // Workload: a mix of inserts, updates, and deletes across tenants, a fifth of
+    // them rolled back. The workload runs as the bootstrap superuser, so it can
+    // touch any tenant's rows; the isolation check happens later, per tenant.
+    let mut live: Oracle = vec![BTreeMap::new(); tenants];
     let mut committed = 0usize;
     let mut rolled_back = 0usize;
+
     for i in 0..ops {
         let t = usize::try_from(rng.below(tenants as u64)).expect("small");
-        let id = i64::try_from(i).expect("op count fits i64") + 1;
-        let embedding = random_vector(&mut rng, dim);
-        let stmt = format!(
-            "INSERT INTO memories VALUES ({id}, 't{t}', '{}')",
-            ast::format_vector(&embedding)
-        );
-        if rng.below(4) == 0 {
-            // A rolled-back transaction: its row must never come back.
+        let (stmt, effect) = build_op(&mut rng, t, i, dim, &live[t]);
+        if rng.below(5) == 0 {
+            // A rolled-back transaction: its change must leave no trace.
             exec(&mut db, "BEGIN")?;
             exec(&mut db, &stmt)?;
             exec(&mut db, "ROLLBACK")?;
             rolled_back += 1;
         } else {
             exec(&mut db, &stmt)?;
-            oracle[t].push((id, embedding));
+            match effect {
+                Effect::Set(id, v) => {
+                    live[t].insert(id, v);
+                }
+                Effect::Remove(id) => {
+                    live[t].remove(&id);
+                }
+            }
             committed += 1;
         }
     }
@@ -134,12 +156,13 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
     drop(db);
     let mut db = Database::open(&path).map_err(|e| format!("reopen: {e}"))?;
 
-    // Durability, from the superuser's unfenced view: exactly the committed rows
-    // survive, no rolled-back row reappears.
+    // Durability, from the superuser's unfenced view: exactly the live rows
+    // survive, no rolled-back or deleted row reappears.
+    let live_total: usize = live.iter().map(BTreeMap::len).sum();
     let total = rows(&mut db, "SELECT id FROM memories")?.len();
-    if total != committed {
+    if total != live_total {
         return Err(format!(
-            "seed {seed}: durability: expected {committed} committed rows, found {total}"
+            "seed {seed}: durability: expected {live_total} live rows, found {total}"
         ));
     }
 
@@ -147,8 +170,8 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
     let probe = ast::format_vector(&vec![0.0f32; dim]);
 
     // Isolation plus durability, per tenant: each tenant sees exactly its own
-    // committed embeddings, intact, and nothing belonging to anyone else.
-    for (t, want) in oracle.iter().enumerate() {
+    // live embeddings, intact, and nothing belonging to anyone else.
+    for (t, want) in live.iter().enumerate() {
         db.set_session_user(&format!("t{t}"));
         let got = rows(&mut db, "SELECT id, e FROM memories ORDER BY id")?;
         let expected: Vec<Vec<Value>> = want
@@ -180,7 +203,61 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
         tenants,
         committed,
         rolled_back,
+        live: live_total,
     })
+}
+
+/// Build one random operation for tenant `t` and the oracle effect it has if
+/// committed. Inserts use a fresh id derived from the op index `i`; updates and
+/// deletes target one of the tenant's currently-live ids, falling back to an
+/// insert when the tenant has no rows yet.
+fn build_op(
+    rng: &mut Rng,
+    t: usize,
+    i: u64,
+    dim: usize,
+    tenant_live: &BTreeMap<i64, Vec<f32>>,
+) -> (String, Effect) {
+    let fresh_id = i64::try_from(i).expect("op count fits i64") + 1;
+    // 0,1 -> insert; 2 -> update; 3 -> delete. Without live rows, always insert.
+    let choice = if tenant_live.is_empty() {
+        0
+    } else {
+        rng.below(4)
+    };
+    match choice {
+        2 => {
+            let target = nth_key(tenant_live, rng);
+            let v = random_vector(rng, dim);
+            let stmt = format!(
+                "UPDATE memories SET e = '{}' WHERE id = {target}",
+                ast::format_vector(&v)
+            );
+            (stmt, Effect::Set(target, v))
+        }
+        3 => {
+            let target = nth_key(tenant_live, rng);
+            (
+                format!("DELETE FROM memories WHERE id = {target}"),
+                Effect::Remove(target),
+            )
+        }
+        _ => {
+            let v = random_vector(rng, dim);
+            let stmt = format!(
+                "INSERT INTO memories VALUES ({fresh_id}, 't{t}', '{}')",
+                ast::format_vector(&v)
+            );
+            (stmt, Effect::Set(fresh_id, v))
+        }
+    }
+}
+
+/// Pick a pseudo-random key from a non-empty map. The map's keys iterate in
+/// sorted order, so the choice is fully determined by the seed.
+fn nth_key(map: &BTreeMap<i64, Vec<f32>>, rng: &mut Rng) -> i64 {
+    let k = usize::try_from(rng.below(map.len() as u64)).expect("nonempty map");
+    *map.keys().nth(k).expect("k is below len")
 }
 
 /// A random embedding of `dim` integer-valued components in `[-1000, 1000]`.
@@ -230,6 +307,7 @@ mod tests {
         let b = run_seed(7).expect("seed 7 again");
         assert_eq!(a.committed, b.committed);
         assert_eq!(a.rolled_back, b.rolled_back);
+        assert_eq!(a.live, b.live);
         assert_eq!(a.tenants, b.tenants);
     }
 }
