@@ -502,6 +502,58 @@ impl Hnsw {
         })
     }
 
+    /// Serialize the index as a self-healing redundant image: two independent,
+    /// each-checksummed copies. If one copy is corrupted past its CRC, the other
+    /// reconstructs the index with no outside intervention, which is the
+    /// "no one is coming" requirement for hardware that cannot be serviced.
+    #[must_use]
+    pub fn to_bytes_redundant(&self) -> Vec<u8> {
+        let copy = self.to_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PJHR");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..2 {
+            out.extend_from_slice(&(copy.len() as u64).to_le_bytes());
+            out.extend_from_slice(&copy);
+        }
+        out
+    }
+
+    /// Load a [`to_bytes_redundant`](Self::to_bytes_redundant) image, repairing
+    /// through redundancy. Returns the index and a flag that is `true` when a copy
+    /// was found corrupt (so a scrubber knows to write back a fresh clean image).
+    /// Returns `None` only when *every* copy is corrupt, so a silently wrong index
+    /// is never produced.
+    #[must_use]
+    pub fn load_redundant(bytes: &[u8]) -> Option<(Self, bool)> {
+        if bytes.get(0..4)? != b"PJHR" {
+            return None;
+        }
+        let ver = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+        if ver != 1 {
+            return None;
+        }
+        let mut p = 8usize;
+        let mut copies: Vec<&[u8]> = Vec::new();
+        for _ in 0..2 {
+            let len =
+                usize::try_from(u64::from_le_bytes(bytes.get(p..p + 8)?.try_into().ok()?)).ok()?;
+            p += 8;
+            copies.push(bytes.get(p..p + len)?);
+            p += len;
+        }
+        // Take the first intact copy. A corrupt copy seen before it sets the
+        // repair flag, so the caller can rewrite a clean image.
+        let mut any_corrupt = false;
+        for copy in copies {
+            match Self::from_bytes(copy) {
+                Some(index) => return Some((index, any_corrupt)),
+                None => any_corrupt = true,
+            }
+        }
+        None
+    }
+
     /// Greedily walk from `from_level` down to just above `to_level`, hopping to
     /// a strictly closer neighbor until none improves, one layer at a time.
     fn greedy_descent(
@@ -811,6 +863,49 @@ mod tests {
     // those relations is the accepted research answer to the oracle problem for
     // systems whose exact output you cannot predict. These are those relations
     // for nearest-neighbor search.
+
+    #[test]
+    fn redundant_index_self_heals_from_one_corrupt_copy() {
+        // The self-healing payoff: corrupt one copy arbitrarily and the index
+        // still loads, recovered from the other with no intervention.
+        let dim = 8;
+        let data = gen_vectors(150, dim, 12);
+        let mut index = Hnsw::new(dim, 16, 100, 5);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let probe = &data[7];
+        let expect = index.search(probe, 5, 64);
+        let img = index.to_bytes_redundant();
+
+        // A clean image loads with no repair needed and answers identically.
+        let (clean, repaired) = Hnsw::load_redundant(&img).expect("clean image loads");
+        assert!(!repaired, "a clean image needs no repair");
+        assert_eq!(clean.search(probe, 5, 64), expect);
+
+        // Smash the first copy (its bytes begin after the 16-byte header).
+        let mut damaged = img.clone();
+        for b in damaged.iter_mut().skip(16).take(24) {
+            *b ^= 0xFF;
+        }
+        let (healed, repaired) = Hnsw::load_redundant(&damaged).expect("self-heals from copy B");
+        assert!(repaired, "a corrupt copy must be reported for the scrubber");
+        assert_eq!(
+            healed.search(probe, 5, 64),
+            expect,
+            "the recovered index answers identically"
+        );
+
+        // Corrupt both copies: unrecoverable, but detected, never silently wrong.
+        let mut dead = img;
+        let n = dead.len();
+        dead[20] ^= 0xFF;
+        dead[n - 6] ^= 0xFF;
+        assert!(
+            Hnsw::load_redundant(&dead).is_none(),
+            "both copies corrupt is detected, not served as a wrong answer"
+        );
+    }
 
     #[test]
     fn corruption_in_the_serialized_index_is_detected() {
