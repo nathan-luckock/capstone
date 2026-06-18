@@ -174,6 +174,13 @@ pub enum BinOp {
     JsonGet,
     /// `->>` JSON member / element access, returning text.
     JsonGetText,
+    /// `<->` vector L2 (Euclidean) distance, returning a FLOAT.
+    VecL2,
+    /// `<=>` vector cosine distance (`1 - cosine similarity`), returning a FLOAT.
+    VecCosine,
+    /// `<#>` vector negative inner product, returning a FLOAT (negated so that
+    /// ascending order ranks the most similar first, matching pgvector).
+    VecInner,
 }
 
 impl fmt::Display for BinOp {
@@ -195,6 +202,9 @@ impl fmt::Display for BinOp {
             Self::Concat => "||",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
+            Self::VecL2 => "<->",
+            Self::VecCosine => "<=>",
+            Self::VecInner => "<#>",
         };
         f.write_str(s)
     }

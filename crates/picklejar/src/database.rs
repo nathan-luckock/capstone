@@ -5970,6 +5970,80 @@ mod tests {
         assert!(db.execute("INSERT INTO docs VALUES (2, '[1, 2]')").is_err());
     }
 
+    /// Pull a single FLOAT scalar out of a one-row, one-column result.
+    fn scalar_float(db: &mut Database, sql: &str) -> f64 {
+        match query(db, sql).1.as_slice() {
+            [row] => match row.as_slice() {
+                [Value::Float(x)] => *x,
+                other => panic!("expected one float, got {other:?}"),
+            },
+            other => panic!("expected one row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_distance_operators_compute() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE d (id INT, e VECTOR(3))").unwrap();
+        db.execute("INSERT INTO d VALUES (1, '[1, 2, 3]')").unwrap();
+        // L2: |[1,2,3] - [4,6,3]| = |(3,4,0)| = 5.
+        let l2 = scalar_float(&mut db, "SELECT e <-> '[4, 6, 3]' FROM d");
+        assert!((l2 - 5.0).abs() < 1e-9, "l2 was {l2}");
+        // Negative inner product: -(1*4 + 2*6 + 3*3) = -25.
+        let ip = scalar_float(&mut db, "SELECT e <#> '[4, 6, 3]' FROM d");
+        assert!((ip + 25.0).abs() < 1e-9, "inner product was {ip}");
+        // Cosine distance against an identical direction is 0; against an
+        // orthogonal vector it is 1.
+        let same = scalar_float(&mut db, "SELECT e <=> '[2, 4, 6]' FROM d");
+        assert!(same.abs() < 1e-9, "cosine of parallel vectors was {same}");
+        db.execute("INSERT INTO d VALUES (2, '[1, 0, 0]')").unwrap();
+        let orth = scalar_float(&mut db, "SELECT e <=> '[0, 1, 0]' FROM d WHERE id = 2");
+        assert!(
+            (orth - 1.0).abs() < 1e-9,
+            "cosine of orthogonal vectors was {orth}"
+        );
+    }
+
+    #[test]
+    fn knn_orders_by_distance() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE docs (id INT, e VECTOR(2))")
+            .unwrap();
+        db.execute(
+            "INSERT INTO docs VALUES (1, '[0, 0]'), (2, '[1, 1]'), (3, '[3, 4]'), (4, '[10, 10]')",
+        )
+        .unwrap();
+        // Nearest two to the origin are ids 1 (dist 0) then 2 (dist sqrt 2).
+        let (_, rows) = query(
+            &mut db,
+            "SELECT id FROM docs ORDER BY e <-> '[0, 0]' LIMIT 2",
+        );
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // A distance threshold in WHERE binds tighter than the comparison, so
+        // `e <-> q < 6` reads as `(e <-> q) < 6` and keeps ids 1, 2, 3 (their
+        // distances 0, sqrt 2, and 5 are all under 6; id 4 at ~14.1 is out).
+        let (_, rows) = query(
+            &mut db,
+            "SELECT id FROM docs WHERE e <-> '[0, 0]' < 6 ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_distance_dimension_mismatch_errors() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE d (id INT, e VECTOR(3))").unwrap();
+        db.execute("INSERT INTO d VALUES (1, '[1, 2, 3]')").unwrap();
+        assert!(db.execute("SELECT e <-> '[1, 2]' FROM d").is_err());
+    }
+
     fn names(cols: &[String]) -> Vec<&str> {
         cols.iter().map(String::as_str).collect()
     }

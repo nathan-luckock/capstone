@@ -714,6 +714,12 @@ const fn infix_binding_power(kind: &TokenKind) -> Option<(BinOp, u8, u8)> {
         // `(j -> 'a') + 1`. Left-associative, so accesses chain.
         TokenKind::Arrow => (BinOp::JsonGet, 11),
         TokenKind::ArrowText => (BinOp::JsonGetText, 11),
+        // Vector distance binds tighter than comparison so
+        // `embedding <-> :q < 0.5` is `(embedding <-> :q) < 0.5`, the natural
+        // "within this distance" reading, and is usable directly in `ORDER BY`.
+        TokenKind::VecL2 => (BinOp::VecL2, 7),
+        TokenKind::VecCosine => (BinOp::VecCosine, 7),
+        TokenKind::VecInner => (BinOp::VecInner, 7),
         _ => return None,
     };
     Some((op, l_bp, l_bp + 1))
@@ -759,6 +765,18 @@ mod tests {
             parse("VECTOR '[1.5, -2, 0]'"),
             Expr::Literal(Value::Vector(vec![1.5, -2.0, 0.0]))
         );
+    }
+
+    #[test]
+    fn vector_distance_operators_parse_and_bind() {
+        // All three operators lex and render.
+        assert_eq!(shape("a <-> b"), "(a <-> b)");
+        assert_eq!(shape("a <=> b"), "(a <=> b)");
+        assert_eq!(shape("a <#> b"), "(a <#> b)");
+        // Distance binds tighter than comparison: `a <-> b < c` is `(a <-> b) < c`.
+        assert_eq!(shape("a <-> b < c"), "((a <-> b) < c)");
+        // `<=>` is the cosine operator, distinct from `<=` followed by `>`.
+        assert_eq!(shape("a <= b"), "(a <= b)");
     }
 
     #[test]
