@@ -144,6 +144,46 @@ index (four metrics, insert/search/delete, durable), and the `vecsim` simulator
 that proves durability and isolation of the memory layer together under crash.
 Durability is verified at 100,000 deterministic crash simulations.
 
+### Sprint 14 - Reliability for unreachable hardware
+
+The HNSW index reachable from SQL through a cached, write-invalidated, RLS-safe
+path (about 150x on a warm query, and structurally unable to widen what a tenant
+sees); end-to-end corruption detection, where every page and serialized index
+carries a CRC32 refused on read; a self-healing redundant index; the metamorphic
+oracle for approximate search; the `vecert` certificate; and the orbital radiation
+fault model injected into the live simulator, irradiating a committed multi-tenant
+workload at a named orbit's single-event-upset rate and proving it is never served
+silently corrupted.
+
+### Sprint 15 - Mass-efficient self-healing
+
+A from-scratch Reed-Solomon erasure code over GF(2^8), a self-healing block store
+(detect, log, repair, heal), and whole-footprint radiation across the heap, WAL,
+and the now-checksummed metadata sidecars. The live heap reconstructs its corrupt
+pages from parity on `open_resilient`, at `m/k` overhead instead of the `+m*100%`
+of redundant copies.
+
+### Sprint 16 - Operability, backup, and replication
+
+The `PROTECT` statement, a durable fault log surfaced as `pg_fault_log`, and the
+`pjscrub` cron scrubber that heals and refreshes parity on a cadence. Snapshot
+backup (`Database::backup`, `pjbackup`) writes a consistent copy, healing first,
+and a physical standby replica streams the WAL and stays caught up.
+
+### Sprint 17 - Model-checking the core invariants
+
+From-scratch bounded model checkers for the write-ahead-logging ordering invariant
+(`walmodel`, the `wal` model) and the MVCC snapshot read-stability invariant (the
+`txn` model). Each enumerates every reachable interleaving of an abstract machine,
+and each ships a deliberately buggy variant that yields a concrete counterexample,
+so the proofs are not vacuous. Both are certified in `vecert`.
+
+### Sprint 18 - Log-streamed point-in-time recovery (planned)
+
+WAL-logging the catalog metadata so forward replay reconstructs later schema
+changes, not just the base state. This is the last piece of the recovery story and
+the one honest gap that remains.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a
@@ -160,14 +200,20 @@ cannot be physically serviced (orbital and edge data centers).
    a metamorphic oracle and the `vecert` certificate make the proof concrete; and
    the live simulator irradiates a committed workload at an orbit's upset rate and
    proves it is never served silently corrupted.
-4. Next: the radiation model now corrupts every persistent file (heap, WAL, and
-   the checksummed metadata sidecars), so what remains is replication and
-   point-in-time recovery, and model-checking the recovery and isolation
-   invariants; then the deployment story for unreachable infrastructure.
+4. Mass-efficient self-healing, operability, recovery, and proof are built
+   (sprints 15-17): Reed-Solomon erasure coding heals corrupt pages from parity on
+   open; `PROTECT`, `pg_fault_log`, and `pjscrub` operate it; backup, point-in-time
+   restore, and a physical standby replica round out recovery; and the core WAL and
+   isolation invariants are model-checked exhaustively, not just sampled.
+5. The one honest gap that remains is WAL-logging the catalog metadata so
+   point-in-time recovery is fully log-streamed (sprint 18), reconstructing later
+   schema changes rather than the base state.
 
 ## Out of scope
 
-- Distributed replication and point-in-time recovery (candidate future work,
-  built on the existing WAL).
-- TLS on the wire (SCRAM authentication is in; transport encryption is the next
-  hardening step before exposing the server publicly).
+- Fully log-streamed point-in-time recovery across schema changes, which needs the
+  catalog metadata in the WAL (sprint 18, the one tracked gap above).
+- Multi-node distributed operation beyond a single physical standby: consensus,
+  sharding, and partition reconciliation are company-scale work, not capstone work.
+- Hardware-in-the-loop and radiation-beam testing: the fault model is simulated and
+  parameterized by published upset rates, not measured on a flight part.

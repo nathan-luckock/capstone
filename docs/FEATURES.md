@@ -18,10 +18,12 @@ durable, isolated memory layer for AI in unreachable environments, see
 This page is the *shipped* surface. The AI memory layer is built on it: a native
 `VECTOR(n)` type, the four distance operators and their function forms,
 brute-force nearest-neighbor search, row-level-security-filtered similarity
-(isolation enforced by the engine, not application code), an HNSW index, and a
-fault simulator (`vecsim`) that proves durability and isolation together under
-simulated crash. The one remaining step is wiring the HNSW index into the planner
-so nearest-neighbor queries use it automatically.
+(isolation enforced by the engine, not application code), an HNSW index wired
+into the planner so a nearest-neighbor query is served from a cached, RLS-safe
+index automatically, and a fault simulator (`vecsim`) that proves durability and
+isolation together under simulated crash. The corruption story is built on top:
+checksums refuse a flipped bit, Reed-Solomon parity heals a corrupt page on open,
+the core invariants are model-checked, and `vecert` regenerates the whole proof.
 
 ## SQL
 

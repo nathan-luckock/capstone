@@ -58,13 +58,15 @@ So vector search and row-level isolation are treated here as table stakes the
 engine must have; the differentiator, and the thing the roadmap drives toward, is
 the *proof* that the AI memory survives an environment no one can reach.
 
-The memory layer is now under construction on top of the proven engine. A native
-`VECTOR(n)` type ships today (durable `f32` embedding storage, width-enforced on
-write; see [The vector memory layer](#the-vector-memory-layer)). The remaining
-steps are distance operators and nearest-neighbor search, then folding row-level
-security into similarity queries so the engine itself guarantees one tenant can
-never read another's memory, then extending the deterministic simulator to prove
-that isolation and durability hold together under fault.
+The memory layer is built on top of the proven engine and is complete (see
+[The vector memory layer](#the-vector-memory-layer)). A native `VECTOR(n)` type
+stores `f32` embeddings durably, width-enforced on write; the four distance
+operators and an HNSW index serve nearest-neighbor search; row-level security is
+folded into similarity queries so the engine itself guarantees one tenant can
+never read another's memory; and the deterministic simulator proves isolation and
+durability hold together under fault, now extended with a space radiation model,
+self-healing erasure coding, and model-checked core invariants, all regenerated
+into the `vecert` certificate.
 
 ## Goals
 
