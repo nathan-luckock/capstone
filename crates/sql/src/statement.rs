@@ -719,6 +719,12 @@ pub enum Statement {
         /// The role to assume, or `None` for `NONE` / `RESET`.
         name: Option<String>,
     },
+    /// `SET vector_index = on|off`: toggle the HNSW index path for nearest-neighbor
+    /// queries for this session.
+    SetVectorIndex {
+        /// Whether to enable the index path.
+        on: bool,
+    },
     /// `CREATE POLICY name ON table [FOR cmd] [TO roles] [USING (expr)]
     /// [WITH CHECK (expr)]`: a row-level security policy.
     CreatePolicy {
@@ -1225,6 +1231,9 @@ impl fmt::Display for Statement {
                 Some(name) => write!(f, "SET ROLE {name}"),
                 None => f.write_str("SET ROLE NONE"),
             },
+            Self::SetVectorIndex { on } => {
+                write!(f, "SET vector_index = {}", if *on { "on" } else { "off" })
+            }
             Self::CreatePolicy {
                 name,
                 table,
@@ -1354,12 +1363,16 @@ impl Parser {
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke()?,
             TokenKind::Keyword(Keyword::Set) => {
                 self.advance();
-                // Only `SET ROLE` is recognised as a statement; other `SET`s are
-                // out of scope.
-                if !self.eat_ident_kw("role") {
-                    return Err(SqlError::parse("expected ROLE after SET", self.span()));
+                if self.eat_ident_kw("role") {
+                    self.parse_set_role_tail()?
+                } else if self.eat_ident_kw("vector_index") {
+                    self.parse_set_vector_index_tail()?
+                } else {
+                    return Err(SqlError::parse(
+                        "expected ROLE or vector_index after SET",
+                        self.span(),
+                    ));
                 }
-                self.parse_set_role_tail()?
             }
             TokenKind::Keyword(Keyword::Reset) => {
                 self.advance();
@@ -2280,6 +2293,26 @@ impl Parser {
         Ok(Statement::SetRole {
             name: Some(self.parse_ident()?),
         })
+    }
+
+    /// `SET vector_index = on|off` (the `SET vector_index` is already consumed).
+    /// Both `=` and `TO` are accepted between the name and the value.
+    fn parse_set_vector_index_tail(&mut self) -> Result<Statement> {
+        if !self.eat_ident_kw("to") {
+            self.expect(&TokenKind::Eq)?;
+        }
+        // `on` is a reserved keyword (it appears in JOIN ... ON); `off` is not.
+        let on = if self.eat_keyword(Keyword::On) {
+            true
+        } else if self.eat_ident_kw("off") {
+            false
+        } else {
+            return Err(SqlError::parse(
+                "expected on or off for SET vector_index",
+                self.span(),
+            ));
+        };
+        Ok(Statement::SetVectorIndex { on })
     }
 
     /// `GRANT <privileges> ON [TABLE] table TO grantees [WITH GRANT OPTION]`, or
