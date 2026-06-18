@@ -45,7 +45,7 @@ use std::rc::Rc;
 
 use crate::error::{Result, StorageError};
 use crate::file::Disk;
-use crate::header::PageHeader;
+use crate::header::{recompute_checksum, verify_checksum, PageHeader};
 use crate::page::{Page, PageId, PAGE_SIZE};
 
 /// Hook the buffer pool calls before flushing any dirty page, to enforce
@@ -347,6 +347,7 @@ impl BufferPool {
             let mut inner = self.frames[idx].inner.borrow_mut();
             if inner.dirty {
                 self.enforce_wal_ordering(&inner.page)?;
+                recompute_checksum(&mut inner.page);
                 self.file.borrow_mut().write_page(id, &inner.page)?;
                 inner.dirty = false;
             }
@@ -362,6 +363,7 @@ impl BufferPool {
             if inner.dirty {
                 if let Some(id) = inner.page_id {
                     self.enforce_wal_ordering(&inner.page)?;
+                    recompute_checksum(&mut inner.page);
                     self.file.borrow_mut().write_page(id, &inner.page)?;
                     inner.dirty = false;
                 }
@@ -389,6 +391,13 @@ impl BufferPool {
             let mut inner = frame.inner.borrow_mut();
             self.evict_inner(&mut inner)?;
             self.file.borrow_mut().read_page(id, &mut inner.page)?;
+            // A never-written page is all zeros (a freshly extended file); treat
+            // it as uninitialized. Any initialized page that fails its checksum is
+            // refused here, so a corrupted page (a radiation bit flip, silent data
+            // corruption) is never served to the engine as if it were intact.
+            if inner.page.iter().any(|&b| b != 0) && !verify_checksum(&inner.page) {
+                return Err(StorageError::Checksum { page: id.0 });
+            }
             inner.page_id = Some(id);
             inner.dirty = false;
             frame.reset_history();
@@ -426,6 +435,7 @@ impl BufferPool {
         if let Some(old_id) = inner.page_id.take() {
             if inner.dirty {
                 self.enforce_wal_ordering(&inner.page)?;
+                recompute_checksum(&mut inner.page);
                 self.file.borrow_mut().write_page(old_id, &inner.page)?;
                 inner.dirty = false;
             }
@@ -782,5 +792,47 @@ mod tests {
         let pool = BufferPool::new(file, 4);
         let g = pool.fetch_page(id).expect("re-fetch after reopen");
         assert_eq!(g.page()[200], 0xDE);
+    }
+
+    #[test]
+    fn a_corrupted_page_is_detected_on_read() {
+        // Flip a bit in a page on disk; the next read must refuse it (the
+        // checksum catches the corruption) rather than serve a wrong page.
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corrupt.db");
+        let id;
+        {
+            let file = FileManager::open(&path).expect("open");
+            let pool = BufferPool::new(file, 4);
+            let (new_id, mut g) = pool.new_page().expect("new");
+            g.page_mut()[200] = 0xDE;
+            id = new_id;
+            drop(g);
+            pool.flush_all().expect("flush");
+        }
+        // Corrupt one byte inside the page's checksummed region on disk.
+        let offset = u64::try_from(PAGE_SIZE).unwrap() * id.0 + 200;
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open file");
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&byte).unwrap();
+        drop(f);
+
+        let file = FileManager::open(&path).expect("reopen");
+        let pool = BufferPool::new(file, 4);
+        let err = pool
+            .fetch_page(id)
+            .expect_err("a corrupted page must be refused, not served");
+        assert!(matches!(err, StorageError::Checksum { .. }), "got {err:?}");
     }
 }

@@ -8,6 +8,16 @@ pub enum StorageError {
     #[error("storage io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A page read back from disk failed its CRC32 check: the stored bytes do
+    /// not match their checksum, so the page is corrupt (a bit flip, silent data
+    /// corruption, a torn write). The page is refused rather than served, so a
+    /// silently corrupted page never reaches the engine.
+    #[error("page {page} failed its checksum (corrupt on disk)")]
+    Checksum {
+        /// The page ID whose checksum did not match.
+        page: u64,
+    },
+
     /// A page ID was requested that is beyond the current end of the file.
     /// Returned by [`FileManager::read_page`] / [`FileManager::write_page`]
     /// when the caller asks for a page that has not been allocated.
