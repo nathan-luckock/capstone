@@ -35,6 +35,7 @@ pub mod file;
 pub mod header;
 pub mod heap;
 pub mod page;
+pub mod varbtree;
 
 pub use btree::{
     BTree, InternalPage, LeafPage, RangeScan, TupleRef, INTERNAL_ENTRY_SIZE, LEAF_ENTRY_SIZE,
@@ -49,3 +50,4 @@ pub use header::{
 };
 pub use heap::{HeapPage, SlotId, MAX_TUPLE_SIZE, SLOT_SIZE, SLOT_SIZE_U16};
 pub use page::{Page, PageId, PAGE_SIZE, PAGE_SIZE_U16};
+pub use varbtree::{VarBTree, VarRangeScan, MAX_VAR_KEY};
