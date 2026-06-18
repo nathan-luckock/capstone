@@ -61,10 +61,12 @@ pub fn encode_field(value: &Value, out: &mut Vec<u8>) -> bool {
             encode_text(s, out);
             true
         }
-        // FLOAT, DECIMAL, and JSON are not keyed by this index (FLOAT has NaN;
-        // DECIMAL is not bijective into bytes across scales). A column of these
-        // types simply falls back to a sequential scan, which is still correct.
-        Value::Float(_) | Value::Decimal(..) | Value::Json(_) => false,
+        // FLOAT, DECIMAL, JSON, and VECTOR are not keyed by this index (FLOAT
+        // has NaN; DECIMAL is not bijective into bytes across scales; a VECTOR
+        // has no meaningful total order and is searched by distance, not range).
+        // A column of these types simply falls back to a sequential scan, which
+        // is still correct.
+        Value::Float(_) | Value::Decimal(..) | Value::Json(_) | Value::Vector(_) => false,
     }
 }
 

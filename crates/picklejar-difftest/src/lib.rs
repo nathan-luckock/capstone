@@ -407,6 +407,9 @@ fn canon_picklejar(v: &Value) -> String {
         Value::Float(x) => canon_float(*x),
         // No DECIMAL columns are generated; canonicalize as a float for safety.
         Value::Decimal(m, s) => canon_float(picklejar::decimal::to_f64(*m, *s)),
+        // SQLite has no vector type, so the generator never emits one; this arm
+        // exists only for exhaustiveness.
+        Value::Vector(vec) => format!("v{}", picklejar::ast::format_vector(vec)),
     }
 }
 

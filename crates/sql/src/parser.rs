@@ -595,6 +595,22 @@ impl Parser {
                 }
                 return Ok(DataType::Decimal);
             }
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("vector") || s.eq_ignore_ascii_case("embedding") =>
+            {
+                self.advance();
+                // An optional `(dimension)`: the embedding width. A value's own
+                // length is validated against it on write.
+                let mut dim = 0u32;
+                if self.eat(&TokenKind::LParen) {
+                    if let TokenKind::Int(n) = self.peek().clone() {
+                        self.advance();
+                        dim = u32::try_from(n).unwrap_or(0);
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                }
+                return Ok(DataType::Vector(dim));
+            }
             other => {
                 return Err(SqlError::parse(
                     format!(
@@ -628,6 +644,13 @@ impl Parser {
                 SqlError::parse(format!("invalid DECIMAL literal '{text}'"), self.span())
             })?;
             return Ok(Some(Expr::Literal(Value::Decimal(m, s))));
+        }
+        if name.eq_ignore_ascii_case("vector") {
+            let text = self.parse_string()?;
+            let v = crate::ast::parse_vector(&text).ok_or_else(|| {
+                SqlError::parse(format!("invalid VECTOR literal '{text}'"), self.span())
+            })?;
+            return Ok(Some(Expr::Literal(Value::Vector(v))));
         }
         Ok(None)
     }
@@ -725,6 +748,17 @@ mod tests {
         assert_eq!(shape("col"), "col");
         assert_eq!(shape("t.col"), "t.col");
         assert_eq!(shape("*"), "*");
+    }
+
+    #[test]
+    fn vector_literal_parses_and_renders() {
+        // A typed VECTOR literal carries its components and renders in the
+        // bracketed pgvector form (whitespace normalized away).
+        assert_eq!(shape("VECTOR '[1, 2, 3]'"), "VECTOR '[1,2,3]'");
+        assert_eq!(
+            parse("VECTOR '[1.5, -2, 0]'"),
+            Expr::Literal(Value::Vector(vec![1.5, -2.0, 0.0]))
+        );
     }
 
     #[test]

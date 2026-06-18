@@ -236,20 +236,23 @@ pub enum DataType {
     Json,
     /// An exact decimal / numeric (free scale).
     Decimal,
+    /// A dense embedding vector of the given dimension (the AI memory type).
+    Vector(u32),
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Int => "INT",
-            Self::Float => "FLOAT",
-            Self::Bool => "BOOL",
-            Self::Text => "TEXT",
-            Self::Date => "DATE",
-            Self::Timestamp => "TIMESTAMP",
-            Self::Json => "JSON",
-            Self::Decimal => "DECIMAL",
-        })
+        match self {
+            Self::Int => f.write_str("INT"),
+            Self::Float => f.write_str("FLOAT"),
+            Self::Bool => f.write_str("BOOL"),
+            Self::Text => f.write_str("TEXT"),
+            Self::Date => f.write_str("DATE"),
+            Self::Timestamp => f.write_str("TIMESTAMP"),
+            Self::Json => f.write_str("JSON"),
+            Self::Decimal => f.write_str("DECIMAL"),
+            Self::Vector(n) => write!(f, "VECTOR({n})"),
+        }
     }
 }
 
@@ -3246,6 +3249,22 @@ mod tests {
     #[test]
     fn float_and_bool_column_types_parse() {
         for ty in ["FLOAT", "REAL", "DOUBLE", "BOOL", "BOOLEAN"] {
+            let mut p = Parser::from_sql(&format!("CREATE TABLE t (a {ty})")).expect("lex");
+            assert!(
+                p.parse_statement().is_ok(),
+                "type {ty} should parse as a column type"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_column_type_parses_and_round_trips() {
+        // A dimensioned VECTOR column renders its declared width back out.
+        let printed = parse("CREATE TABLE docs (id INT, e VECTOR(384))").to_string();
+        assert_eq!(printed, "CREATE TABLE docs (id INT, e VECTOR(384))");
+        // `EMBEDDING` is an accepted spelling and a bare, dimensionless form
+        // normalizes to VECTOR(0) (width-agnostic).
+        for ty in ["VECTOR", "VECTOR(3)", "EMBEDDING", "EMBEDDING(128)"] {
             let mut p = Parser::from_sql(&format!("CREATE TABLE t (a {ty})")).expect("lex");
             assert!(
                 p.parse_statement().is_ok(),
