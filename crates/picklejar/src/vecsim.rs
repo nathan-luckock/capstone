@@ -112,25 +112,33 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
         &mut db,
         &format!("CREATE TABLE memories (id INT, tenant TEXT, e VECTOR({dim}))"),
     )?;
-    exec(&mut db, "GRANT SELECT ON memories TO PUBLIC")?;
+    exec(
+        &mut db,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON memories TO PUBLIC",
+    )?;
     for t in 0..tenants {
         exec(&mut db, &format!("CREATE ROLE t{t} LOGIN"))?;
     }
+    // USING fences reads and the affected scope of writes; WITH CHECK fences the
+    // values written, so a tenant can neither see nor create another's rows.
     exec(
         &mut db,
-        "CREATE POLICY tenant ON memories USING ((tenant = current_user()))",
+        "CREATE POLICY tenant ON memories \
+         USING ((tenant = current_user())) WITH CHECK ((tenant = current_user()))",
     )?;
     exec(&mut db, "ALTER TABLE memories ENABLE ROW LEVEL SECURITY")?;
 
-    // Workload: a mix of inserts, updates, and deletes across tenants, a fifth of
-    // them rolled back. The workload runs as the bootstrap superuser, so it can
-    // touch any tenant's rows; the isolation check happens later, per tenant.
+    // Workload: a mix of inserts, updates, and deletes, a fifth of them rolled
+    // back. Each operation runs AS the owning tenant, so every write passes
+    // through the RLS fence exactly as a real tenant's would; the post-crash
+    // checks then confirm both durability and that the fence held.
     let mut live: Oracle = vec![BTreeMap::new(); tenants];
     let mut committed = 0usize;
     let mut rolled_back = 0usize;
 
     for i in 0..ops {
         let t = usize::try_from(rng.below(tenants as u64)).expect("small");
+        db.set_session_user(&format!("t{t}"));
         let (stmt, effect) = build_op(&mut rng, t, i, dim, &live[t]);
         if rng.below(5) == 0 {
             // A rolled-back transaction: its change must leave no trace.
