@@ -124,6 +124,7 @@ The complete feature list is in [docs/FEATURES.md](docs/FEATURES.md).
 Correctness is not asserted, it is tested several independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
 
 - **Deterministic simulation testing.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. **100,000 seeded crash-and-recover runs pass** (4.1M committed rows verified), and the harness found and fixed a real recovery bug.
+- **Exhaustive model checking.** Where the crash sims sample random interleavings, a from-scratch bounded model checker (`walmodel`) enumerates *every* reachable interleaving of an abstract log-and-page model and proves the write-ahead-logging ordering invariant (a page change is never durable ahead of its log record) holds in all of them, with a deliberately buggy variant confirming the check has teeth. Random testing finds bugs; this proves their absence over the bounded model.
 - **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
 - **Vector durability and isolation simulation (`vecsim`).** The same seeded, replayable model applied to the memory layer: a multi-tenant embedding workload writing through the RLS fence, a crash, then a check that every committed embedding survives intact and each tenant sees only its own after recovery, on reads and on nearest-neighbor ranking.
 - **A metamorphic oracle for approximate search.** Relations that must always hold (self-retrieval, monotonic insertion, deletion consistency, recall monotonicity) test correctness without a ground-truth answer, the accepted answer to the oracle problem for approximate search.
@@ -134,6 +135,7 @@ Correctness is not asserted, it is tested several independent ways, all under `c
 ```bash
 cargo run --release --bin dst -- 100000              # 100k reproducible crash scenarios
 cargo run --release --bin difftest -- 100000         # 100k queries checked against SQLite
+cargo run --release --bin walmodel                   # exhaustively model-check the WAL ordering invariant
 cargo run --release --bin vecsim -- 100000           # 100k durability + isolation sims
 cargo run --release --bin vecsim -- --irradiate 10000 365 geo   # irradiate a year in GEO
 cargo run --release --bin vecbench                   # HNSW vs brute-force speedup and recall
