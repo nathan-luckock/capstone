@@ -155,6 +155,56 @@ fn protect_statement_writes_parity_and_heals() {
 }
 
 #[test]
+fn pg_fault_log_records_and_persists_repairs() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("log.db");
+    {
+        let mut db = Database::open(&path).expect("open");
+        db.execute("CREATE TABLE m (id INT, e VECTOR(2))").unwrap();
+        for i in 1..=1500i64 {
+            db.execute(&format!("INSERT INTO m VALUES ({i}, '[{i}, {i}]')"))
+                .unwrap();
+        }
+        db.protect(6, 3).expect("protect");
+    }
+
+    // A clean resilient open logs nothing.
+    {
+        let mut db = Database::open_resilient(&path).expect("resilient open");
+        assert!(
+            rows(&mut db, "SELECT * FROM pg_fault_log").is_empty(),
+            "no faults before any corruption"
+        );
+    }
+
+    // Corrupt one page per stripe, then heal on open: each repair is logged.
+    let pages = std::fs::metadata(&path).expect("meta").len() / PAGE;
+    let mut seed = 0x1357u64;
+    let mut s = 0u64;
+    while s * 6 + 1 < pages {
+        corrupt_page(&path, s * 6 + 1, &mut seed);
+        s += 1;
+    }
+    let logged = {
+        let mut db = Database::open_resilient(&path).expect("resilient open");
+        let log = rows(&mut db, "SELECT kind FROM pg_fault_log");
+        assert!(!log.is_empty(), "repairs should be logged");
+        for row in &log {
+            assert_eq!(row[0], Value::Text("repaired".to_string()));
+        }
+        log.len()
+    };
+
+    // The fault log is durable: a plain reopen still sees it.
+    let mut db = Database::open(&path).expect("reopen");
+    let log = rows(
+        &mut db,
+        "SELECT seq, page, kind FROM pg_fault_log ORDER BY seq",
+    );
+    assert_eq!(log.len(), logged, "fault log survives reopen");
+}
+
+#[test]
 fn protect_requires_a_superuser() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("perm.db");

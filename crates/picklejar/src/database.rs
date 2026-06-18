@@ -239,6 +239,11 @@ pub struct Database {
     /// Sidecar file holding the Reed-Solomon parity that [`Self::protect`] writes
     /// and [`Self::open_resilient`] heals corrupt heap pages from.
     parity_path: PathBuf,
+    /// Sidecar file recording the durable fault log (corrupt pages detected and
+    /// repaired on `open_resilient`), surfaced through `pg_fault_log`.
+    faultlog_path: PathBuf,
+    /// The in-memory fault log, loaded at open and appended to on each heal.
+    fault_log: Vec<FaultLogEntry>,
     /// When on, a `SELECT ... ORDER BY col <op> :q LIMIT k` over a vector column
     /// (with no WHERE, join, or grouping, and where row-level security does not
     /// apply) is served from an HNSW index instead of an exact scan. Off by
@@ -252,6 +257,21 @@ pub struct Database {
     /// reuse an index it was itself permitted to build, never one another role
     /// built; keying by metric means an L2 index is never reused for a cosine query.
     vector_index_cache: HashMap<(String, String, String, Metric), CachedVectorIndex>,
+}
+
+/// One entry in the durable fault log: a heap page the self-healing layer found
+/// corrupt and either repaired from parity or could not recover. Surfaced through
+/// the `pg_fault_log` system view so an operator (or the AI itself) can see what
+/// storage is degrading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FaultLogEntry {
+    /// Monotonic sequence number, in detection order.
+    seq: u64,
+    /// The heap page id the fault was found at.
+    page: u64,
+    /// `repaired` (reconstructed from parity) or `unrecoverable` (lost, and kept
+    /// detectably corrupt rather than served wrong).
+    kind: String,
 }
 
 /// A summary of a [`Database::protect`] call: what the parity snapshot covered.
@@ -400,6 +420,7 @@ impl Database {
         let pol_path = base.with_extension("pol");
         let midx_path = base.with_extension("midx");
         let parity_path = base.with_extension("parity");
+        let faultlog_path = base.with_extension("faultlog");
         let db_path = base.to_path_buf();
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
@@ -429,6 +450,8 @@ impl Database {
             midx_path,
             db_path,
             parity_path,
+            faultlog_path,
+            fault_log: Vec::new(),
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
         };
@@ -447,6 +470,10 @@ impl Database {
         // session stays visible (its xids would otherwise read as aborted).
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
         db.mgr.recover(next_xid, &aborted);
+        db.fault_log = persist::load_fault_log(&db.faultlog_path)?
+            .into_iter()
+            .map(|(seq, page, kind)| FaultLogEntry { seq, page, kind })
+            .collect();
         Ok(db)
     }
 
@@ -466,10 +493,52 @@ impl Database {
     pub fn open_resilient(base: impl AsRef<Path>) -> Result<Self> {
         let base = base.as_ref();
         let parity_path = base.with_extension("parity");
-        if parity_path.exists() {
-            picklejar_storage::resilience::heal_file(base, &parity_path)?;
+        let healed = if parity_path.exists() {
+            Some(picklejar_storage::resilience::heal_file(
+                base,
+                &parity_path,
+            )?)
+        } else {
+            None
+        };
+        let mut db = Self::open(base)?;
+        if let Some(report) = healed {
+            db.record_heal(&report)?;
         }
-        Self::open(base)
+        Ok(db)
+    }
+
+    /// Append a heal pass's detected faults to the durable fault log (repaired
+    /// pages, then unrecoverable stripes), and persist it. Nothing is written when
+    /// the pass found nothing.
+    fn record_heal(&mut self, report: &picklejar_storage::resilience::HealReport) -> Result<()> {
+        if report.repaired_pages.is_empty() && report.unrecoverable_stripes.is_empty() {
+            return Ok(());
+        }
+        let mut seq = self.fault_log.last().map_or(0, |e| e.seq + 1);
+        for &page in &report.repaired_pages {
+            self.fault_log.push(FaultLogEntry {
+                seq,
+                page,
+                kind: "repaired".to_string(),
+            });
+            seq += 1;
+        }
+        for &page in &report.unrecoverable_stripes {
+            self.fault_log.push(FaultLogEntry {
+                seq,
+                page,
+                kind: "unrecoverable".to_string(),
+            });
+            seq += 1;
+        }
+        let entries: Vec<(u64, u64, String)> = self
+            .fault_log
+            .iter()
+            .map(|e| (e.seq, e.page, e.kind.clone()))
+            .collect();
+        persist::save_fault_log(&self.faultlog_path, &entries)?;
+        Ok(())
     }
 
     /// Write a Reed-Solomon parity snapshot of the current committed heap to the
@@ -2409,6 +2478,7 @@ impl Database {
             catalog: &self.catalog,
             tables: &self.tables,
             txn: &txn,
+            fault_log: &self.fault_log,
         };
         // (table, row count, [(column, stats)]) computed before any catalog write.
         let mut computed: Vec<(String, u64, ColumnStatList)> = Vec::new();
@@ -2585,6 +2655,7 @@ impl Database {
             catalog: &self.catalog,
             tables: &self.tables,
             txn,
+            fault_log: &self.fault_log,
         };
         let relation = source.scan(table)?;
         let mut out = String::new();
@@ -3994,6 +4065,7 @@ impl Database {
             catalog: &self.catalog,
             tables: &self.tables,
             txn,
+            fault_log: &self.fault_log,
         };
         // Start from a snapshot of every base table plus a scratch catalog we
         // can extend with each CTE's schema.
@@ -4119,6 +4191,7 @@ impl Database {
             catalog: &self.catalog,
             tables: &self.tables,
             txn,
+            fault_log: &self.fault_log,
         };
         // A correlated subquery survives folding as a node in the plan. When one
         // is present, build a per-row runner over a consistent snapshot of the
@@ -4693,6 +4766,8 @@ struct EngineSource<'a> {
     catalog: &'a Catalog,
     tables: &'a HashMap<String, TableStore>,
     txn: &'a Transaction,
+    /// The durable fault log, for the `pg_fault_log` system view.
+    fault_log: &'a [FaultLogEntry],
 }
 
 impl EngineSource<'_> {
@@ -4729,6 +4804,15 @@ impl EngineSource<'_> {
                             Value::Text(if col.not_null { "NO" } else { "YES" }.to_string()),
                         ]);
                     }
+                }
+            }
+            "pg_fault_log" => {
+                for entry in self.fault_log {
+                    rows.push(vec![
+                        Value::Int(i64::try_from(entry.seq).unwrap_or(i64::MAX)),
+                        Value::Int(i64::try_from(entry.page).unwrap_or(i64::MAX)),
+                        Value::Text(entry.kind.clone()),
+                    ]);
                 }
             }
             _ => {}
@@ -5661,8 +5745,13 @@ fn stat_key(value: &Value) -> Vec<u8> {
     b
 }
 
-/// The `information_schema` views the engine exposes for introspection.
-const SYSTEM_TABLES: [&str; 2] = ["information_schema.tables", "information_schema.columns"];
+/// The `information_schema` views the engine exposes for introspection, plus the
+/// `pg_fault_log` view over the self-healing layer's detected faults.
+const SYSTEM_TABLES: [&str; 3] = [
+    "information_schema.tables",
+    "information_schema.columns",
+    "pg_fault_log",
+];
 
 /// The fixed schema of a system view, or `None` if `name` is not one. Used both
 /// to register the view in the catalog and to build its rows on scan.
@@ -5678,6 +5767,11 @@ fn system_table_schema(name: &str) -> Option<Vec<(&'static str, DataType)>> {
             ("ordinal_position", DataType::Int),
             ("data_type", DataType::Text),
             ("is_nullable", DataType::Text),
+        ]),
+        "pg_fault_log" => Some(vec![
+            ("seq", DataType::Int),
+            ("page", DataType::Int),
+            ("kind", DataType::Text),
         ]),
         _ => None,
     }

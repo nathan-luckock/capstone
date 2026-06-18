@@ -47,7 +47,7 @@ const HEADER_LEN: usize = HEADER_BODY + 4;
 const SHARD_FRAME: usize = 4 + PAGE_SIZE;
 
 /// What a heal pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HealReport {
     /// Heap pages whose checksum was verified.
     pub pages_checked: u64,
@@ -56,6 +56,10 @@ pub struct HealReport {
     /// Stripes with more bad shards than parity, left as they were (the data is
     /// genuinely lost, and stays detectably corrupt rather than silently wrong).
     pub stripes_unrecoverable: u64,
+    /// The id of each page that was repaired, for the fault log.
+    pub repaired_pages: Vec<u64>,
+    /// The first page id of each stripe that could not be recovered.
+    pub unrecoverable_stripes: Vec<u64>,
 }
 
 /// An `InvalidData` error describing a corrupt or unreadable parity sidecar.
@@ -197,6 +201,7 @@ pub fn heal_file(heap_path: &Path, parity_path: &Path) -> io::Result<HealReport>
         }
         if bad > m || rs.reconstruct(&mut shards, &present).is_err() {
             report.stripes_unrecoverable += 1;
+            report.unrecoverable_stripes.push(s as u64 * k as u64);
             continue;
         }
         // Write back the data pages that were corrupt and are real and in range.
@@ -209,6 +214,7 @@ pub fn heal_file(heap_path: &Path, parity_path: &Path) -> io::Result<HealReport>
                     fm.write_page(PageId::new(id as u64), &page)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     report.pages_repaired += 1;
+                    report.repaired_pages.push(id as u64);
                 }
             }
         }

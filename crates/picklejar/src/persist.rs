@@ -753,6 +753,45 @@ pub fn load_multi_indexes(path: &Path) -> io::Result<Vec<MultiIndexRecord>> {
     Ok(out)
 }
 
+/// Persist the fault log as `seq page kind` lines, integrity-checked like the
+/// other sidecars. `kind` is a single whitespace-free token.
+///
+/// # Errors
+///
+/// Returns an I/O error if the sidecar cannot be written.
+pub fn save_fault_log(path: &Path, entries: &[(u64, u64, String)]) -> io::Result<()> {
+    let mut out = String::new();
+    for (seq, page, kind) in entries {
+        let _ = writeln!(out, "{seq} {page} {kind}");
+    }
+    write_checked(path, &out)
+}
+
+/// Read the fault log written by [`save_fault_log`]. An absent file is an empty
+/// log; a present file with a bad checksum is an error.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file is present but cannot be read or fails its
+/// checksum.
+pub fn load_fault_log(path: &Path) -> io::Result<Vec<(u64, u64, String)>> {
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut toks = line.split_whitespace();
+        let (Some(seq), Some(page), Some(kind)) = (toks.next(), toks.next(), toks.next()) else {
+            continue;
+        };
+        let (Ok(seq), Ok(page)) = (parse_u64(seq), parse_u64(page)) else {
+            continue;
+        };
+        out.push((seq, page, kind.to_string()));
+    }
+    Ok(out)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }
