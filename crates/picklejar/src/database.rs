@@ -36,6 +36,7 @@ use picklejar_planner::{bind, explain, plan, Catalog, ColumnStats};
 
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
+use crate::hnsw::{Hnsw, Metric};
 use picklejar_sql::statement::{
     AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Grantee, Join, OnConflict,
     OrderItem, PolicyCommand, Privilege, RefAction, RoleOption, Select, SelectItem,
@@ -807,6 +808,65 @@ impl Database {
         };
         self.session_user = role.to_string();
         self.current_role = role.to_string();
+    }
+
+    /// Approximate nearest-neighbor search over `vec_col` of `table`: the `k` rows
+    /// nearest to `query` under `metric`, found through an HNSW index.
+    ///
+    /// The rows it indexes come from a `SELECT` through the engine, so the
+    /// row-level-security fence is applied *before* the index is built: the result
+    /// can only ever contain rows the session is allowed to see, the same
+    /// isolation the exact path has. This is the approximate counterpart to the
+    /// exact `ORDER BY col <-> :q LIMIT k` path, which stays the correctness
+    /// baseline it is checked against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be queried or `vec_col` is not a
+    /// column of it. A column with no vectors yields an empty result.
+    pub fn knn(
+        &mut self,
+        table: &str,
+        vec_col: &str,
+        query: &[f32],
+        k: usize,
+        metric: Metric,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (columns, rows) = match self.execute(&format!("SELECT * FROM {table}"))? {
+            QueryOutcome::Rows { columns, rows } => (columns, rows),
+            other => {
+                return Err(DbError::Unsupported(format!(
+                    "knn expected rows from {table}, got {other:?}"
+                )))
+            }
+        };
+        let col = columns
+            .iter()
+            .position(|c| c == vec_col)
+            .ok_or_else(|| DbError::Unsupported(format!("no column {vec_col:?} in {table}")))?;
+        // The dimension comes from the first row that actually carries a vector.
+        let Some(dim) = rows.iter().find_map(|r| match r.get(col) {
+            Some(Value::Vector(v)) => Some(v.len()),
+            _ => None,
+        }) else {
+            return Ok(Vec::new());
+        };
+        let mut index = Hnsw::new_with_metric(dim, 16, 200, 0x5EED_5EED, metric);
+        let mut node_to_row: Vec<usize> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(Value::Vector(v)) = r.get(col) {
+                if v.len() == dim {
+                    index.insert(v.clone());
+                    node_to_row.push(i);
+                }
+            }
+        }
+        let ef = k.max(64).saturating_mul(2);
+        Ok(index
+            .search(query, k, ef)
+            .into_iter()
+            .map(|(id, _)| rows[node_to_row[id]].clone())
+            .collect())
     }
 
     /// The role the session authenticated as (`session_user`).
@@ -6068,6 +6128,47 @@ mod tests {
         db.execute("CREATE TABLE d (id INT, e VECTOR(3))").unwrap();
         db.execute("INSERT INTO d VALUES (1, '[1, 2, 3]')").unwrap();
         assert!(db.execute("SELECT e <-> '[1, 2]' FROM d").is_err());
+    }
+
+    #[test]
+    fn knn_index_search_matches_exact_and_respects_rls() {
+        use crate::hnsw::Metric;
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE m (id INT, tenant TEXT, e VECTOR(2))")
+            .unwrap();
+        db.execute(
+            "INSERT INTO m VALUES (1,'a','[0,0]'),(2,'a','[1,1]'),(3,'a','[5,5]'),(4,'b','[0,0]')",
+        )
+        .unwrap();
+        let ids = |rows: &[Vec<Value>]| -> Vec<i64> {
+            rows.iter()
+                .map(|r| match r[0] {
+                    Value::Int(n) => n,
+                    ref o => panic!("expected int id, got {o:?}"),
+                })
+                .collect()
+        };
+        // No RLS: the two nearest to the origin are the two [0,0] rows (ids 1, 4).
+        let got = db.knn("m", "e", &[0.0, 0.0], 2, Metric::L2).unwrap();
+        let near = ids(&got);
+        assert!(near.contains(&1) && near.contains(&4), "got {near:?}");
+
+        // With RLS, a tenant's index search can only ever return its own rows,
+        // because the rows are sourced through a SELECT that the policy filters,
+        // even though tenant b holds the globally-nearest vector.
+        db.execute("GRANT SELECT ON m TO PUBLIC").unwrap();
+        db.execute("CREATE ROLE a LOGIN").unwrap();
+        db.execute("CREATE POLICY p ON m USING ((tenant = current_user()))")
+            .unwrap();
+        db.execute("ALTER TABLE m ENABLE ROW LEVEL SECURITY")
+            .unwrap();
+        db.set_session_user("a");
+        let got = db.knn("m", "e", &[0.0, 0.0], 5, Metric::L2).unwrap();
+        let mine = ids(&got);
+        assert!(
+            mine.iter().all(|id| (1..=3).contains(id)),
+            "the index search leaked another tenant's row: {mine:?}"
+        );
     }
 
     fn names(cols: &[String]) -> Vec<&str> {
