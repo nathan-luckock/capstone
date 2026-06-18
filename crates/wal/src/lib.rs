@@ -22,6 +22,7 @@ pub mod archive;
 pub mod error;
 pub mod hook;
 pub mod lsn;
+pub mod model;
 pub mod reader;
 pub mod record;
 pub mod recovery;

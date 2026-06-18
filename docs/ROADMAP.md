@@ -324,8 +324,15 @@ Make the proof a regenerable, signed artifact.
 
 ### 3C. Model-check the core invariants
 
-Deterministic simulation samples the state space. Model checking covers a bounded
-state space exhaustively. Do both, the way the most serious systems do.
+**Status: shipped (WAL ordering).** Deterministic simulation samples the state
+space; model checking covers a bounded state space exhaustively. The
+write-ahead-logging ordering invariant, the foundation of crash durability, is now
+model-checked from scratch (`crates/wal/src/model.rs`, the `walmodel` binary): a
+bounded breadth-first sweep of every reachable interleaving of an abstract
+log-and-page machine proves no page change is ever durable ahead of its log
+record, and a deliberately buggy variant yields a concrete counterexample so the
+proof is not vacuous. Extending the same approach to the MVCC isolation invariant
+is the remaining piece.
 
 - **Build:** a lightweight formal model of the recovery and isolation invariants
   (in TLA+, or in Rust with a state-exploration library), model-checked so that,
