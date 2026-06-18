@@ -829,6 +829,10 @@ impl Database {
                 ref grantees,
             } => self.run_grant(privileges, table.as_deref(), roles, grantees, false),
             Statement::SetRole { ref name } => self.set_role(name.as_deref()),
+            Statement::SetVectorIndex { on } => {
+                self.set_vector_index(on);
+                Ok(QueryOutcome::Message("SET"))
+            }
             Statement::CreatePolicy {
                 ref name,
                 ref table,

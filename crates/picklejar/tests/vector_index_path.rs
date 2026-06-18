@@ -241,6 +241,35 @@ fn enabling_rls_after_caching_still_fences() {
 }
 
 #[test]
+fn set_vector_index_sql_toggles_the_path() {
+    let mut db = seeded_store();
+    assert!(!db.vector_index_enabled(), "off by default");
+
+    // The SQL toggle reaches any client over the wire, not just the Rust API.
+    db.execute("SET vector_index = on").unwrap();
+    assert!(db.vector_index_enabled());
+    let q = "SELECT id FROM items ORDER BY e <-> '[3.2, 0]' LIMIT 5";
+    let indexed = rows(&mut db, q);
+
+    db.execute("SET vector_index = off").unwrap();
+    assert!(!db.vector_index_enabled());
+    let exact = rows(&mut db, q);
+    assert_eq!(
+        indexed, exact,
+        "the toggled-on path must match the exact path"
+    );
+
+    // The `TO` spelling parses as well.
+    db.execute("SET vector_index TO on").unwrap();
+    assert!(db.vector_index_enabled());
+    db.execute("SET vector_index TO off").unwrap();
+    assert!(!db.vector_index_enabled());
+
+    // A nonsense value is a parse error, not a silent no-op.
+    assert!(db.execute("SET vector_index = maybe").is_err());
+}
+
+#[test]
 fn index_path_respects_table_permissions() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("perm.db");

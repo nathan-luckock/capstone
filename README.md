@@ -78,7 +78,7 @@ SELECT id FROM memories ORDER BY embedding <-> '[0.1, 0.2, 0.8]' LIMIT 5;
 
 A `VECTOR(n)` column stores an embedding as native `f32`, validates its width on write, and survives a crash and reopen like any other value. Similarity search runs through the same row-level-security fence as every other read, so a tenant's nearest-neighbor query can only ever rank that tenant's own vectors, enforced by the engine.
 
-That last query can be served two ways. By default it is an exact scan. Turn on the index path and the same SQL is answered from a cached HNSW index instead, roughly 150x faster on a warm query, and only when row-level security does not apply to the query, so the acceleration can never widen what a tenant can see. An RLS-fenced query always falls back to the exact, fenced path.
+That last query can be served two ways. By default it is an exact scan. Run `SET vector_index = on` (from `psql` or any client) and the same SQL is answered from a cached HNSW index instead, roughly 150x faster on a warm query, and only when row-level security does not apply to the query, so the acceleration can never widen what a tenant can see. An RLS-fenced query always falls back to the exact, fenced path.
 
 ## It speaks Postgres
 
