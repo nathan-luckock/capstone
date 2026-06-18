@@ -28,9 +28,10 @@
 use std::ops::Bound;
 
 use picklejar_sql::Value;
-use picklejar_storage::{BTree, BufferPool, PageId, SlotId, TupleRef};
+use picklejar_storage::{BTree, BufferPool, PageId, SlotId, TupleRef, VarBTree};
 
 use crate::error::Result;
+use crate::keyenc;
 
 /// Map an indexable value to an order-preserving `u64` B+ tree key, or `None`
 /// for a type that is not indexed.
@@ -148,6 +149,138 @@ impl<'pool> Index<'pool> {
     }
 }
 
+/// A general secondary index over one or more columns of any indexable type,
+/// backed by the variable-length-key [`VarBTree`].
+///
+/// Unlike [`Index`] (a unique `u64` map), this one indexes `TEXT`, composite
+/// keys, and non-unique columns: the engine encodes the indexed column values
+/// order-preservingly (see [`keyenc`]) and appends the row id, so every key is
+/// unique even when the column values repeat. A value lookup is a prefix range
+/// scan, returning every matching row id; equality on a leading subset of a
+/// composite index works the same way.
+///
+/// Like [`Index`], it is insert-only: an `UPDATE` that changes a value inserts a
+/// new key and leaves the old one behind as a stale entry, filtered downstream
+/// by the MVCC visibility check and the executor's residual predicate. Results
+/// may therefore contain stale or duplicate row ids; the caller dedups and
+/// re-checks.
+pub struct MultiIndex<'pool> {
+    tree: VarBTree<'pool>,
+}
+
+impl std::fmt::Debug for MultiIndex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiIndex")
+            .field("root", &self.tree.root_page())
+            .finish()
+    }
+}
+
+impl<'pool> MultiIndex<'pool> {
+    /// Create a new empty index.
+    pub fn create(pool: &'pool BufferPool) -> Result<Self> {
+        Ok(Self {
+            tree: VarBTree::create(pool)?,
+        })
+    }
+
+    /// Open an existing index rooted at `root`.
+    #[must_use]
+    pub const fn open(pool: &'pool BufferPool, root: PageId) -> Self {
+        Self {
+            tree: VarBTree::open(pool, root),
+        }
+    }
+
+    /// The current root page id.
+    #[must_use]
+    pub fn root(&self) -> PageId {
+        self.tree.root_page()
+    }
+
+    /// Record that `rowid` holds the tuple `values` (one per indexed column).
+    /// Returns `false` (a no-op) if any column's type is not indexable.
+    pub fn put(&self, values: &[&Value], rowid: u64) -> Result<bool> {
+        let Some(mut key) = keyenc::encode_key(values) else {
+            return Ok(false);
+        };
+        key.extend_from_slice(&rowid.to_be_bytes());
+        self.tree
+            .insert(&key, TupleRef::new(PageId::new(rowid), SlotId::new(0)))?;
+        Ok(true)
+    }
+
+    /// Candidate row ids whose leading indexed columns equal `values` (which may
+    /// be a prefix of the index's columns). The encoded value tuple is a key
+    /// prefix, so this is one prefix range scan.
+    pub fn lookup_prefix(&self, values: &[&Value]) -> Result<Vec<u64>> {
+        let Some(prefix) = keyenc::encode_key(values) else {
+            return Ok(Vec::new());
+        };
+        self.scan_prefix(&prefix)
+    }
+
+    /// Candidate row ids whose single leading column falls in `[lo, hi]`. Used
+    /// for a range predicate on the first indexed column.
+    pub fn range_leading(&self, lo: Bound<&Value>, hi: Bound<&Value>) -> Result<Vec<u64>> {
+        // Encode each bound to the leading field, then translate the value bound
+        // into a key bound. A row with leading value `v` has keys in
+        // `[enc(v), succ(enc(v)))`, so an inclusive value bound becomes an
+        // inclusive/exclusive key bound around that prefix.
+        let lo_key = match lo {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => encode_one(v).map_or(Bound::Unbounded, Bound::Included),
+            Bound::Excluded(v) => match encode_one(v).and_then(|e| keyenc::prefix_successor(&e)) {
+                Some(succ) => Bound::Included(succ),
+                // `v` encodes to all-0xFF (no greater value); nothing qualifies.
+                None => return Ok(Vec::new()),
+            },
+        };
+        let hi_key = match hi {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => encode_one(v)
+                .and_then(|e| keyenc::prefix_successor(&e))
+                .map_or(Bound::Unbounded, Bound::Excluded),
+            Bound::Excluded(v) => encode_one(v).map_or(Bound::Unbounded, Bound::Excluded),
+        };
+        self.scan_keys(as_bound(&lo_key), as_bound(&hi_key))
+    }
+
+    /// Scan every key with the given byte prefix, collecting row ids.
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<u64>> {
+        let hi = keyenc::prefix_successor(prefix);
+        let hi_bound = hi
+            .as_ref()
+            .map_or(Bound::Unbounded, |h| Bound::Excluded(h.as_slice()));
+        self.scan_keys(Bound::Included(prefix), hi_bound)
+    }
+
+    /// Run a byte-key range scan and collect the row ids.
+    fn scan_keys(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Vec<u64>> {
+        let mut rowids = Vec::new();
+        for item in self.tree.range_scan(lo, hi)? {
+            let (_key, tuple) = item?;
+            rowids.push(tuple.page_id.get());
+        }
+        Ok(rowids)
+    }
+}
+
+/// Encode a single value to its leading-field bytes, or `None` if unindexable.
+fn encode_one(v: &Value) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    keyenc::encode_field(v, &mut out).then_some(out)
+}
+
+/// Borrow an owned `Bound<Vec<u8>>` as a `Bound<&[u8]>`.
+fn as_bound(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match b {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +339,91 @@ mod tests {
         let idx = Index::create(&pool).unwrap();
         assert!(!idx.put(&Value::Text("x".into()), 1).unwrap());
         assert_eq!(idx.lookup(&Value::Text("x".into())).unwrap(), None);
+    }
+
+    // --- MultiIndex (variable-key, non-unique, composite) ---
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    #[test]
+    fn multi_index_text_equality_returns_all_rows_for_a_value() {
+        let (_d, pool) = pool();
+        let idx = MultiIndex::create(&pool).unwrap();
+        // A non-unique TEXT column: three rows share 'active'.
+        idx.put(&[&text("active")], 1).unwrap();
+        idx.put(&[&text("inactive")], 2).unwrap();
+        idx.put(&[&text("active")], 3).unwrap();
+        idx.put(&[&text("active")], 5).unwrap();
+        let mut got = idx.lookup_prefix(&[&text("active")]).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 3, 5]);
+        assert_eq!(
+            idx.lookup_prefix(&[&text("gone")]).unwrap(),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn multi_index_range_on_leading_column() {
+        let (_d, pool) = pool();
+        let idx = MultiIndex::create(&pool).unwrap();
+        for i in 0..20u64 {
+            idx.put(&[&Value::Int(i64::from(u32::try_from(i).unwrap()))], i)
+                .unwrap();
+        }
+        // [5, 10): rows 5..=9.
+        let mut got = idx
+            .range_leading(
+                Bound::Included(&Value::Int(5)),
+                Bound::Excluded(&Value::Int(10)),
+            )
+            .unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![5, 6, 7, 8, 9]);
+        // (15, ..]: rows 16..=19.
+        let mut got = idx
+            .range_leading(Bound::Excluded(&Value::Int(15)), Bound::Unbounded)
+            .unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn multi_index_composite_equality_and_leading_prefix() {
+        let (_d, pool) = pool();
+        let idx = MultiIndex::create(&pool).unwrap();
+        // (tenant, status) composite.
+        idx.put(&[&Value::Int(1), &text("open")], 10).unwrap();
+        idx.put(&[&Value::Int(1), &text("closed")], 11).unwrap();
+        idx.put(&[&Value::Int(2), &text("open")], 12).unwrap();
+        // Full-tuple equality.
+        assert_eq!(
+            idx.lookup_prefix(&[&Value::Int(1), &text("open")]).unwrap(),
+            vec![10]
+        );
+        // Leading-column-only equality returns both rows of tenant 1.
+        let mut got = idx.lookup_prefix(&[&Value::Int(1)]).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11]);
+    }
+
+    #[test]
+    fn multi_index_survives_reopen() {
+        let (_d, pool) = pool();
+        let root = {
+            let idx = MultiIndex::create(&pool).unwrap();
+            for i in 0..500u64 {
+                idx.put(&[&text(&format!("v{}", i % 7))], i).unwrap();
+            }
+            idx.root()
+        };
+        pool.flush_all().unwrap();
+        let idx = MultiIndex::open(&pool, root);
+        // All rows whose value is 'v3' (i % 7 == 3): 3, 10, 17, ...
+        let mut got = idx.lookup_prefix(&[&text("v3")]).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, (0..500u64).filter(|i| i % 7 == 3).collect::<Vec<_>>());
     }
 }

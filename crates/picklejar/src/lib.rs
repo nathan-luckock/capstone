@@ -9,6 +9,7 @@ pub mod correlated;
 pub mod database;
 pub mod error;
 pub mod index;
+pub mod keyenc;
 pub mod persist;
 pub mod security;
 

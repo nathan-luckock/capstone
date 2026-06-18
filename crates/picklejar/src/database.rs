@@ -47,7 +47,7 @@ use picklejar_txn::{MvccTable, Transaction, TransactionManager};
 use picklejar_wal::{WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
-use crate::index::Index;
+use crate::index::{Index, MultiIndex};
 use crate::persist::{self, TableRecord};
 use crate::security::{self, RoleAttrs, SecurityCatalog};
 
@@ -65,8 +65,12 @@ struct TableStore {
     version_page: PageId,
     /// Next auto-increment rowid (the `MvccTable` key).
     next_rowid: u64,
-    /// Physical secondary indexes, one per indexed column (unique INT columns).
+    /// Physical secondary indexes (the unique fixed-type `u64` map), one per
+    /// auto-indexed column.
     secondary: Vec<SecondaryIndex>,
+    /// Variable-key secondary indexes from explicit `CREATE INDEX`: any
+    /// indexable type, non-unique, possibly multi-column.
+    multi_secondary: Vec<MultiSecondaryIndex>,
     /// Per-column DEFAULT value (in schema order), used to fill omitted columns
     /// on INSERT. `None` for a column with no default.
     defaults: Vec<Option<Value>>,
@@ -80,6 +84,23 @@ struct SecondaryIndex {
     column: usize,
     /// Root page of the index B+ tree.
     root: PageId,
+}
+
+/// A variable-key secondary index from `CREATE INDEX`: the indexed columns'
+/// positions (one for a single-column index, more for a composite one) and the
+/// root page of its [`MultiIndex`] tree.
+#[derive(Debug, Clone)]
+struct MultiSecondaryIndex {
+    /// The index's name (so `DROP INDEX` and persistence can find it).
+    name: String,
+    /// Positions of the indexed columns in the table's schema, in index order.
+    columns: Vec<usize>,
+    /// Root page of the variable-key B+ tree.
+    root: PageId,
+    /// Distinct values observed in the leading column when the index was built,
+    /// so the cost model can judge an equality's selectivity after a reopen
+    /// (stats are otherwise in-memory only).
+    distinct: u64,
 }
 
 /// The outcome of running one statement.
@@ -200,6 +221,9 @@ pub struct Database {
     rls: HashMap<String, TableRls>,
     /// Sidecar file recording the row-level-security state.
     pol_path: PathBuf,
+    /// Sidecar file recording the variable-key (`CREATE INDEX`) secondary
+    /// indexes (their roots and columns).
+    midx_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -228,6 +252,7 @@ impl Database {
         let seq_path = base.with_extension("seq");
         let acl_path = base.with_extension("acl");
         let pol_path = base.with_extension("pol");
+        let midx_path = base.with_extension("midx");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -253,6 +278,7 @@ impl Database {
             acl_path,
             rls: HashMap::new(),
             pol_path,
+            midx_path,
         };
         db.load_catalog()?;
         db.load_views()?;
@@ -260,6 +286,7 @@ impl Database {
         db.load_serials()?;
         db.load_security()?;
         db.load_rls()?;
+        db.load_multi_indexes()?;
         // Register the read-only information_schema views so introspection
         // queries bind. They are catalog-only (no physical store) and are built
         // on demand by `EngineSource`, so they are never persisted.
@@ -340,6 +367,7 @@ impl Database {
                     version_page: PageId(r.version_page),
                     next_rowid: r.next_rowid,
                     secondary,
+                    multi_secondary: Vec::new(),
                     defaults,
                 },
             );
@@ -610,6 +638,7 @@ impl Database {
         )?;
         self.save_security()?;
         self.save_rls()?;
+        self.save_multi_indexes()?;
         Ok(())
     }
 
@@ -689,11 +718,11 @@ impl Database {
                 ref name,
                 ref query,
             } => self.create_table_as(name, query),
-            Statement::CreateIndex { .. } => {
-                self.catalog.apply(&stmt)?;
-                self.persist()?;
-                Ok(QueryOutcome::Ddl)
-            }
+            Statement::CreateIndex {
+                ref name,
+                ref table,
+                ref column,
+            } => self.create_index(name, table, column),
             Statement::DropTable {
                 if_exists,
                 ref name,
@@ -1101,6 +1130,71 @@ impl Database {
         }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// Rebuild the variable-key secondary index descriptors from their sidecar,
+    /// mapping each persisted column name back to its position.
+    fn load_multi_indexes(&mut self) -> Result<()> {
+        for r in persist::load_multi_indexes(&self.midx_path)? {
+            let Some(meta) = self.catalog.get_table(&r.table) else {
+                continue;
+            };
+            let columns: Option<Vec<usize>> =
+                r.columns.iter().map(|c| meta.column_index(c)).collect();
+            let Some(columns) = columns else {
+                continue;
+            };
+            // Restore the leading column's distinct stat so the cost model still
+            // chooses the index after a reopen.
+            if let Some(lead) = r.columns.first() {
+                self.catalog.set_column_stats(
+                    &r.table,
+                    lead,
+                    ColumnStats {
+                        distinct: r.distinct,
+                        min: None,
+                        max: None,
+                    },
+                )?;
+            }
+            if let Some(store) = self.tables.get_mut(&r.table) {
+                store.multi_secondary.push(MultiSecondaryIndex {
+                    name: r.name,
+                    columns,
+                    root: PageId(r.root),
+                    distinct: r.distinct,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the variable-key secondary indexes to their sidecar.
+    fn save_multi_indexes(&self) -> Result<()> {
+        let mut records = Vec::new();
+        let mut tables: Vec<&String> = self.tables.keys().collect();
+        tables.sort();
+        for table in tables {
+            let store = &self.tables[table];
+            let Some(meta) = self.catalog.get_table(table) else {
+                continue;
+            };
+            for m in &store.multi_secondary {
+                records.push(persist::MultiIndexRecord {
+                    table: table.clone(),
+                    name: m.name.clone(),
+                    root: m.root.0,
+                    distinct: m.distinct,
+                    columns: m
+                        .columns
+                        .iter()
+                        .map(|&c| meta.columns[c].name.clone())
+                        .collect(),
+                });
+            }
+        }
+        persist::save_multi_indexes(&self.midx_path, &records)?;
+        Ok(())
     }
 
     /// Load the row-level-security state from its sidecar.
@@ -1643,6 +1737,7 @@ impl Database {
             version_page: table.version_page(),
             next_rowid: 0,
             secondary,
+            multi_secondary: Vec::new(),
             defaults,
         };
         self.tables.insert(name.clone(), store);
@@ -1822,6 +1917,9 @@ impl Database {
         for sec in &mut store.secondary {
             sec.root = Index::create(&self.pool)?.root();
         }
+        for m in &mut store.multi_secondary {
+            m.root = MultiIndex::create(&self.pool)?.root();
+        }
         self.catalog.set_row_count(name, 0)?;
         self.persist()?;
         Ok(QueryOutcome::Ddl)
@@ -1926,7 +2024,7 @@ impl Database {
 
         // 1. Read the live rows under a fresh snapshot (latest committed values).
         let reader = self.mgr.begin();
-        let (rows, sec_cols) = {
+        let (rows, sec_cols, multi_cols) = {
             let store = self
                 .tables
                 .get(name)
@@ -1944,7 +2042,12 @@ impl Database {
                 .map(|(_k, bytes)| decode_row(&bytes, &schema))
                 .collect::<std::result::Result<_, _>>()?;
             let sec_cols: Vec<usize> = store.secondary.iter().map(|s| s.column).collect();
-            (rows, sec_cols)
+            let multi_cols: Vec<(String, Vec<usize>, u64)> = store
+                .multi_secondary
+                .iter()
+                .map(|m| (m.name.clone(), m.columns.clone(), m.distinct))
+                .collect();
+            (rows, sec_cols, multi_cols)
         };
         self.mgr.commit(&reader);
 
@@ -1958,17 +2061,22 @@ impl Database {
                 root: Index::create(&self.pool)?.root(),
             });
         }
+        let mut multi: Vec<MultiSecondaryIndex> = Vec::with_capacity(multi_cols.len());
+        for (name, columns, distinct) in multi_cols {
+            multi.push(MultiSecondaryIndex {
+                name,
+                columns,
+                root: MultiIndex::create(&self.pool)?.root(),
+                distinct,
+            });
+        }
 
         // 3. Re-insert each live row, rebuilding the indexes as we go.
         let writer = self.mgr.begin();
         let mut rowid: u64 = 0;
         for values in rows {
             new_table.insert(&writer, rowid, &encode_row(&values, &schema)?)?;
-            for sec in &mut secondary {
-                let index = Index::open(&self.pool, sec.root);
-                index.put(&values[sec.column], rowid)?;
-                sec.root = index.root();
-            }
+            put_secondaries(&self.pool, &mut secondary, &mut multi, &values, rowid)?;
             rowid += 1;
         }
         self.mgr.commit(&writer);
@@ -1981,6 +2089,7 @@ impl Database {
         store.version_page = version_page;
         store.next_rowid = rowid;
         store.secondary = secondary;
+        store.multi_secondary = multi;
         self.catalog.set_row_count(name, rowid)?;
         Ok(())
     }
@@ -2263,6 +2372,114 @@ impl Database {
         Ok(rows)
     }
 
+    /// Like [`scan_all_rows`](Self::scan_all_rows) but keeps each row's id (the
+    /// MVCC key), for building a secondary index over an existing table.
+    fn scan_rows_with_rowid(
+        &self,
+        table: &str,
+        schema: &[DataType],
+    ) -> Result<Vec<(u64, Vec<Value>)>> {
+        let reader = self.mgr.begin();
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let rows = handle
+            .scan(&reader)?
+            .into_iter()
+            .map(|(k, bytes)| decode_row(&bytes, schema).map(|r| (k, r)))
+            .collect::<std::result::Result<_, _>>()?;
+        self.mgr.commit(&reader);
+        Ok(rows)
+    }
+
+    /// `CREATE INDEX name ON table (column)`: register the index in the catalog
+    /// and, for an indexable column type that is not already physically indexed,
+    /// build and populate a variable-key [`MultiIndex`] over the live rows.
+    fn create_index(&mut self, name: &str, table: &str, column: &str) -> Result<QueryOutcome> {
+        // Only the table owner (or a superuser) may add an index.
+        self.require_owner(table)?;
+        // Validate and register in the catalog (the planner sees it from here).
+        self.catalog.apply(&Statement::CreateIndex {
+            name: name.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+        })?;
+
+        let (col_idx, col_ty) = {
+            let meta = self
+                .catalog
+                .get_table(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let idx = meta
+                .column_index(column)
+                .ok_or_else(|| DbError::UnknownColumn {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                })?;
+            (idx, meta.columns[idx].ty)
+        };
+
+        // Skip a column already covered by a physical index (the auto-built u64
+        // index for a unique fixed-type column, or a prior CREATE INDEX) or whose
+        // type the variable-key index does not handle.
+        let already = self.tables.get(table).is_some_and(|s| {
+            s.secondary.iter().any(|x| x.column == col_idx)
+                || s.multi_secondary.iter().any(|m| m.columns == [col_idx])
+        });
+        if is_multi_indexable(col_ty) && !already {
+            let schema: Vec<DataType> = self
+                .catalog
+                .get_table(table)
+                .expect("table just validated")
+                .columns
+                .iter()
+                .map(|c| c.ty)
+                .collect();
+            let rows = self.scan_rows_with_rowid(table, &schema)?;
+            let mindex = MultiIndex::create(&self.pool)?;
+            let mut distinct = std::collections::HashSet::new();
+            for (rowid, values) in &rows {
+                mindex.put(&[&values[col_idx]], *rowid)?;
+                // Track the column's distinct values (by their encoded bytes) so
+                // the cost model can judge an equality's selectivity and actually
+                // choose this index when it pays off.
+                let mut enc = Vec::new();
+                if crate::keyenc::encode_field(&values[col_idx], &mut enc) {
+                    distinct.insert(enc);
+                }
+            }
+            let root = mindex.root();
+            let distinct = u64::try_from(distinct.len().max(1)).unwrap_or(u64::MAX);
+            if let Some(store) = self.tables.get_mut(table) {
+                store.multi_secondary.push(MultiSecondaryIndex {
+                    name: name.to_string(),
+                    columns: vec![col_idx],
+                    root,
+                    distinct,
+                });
+            }
+            self.catalog.set_column_stats(
+                table,
+                column,
+                ColumnStats {
+                    distinct,
+                    min: None,
+                    max: None,
+                },
+            )?;
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
     /// Rebuild `table`'s physical storage and secondary indexes from `rows`,
     /// which must already be shaped to the table's *current* catalog columns.
     /// Swaps the fresh anchors into the table's store and updates its row count.
@@ -2315,6 +2532,10 @@ impl Database {
         store.version_page = version_page;
         store.next_rowid = rowid;
         store.secondary = secondary;
+        // A column rewrite renumbers rowids (and can shift column positions), so
+        // any variable-key index would be stale; drop it and let queries fall
+        // back to a scan. The user can re-`CREATE INDEX`.
+        store.multi_secondary.clear();
         self.catalog.set_row_count(table, rowid)?;
         Ok(())
     }
@@ -2454,6 +2675,8 @@ impl Database {
         store.next_rowid = rowid;
         store.secondary = secondary;
         store.defaults.push(default);
+        // The rewrite renumbered rowids, so any variable-key index is now stale.
+        store.multi_secondary.clear();
         self.catalog.set_row_count(table, rowid)?;
         self.persist()?;
         Ok(QueryOutcome::Ddl)
@@ -3140,21 +3363,25 @@ impl Database {
                 RowPlan::Insert(values) => {
                     let rowid = store.next_rowid;
                     handle.insert(txn, rowid, &encode_row(&values, &schema)?)?;
-                    for sec in &mut store.secondary {
-                        let index = Index::open(&self.pool, sec.root);
-                        index.put(&values[sec.column], rowid)?;
-                        sec.root = index.root();
-                    }
+                    put_secondaries(
+                        &self.pool,
+                        &mut store.secondary,
+                        &mut store.multi_secondary,
+                        &values,
+                        rowid,
+                    )?;
                     store.next_rowid += 1;
                     inserted.push(values);
                 }
                 RowPlan::Update { rowid, new_row } => {
                     handle.update(txn, rowid, &encode_row(&new_row, &schema)?)?;
-                    for sec in &mut store.secondary {
-                        let index = Index::open(&self.pool, sec.root);
-                        index.put(&new_row[sec.column], rowid)?;
-                        sec.root = index.root();
-                    }
+                    put_secondaries(
+                        &self.pool,
+                        &mut store.secondary,
+                        &mut store.multi_secondary,
+                        &new_row,
+                        rowid,
+                    )?;
                     inserted.push(new_row);
                 }
             }
@@ -3779,11 +4006,13 @@ impl Database {
             handle.update(txn, *key, &encode_row(new_row, schema)?)?;
             // Point each indexed column's key at this rowid's new value. Old
             // values stay in the tree (upsert only) and are filtered on read.
-            for sec in &mut store.secondary {
-                let index = Index::open(&self.pool, sec.root);
-                index.put(&new_row[sec.column], *key)?;
-                sec.root = index.root();
-            }
+            put_secondaries(
+                &self.pool,
+                &mut store.secondary,
+                &mut store.multi_secondary,
+                new_row,
+                *key,
+            )?;
             new_rows.push(new_row.clone());
         }
         store.index_root = handle.index_root();
@@ -4082,9 +4311,70 @@ impl TableSource for EngineSource<'_> {
             return Ok(Relation { columns, rows });
         }
 
+        // Variable-key indexes (explicit CREATE INDEX, including TEXT and
+        // non-unique columns). An equality on the leading column is a prefix
+        // lookup; a range is a leading-column range scan. Candidates are still
+        // deduped, MVCC-resolved, and re-filtered by the executor.
+        for m in &store.multi_secondary {
+            let Some(&leading) = m.columns.first() else {
+                continue;
+            };
+            let col_name = &meta.columns[leading].name;
+            let mindex = MultiIndex::open(self.pool, m.root);
+            let candidates = if let Some(value) = find_equality(predicate, col_name) {
+                mindex.lookup_prefix(&[&value])
+            } else if let Some((lo, hi)) = find_range(predicate, col_name) {
+                mindex.range_leading(lo.as_ref(), hi.as_ref())
+            } else {
+                continue;
+            }
+            .map_err(|e| ExecError::Source(e.to_string()))?;
+            return self.resolve_candidates(store, &columns, &schema, candidates);
+        }
+
         // No physical index matched this predicate: a full scan is still
         // correct (the executor's residual filter does the rest).
         self.scan(table)
+    }
+}
+
+impl EngineSource<'_> {
+    /// Resolve index candidate rowids into rows: dedup (the index is
+    /// upsert-only, so a row can appear under several stale keys), fetch each
+    /// through MVCC under the current snapshot, and decode. The executor then
+    /// re-applies the predicate, so stale or out-of-snapshot entries drop.
+    fn resolve_candidates(
+        &self,
+        store: &TableStore,
+        columns: &[String],
+        schema: &[DataType],
+        candidates: Vec<u64>,
+    ) -> std::result::Result<Relation, picklejar_executor::ExecError> {
+        use picklejar_executor::ExecError;
+        let mvcc = MvccTable::open(
+            self.pool,
+            self.wal.clone(),
+            self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        for rowid in candidates {
+            if !seen.insert(rowid) {
+                continue;
+            }
+            if let Some(bytes) = mvcc
+                .get(self.txn, rowid)
+                .map_err(|e| ExecError::Source(e.to_string()))?
+            {
+                rows.push(decode_row(&bytes, schema)?);
+            }
+        }
+        Ok(Relation {
+            columns: columns.to_vec(),
+            rows,
+        })
     }
 }
 
@@ -4095,6 +4385,44 @@ const fn is_indexable_type(ty: DataType) -> bool {
         ty,
         DataType::Int | DataType::Date | DataType::Timestamp | DataType::Bool
     )
+}
+
+/// Whether a column type can be keyed by the variable-key [`MultiIndex`] (see
+/// `keyenc`): the order-preserving, self-delimiting types, which add `TEXT` to
+/// the fixed set. `FLOAT` / `DECIMAL` / `JSON` are not keyed (a `CREATE INDEX` on
+/// them stays catalog-only and the query falls back to a sequential scan).
+const fn is_multi_indexable(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Int | DataType::Date | DataType::Timestamp | DataType::Bool | DataType::Text
+    )
+}
+
+/// Maintain every physical secondary index after writing `(rowid, values)`:
+/// the unique `u64` indexes and the variable-key [`MultiIndex`]es. Each index's
+/// root may move as its tree grows, so it is read back into the descriptor.
+///
+/// Taking the pool and the two index slices (rather than `&self` and the store)
+/// keeps the borrows disjoint, so a caller holding `&mut store` can invoke it.
+fn put_secondaries(
+    pool: &BufferPool,
+    secondary: &mut [SecondaryIndex],
+    multi: &mut [MultiSecondaryIndex],
+    values: &[Value],
+    rowid: u64,
+) -> Result<()> {
+    for sec in secondary.iter_mut() {
+        let index = Index::open(pool, sec.root);
+        index.put(&values[sec.column], rowid)?;
+        sec.root = index.root();
+    }
+    for m in multi.iter_mut() {
+        let mindex = MultiIndex::open(pool, m.root);
+        let cols: Vec<&Value> = m.columns.iter().map(|&c| &values[c]).collect();
+        mindex.put(&cols, rowid)?;
+        m.root = mindex.root();
+    }
+    Ok(())
 }
 
 /// Extract the tightest `[lo, hi]` value bounds a predicate places on `col`
@@ -5947,6 +6275,120 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![Value::Text("b".into())], vec![Value::Text("c".into())],]
+        );
+    }
+
+    // --- variable-key (CREATE INDEX) secondary indexes ---
+
+    #[test]
+    fn create_index_on_text_column_is_used_and_correct() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE u (id INT, email TEXT, status TEXT)")
+            .unwrap();
+        for i in 0..200 {
+            let st = if i % 3 == 0 { "active" } else { "inactive" };
+            db.execute(&format!(
+                "INSERT INTO u VALUES ({i}, 'user{i}@x.com', '{st}')"
+            ))
+            .unwrap();
+        }
+        db.execute("CREATE INDEX u_email ON u (email)").unwrap();
+        db.execute("CREATE INDEX u_status ON u (status)").unwrap();
+
+        // A TEXT equality on the indexed column uses the index.
+        let plan = explain(&mut db, "SELECT id FROM u WHERE email = 'user42@x.com'");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        let (_c, rows) = query(&mut db, "SELECT id FROM u WHERE email = 'user42@x.com'");
+        assert_eq!(rows, vec![vec![Value::Int(42)]]);
+
+        // A non-unique TEXT column: the index returns every matching row.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM u WHERE status = 'active' ORDER BY id",
+        );
+        assert_eq!(rows.len(), (0..200).filter(|i| i % 3 == 0).count());
+        assert_eq!(rows[0], vec![Value::Int(0)]);
+
+        // A miss returns nothing.
+        assert!(
+            query(&mut db, "SELECT id FROM u WHERE email = 'nobody@x.com'")
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_index_text_reflects_updates_and_deletes() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+            .unwrap();
+        db.execute("CREATE INDEX t_name ON t (name)").unwrap();
+        // Move a row to a new value; the old key is stale and filtered.
+        db.execute("UPDATE t SET name = 'alice2' WHERE id = 1")
+            .unwrap();
+        assert!(query(&mut db, "SELECT id FROM t WHERE name = 'alice'")
+            .1
+            .is_empty());
+        assert_eq!(
+            query(&mut db, "SELECT id FROM t WHERE name = 'alice2'").1,
+            vec![vec![Value::Int(1)]]
+        );
+        // Delete a row; the index entry resolves to no live row.
+        db.execute("DELETE FROM t WHERE name = 'bob'").unwrap();
+        assert!(query(&mut db, "SELECT id FROM t WHERE name = 'bob'")
+            .1
+            .is_empty());
+    }
+
+    #[test]
+    fn create_index_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("midx.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, tag TEXT)").unwrap();
+            for i in 0..100 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'tag{}')", i % 5))
+                    .unwrap();
+            }
+            db.execute("CREATE INDEX t_tag ON t (tag)").unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        // The physical index reloads and is still chosen.
+        let plan = explain(&mut db, "SELECT id FROM t WHERE tag = 'tag3'");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t WHERE tag = 'tag3' ORDER BY id");
+        assert_eq!(
+            rows,
+            (0..100)
+                .filter(|i| i % 5 == 3)
+                .map(|i| vec![Value::Int(i)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_index_text_rows_survive_vacuum() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        for i in 0..60 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'n{}')", i % 4))
+                .unwrap();
+        }
+        db.execute("CREATE INDEX t_name ON t (name)").unwrap();
+        // Churn to create dead versions, then compact.
+        db.execute("UPDATE t SET name = 'n0' WHERE id < 10")
+            .unwrap();
+        db.execute("VACUUM t").unwrap();
+        // After vacuum the index is rebuilt with the new rowids and still right.
+        let (_c, rows) = query(&mut db, "SELECT id FROM t WHERE name = 'n2' ORDER BY id");
+        assert_eq!(
+            rows,
+            (0..60)
+                .filter(|i| i % 4 == 2 && *i >= 10)
+                .map(|i| vec![Value::Int(i)])
+                .collect::<Vec<_>>()
         );
     }
 
