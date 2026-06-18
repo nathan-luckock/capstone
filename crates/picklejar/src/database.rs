@@ -62,6 +62,12 @@ const DEFAULT_PROTECT_K: usize = 8;
 /// stripe at a 25% overhead).
 const DEFAULT_PROTECT_M: usize = 2;
 
+/// The sidecar file extensions that, with the heap, make up a database. Used by
+/// backup to copy the whole set, and by archiving so a restore finds them all.
+const SIDECAR_EXTS: [&str; 11] = [
+    "wal", "meta", "txn", "view", "cons", "seq", "acl", "pol", "midx", "parity", "faultlog",
+];
+
 /// Per-table storage descriptor. The catalog holds the logical schema (the
 /// column types are derived from it on demand); this holds the physical
 /// anchors the engine needs to reopen the table.
@@ -272,6 +278,15 @@ struct FaultLogEntry {
     /// `repaired` (reconstructed from parity) or `unrecoverable` (lost, and kept
     /// detectably corrupt rather than served wrong).
     kind: String,
+}
+
+/// A summary of a [`Database::backup`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupReport {
+    /// Number of files copied (the heap plus whichever sidecars exist).
+    pub files: usize,
+    /// Total bytes copied.
+    pub bytes: u64,
 }
 
 /// A summary of a [`Database::protect`] call: what the parity snapshot covered.
@@ -592,6 +607,42 @@ impl Database {
                 Value::Int(i64::try_from(report.parity_bytes).unwrap_or(-1)),
             ]],
         })
+    }
+
+    /// Copy a consistent snapshot of the whole database (the heap, the WAL, and
+    /// every sidecar) to `dest`, a base path like the one [`Self::open`] takes.
+    ///
+    /// The buffer pool and the WAL are flushed first, so the copy reflects every
+    /// committed change; `Database::open(dest)` then restores an identical
+    /// database (running WAL recovery over the copied log). Because the engine is
+    /// single-threaded, taking the copy between statements is a consistent point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pool or WAL cannot be flushed or any file cannot be
+    /// copied.
+    pub fn backup(&mut self, dest: impl AsRef<Path>) -> Result<BackupReport> {
+        self.pool.flush_all()?;
+        self.wal.writer().fsync_all()?;
+        let dest = dest.as_ref();
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        // The heap is the base path itself; the sidecars share the stem.
+        let mut pairs: Vec<(PathBuf, PathBuf)> = vec![(self.db_path.clone(), dest.to_path_buf())];
+        for ext in SIDECAR_EXTS {
+            pairs.push((self.db_path.with_extension(ext), dest.with_extension(ext)));
+        }
+        let mut report = BackupReport { files: 0, bytes: 0 };
+        for (src, dst) in pairs {
+            if src.exists() {
+                report.bytes += std::fs::copy(&src, &dst)?;
+                report.files += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// The path of the parity sidecar this database protects to.
