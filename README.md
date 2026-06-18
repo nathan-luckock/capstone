@@ -112,7 +112,7 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 | **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
 | **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
 | **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) wired into SQL through a cached, RLS-safe path |
-| **Reliability under fault** | page and index checksums refuse corrupt data, a self-healing redundant index, a metamorphic oracle, and a regenerable certificate |
+| **Reliability under fault** | page, index, and metadata-sidecar checksums refuse corrupt data, a self-healing redundant index, a metamorphic oracle, and a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
 | **Deep SQL** | joins, window functions, set operations, correlated subqueries, CTEs, upserts, `information_schema` |
 

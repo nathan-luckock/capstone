@@ -19,6 +19,62 @@ use std::path::Path;
 use picklejar_sql::statement::DataType;
 use picklejar_sql::Value;
 
+/// Atomically write `body` to `path` with a CRC32 integrity header, so a later
+/// flipped byte (radiation, a failing disk) is detected on load rather than
+/// silently applied. The on-disk format is one header line, `<crc32-hex>`, over
+/// the body bytes, followed by the body itself. The write goes to a sibling temp
+/// file and is renamed into place, so a crash mid-write never leaves a torn file.
+///
+/// # Errors
+///
+/// Returns an I/O error if the temp file cannot be written or renamed.
+fn write_checked(path: &Path, body: &str) -> io::Result<()> {
+    let crc = picklejar_storage::crc32::crc32(body.as_bytes());
+    let mut out = String::with_capacity(body.len() + 16);
+    let _ = writeln!(out, "{crc:08x}");
+    out.push_str(body);
+    let tmp = path.with_extension("pjtmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read a file written by [`write_checked`], verifying its CRC32 header. Returns
+/// `Ok(None)` if the file does not exist (a brand-new database), `Ok(Some(body))`
+/// if the header matches, and an error if the file is present but its checksum
+/// does not match its body, so a corrupted catalog, policy, or grant file is
+/// refused rather than trusted.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read, has no valid
+/// header, or fails its checksum.
+fn read_checked(path: &Path) -> io::Result<Option<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some((header, body)) = text.split_once('\n') else {
+        return Err(corrupt_sidecar(path, "missing integrity header"));
+    };
+    let Ok(expected) = u32::from_str_radix(header.trim(), 16) else {
+        return Err(corrupt_sidecar(path, "unreadable integrity header"));
+    };
+    if picklejar_storage::crc32::crc32(body.as_bytes()) != expected {
+        return Err(corrupt_sidecar(path, "checksum mismatch"));
+    }
+    Ok(Some(body.to_string()))
+}
+
+/// An `InvalidData` error naming a corrupted sidecar file and why.
+fn corrupt_sidecar(path: &Path, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("corrupted metadata file {}: {why}", path.display()),
+    )
+}
+
 /// One table's persisted metadata.
 #[derive(Debug, Clone)]
 pub struct TableRecord {
@@ -183,9 +239,7 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
         }
         out.push('\n');
     }
-    let tmp = path.with_extension("meta.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -196,10 +250,8 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
 ///
 /// Returns an I/O error if the file exists but cannot be read or parsed.
 pub fn load(path: &Path) -> io::Result<Vec<TableRecord>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
     };
 
     let mut records = Vec::new();
@@ -276,9 +328,7 @@ pub fn save_txn(path: &Path, next_xid: u64, aborted: &[u64]) -> io::Result<()> {
         let _ = write!(out, " {x}");
     }
     out.push('\n');
-    let tmp = path.with_extension("txn.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -289,10 +339,8 @@ pub fn save_txn(path: &Path, next_xid: u64, aborted: &[u64]) -> io::Result<()> {
 ///
 /// Returns an I/O error if the file exists but cannot be read or parsed.
 pub fn load_txn(path: &Path) -> io::Result<(u64, Vec<u64>)> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((1, Vec::new())),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok((1, Vec::new()));
     };
     let mut nums = text.split_whitespace().map(parse_u64);
     let next_xid = match nums.next() {
@@ -317,9 +365,7 @@ pub fn save_views(path: &Path, views: &[(String, String)]) -> io::Result<()> {
     for (name, sql) in views {
         let _ = writeln!(out, "{name} {sql}");
     }
-    let tmp = path.with_extension("view.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -329,10 +375,8 @@ pub fn save_views(path: &Path, views: &[(String, String)]) -> io::Result<()> {
 ///
 /// Returns an I/O error if the file exists but cannot be read.
 pub fn load_views(path: &Path) -> io::Result<Vec<(String, String)>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
     };
     let mut views = Vec::new();
     for line in text.lines() {
@@ -404,9 +448,7 @@ pub fn save_constraints(path: &Path, constraints: &[Constraint]) -> io::Result<(
             }
         }
     }
-    let tmp = path.with_extension("cons.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -416,10 +458,8 @@ pub fn save_constraints(path: &Path, constraints: &[Constraint]) -> io::Result<(
 ///
 /// Returns an I/O error if the file exists but cannot be read or parsed.
 pub fn load_constraints(path: &Path) -> io::Result<Vec<Constraint>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for line in text.lines() {
@@ -469,9 +509,7 @@ pub fn save_sequences(path: &Path, columns: &[(String, String)]) -> io::Result<(
     for (table, column) in columns {
         let _ = writeln!(out, "{table} {column}");
     }
-    let tmp = path.with_extension("seq.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -482,10 +520,8 @@ pub fn save_sequences(path: &Path, columns: &[(String, String)]) -> io::Result<(
 ///
 /// Returns an I/O error if the file exists but cannot be read.
 pub fn load_sequences(path: &Path) -> io::Result<Vec<(String, String)>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for line in text.lines() {
@@ -540,9 +576,7 @@ pub fn save_acl(path: &Path, acl: &AclData) -> io::Result<()> {
     for (table, owner) in &acl.owners {
         let _ = writeln!(out, "owner {table} {owner}");
     }
-    let tmp = path.with_extension("acl.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -552,10 +586,8 @@ pub fn save_acl(path: &Path, acl: &AclData) -> io::Result<()> {
 ///
 /// Returns an I/O error if the file exists but is unreadable or malformed.
 pub fn load_acl(path: &Path) -> io::Result<AclData> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(AclData::default()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(AclData::default());
     };
     let mut acl = AclData::default();
     for line in text.lines() {
@@ -616,9 +648,7 @@ pub fn save_rls(path: &Path, rls: &RlsData) -> io::Result<()> {
     for policy in &rls.policies {
         let _ = writeln!(out, "policy {policy}");
     }
-    let tmp = path.with_extension("pol.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -628,10 +658,8 @@ pub fn save_rls(path: &Path, rls: &RlsData) -> io::Result<()> {
 ///
 /// Returns an I/O error if the file exists but is unreadable or malformed.
 pub fn load_rls(path: &Path) -> io::Result<RlsData> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RlsData::default()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(RlsData::default());
     };
     let mut rls = RlsData::default();
     for line in text.lines() {
@@ -691,9 +719,7 @@ pub fn save_multi_indexes(path: &Path, records: &[MultiIndexRecord]) -> io::Resu
         }
         out.push('\n');
     }
-    let tmp = path.with_extension("midx.tmp");
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, path)?;
+    write_checked(path, &out)?;
     Ok(())
 }
 
@@ -703,10 +729,8 @@ pub fn save_multi_indexes(path: &Path, records: &[MultiIndexRecord]) -> io::Resu
 ///
 /// Returns an I/O error if the file exists but is unreadable or malformed.
 pub fn load_multi_indexes(path: &Path) -> io::Result<Vec<MultiIndexRecord>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(text) = read_checked(path)? else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for line in text.lines() {
