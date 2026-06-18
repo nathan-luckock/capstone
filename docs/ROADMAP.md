@@ -295,6 +295,17 @@ a strong capstone into something a space company takes seriously.
 
 ### 3A. Radiation-realistic fault rates
 
+**Status: substantially shipped.** The simulator is already driven by a named
+orbit's representative single-event-upset rate (`radiation.rs`,
+`expected_upsets_per_day(bytes, orbit)` for low Earth and geostationary orbit),
+and `vecsim --irradiate <count> <orbit_days> <orbit>` runs at any multiple of the
+expected daily dose by scaling the dwell, which is exactly the "one, ten, one
+hundred times the rate" sweep: a 500-workload, 400-day GEO run injected 46,409
+upsets and lost nothing. The honest caveat stays in the module: the exact rate is
+an order-of-magnitude figure for commodity memory, and a real deployment measures
+its own hardware. The remaining refinement is per-part, shielding-aware rates,
+which only a specific flight build can supply.
+
 Parameterize the simulator by real upset rates instead of arbitrary ones.
 
 - **Build:** drive the bit-flip injector from published single-event-upset rates
@@ -344,6 +355,16 @@ is the remaining piece.
   does it.
 
 ### 3D. Partition and power tolerance
+
+**Status: power loss is covered; partition arrives with replication.** Power loss
+mid-operation is exactly the crash-with-partial-fsync model the engine is built
+around: the 100,000-seed deterministic simulation (only `fsync`-ed writes survive)
+and the now-model-checked WAL ordering invariant prove a brownout never loses a
+committed write or serves a torn one. Network partition is not meaningful for a
+single unreachable node that serves locally and ships snapshots; it becomes real
+only once there is a multi-node replica to diverge from, so it is folded into the
+replication work (the streaming, metadata-logged path noted under backup and PITR)
+rather than built ahead of it.
 
 For intermittent ground links and constrained power, prove behavior under the
 remaining space realities.
