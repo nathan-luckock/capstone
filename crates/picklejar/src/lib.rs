@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod certify;
 pub mod correlated;
 pub mod database;
 pub mod error;
