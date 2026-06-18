@@ -270,6 +270,12 @@ pub enum TokenKind {
     Arrow,
     /// `->>` (JSON get, returning text)
     ArrowText,
+    /// `<->` (vector L2 / Euclidean distance)
+    VecL2,
+    /// `<=>` (vector cosine distance)
+    VecCosine,
+    /// `<#>` (vector negative inner product)
+    VecInner,
     /// End of input.
     Eof,
 }

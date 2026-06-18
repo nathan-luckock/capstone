@@ -77,7 +77,12 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
         | BinOp::Mul
         | BinOp::Div
         | BinOp::JsonGet
-        | BinOp::JsonGetText => UNKNOWN_SELECTIVITY,
+        | BinOp::JsonGetText
+        // Vector distance yields a FLOAT, not a boolean, so as a bare predicate
+        // it carries no selectivity information.
+        | BinOp::VecL2
+        | BinOp::VecCosine
+        | BinOp::VecInner => UNKNOWN_SELECTIVITY,
     }
 }
 

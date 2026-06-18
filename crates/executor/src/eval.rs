@@ -488,8 +488,84 @@ fn eval_binary(
         BinOp::Like => like(&l, &r),
         BinOp::Concat => Ok(Value::Text(value_text(&l) + &value_text(&r))),
         BinOp::JsonGet | BinOp::JsonGetText => json_get(&l, &r, op == BinOp::JsonGetText),
+        BinOp::VecL2 | BinOp::VecCosine | BinOp::VecInner => vector_distance(op, &l, &r),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// Read a value as a vector of `f32` components, accepting either a `VECTOR`
+/// value or a text literal in the bracketed `[a,b,c]` form (so a query vector can
+/// be written inline as a string).
+fn as_vector(v: &Value) -> Result<Vec<f32>> {
+    match v {
+        Value::Vector(x) => Ok(x.clone()),
+        Value::Text(s) => picklejar_sql::ast::parse_vector(s)
+            .ok_or_else(|| ExecError::Type(format!("not a vector literal: {s:?}"))),
+        other => Err(ExecError::Type(format!(
+            "a vector distance operator needs a vector operand, found {other:?}"
+        ))),
+    }
+}
+
+/// Evaluate a vector distance operator to a `FLOAT`. Following pgvector:
+/// `<->` is L2 (Euclidean) distance, `<=>` is cosine distance
+/// (`1 - cosine similarity`), and `<#>` is the negative inner product (negated so
+/// ascending order ranks the most similar first). Both operands must share a
+/// dimension.
+fn vector_distance(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
+    let a = as_vector(left)?;
+    let b = as_vector(right)?;
+    if a.len() != b.len() {
+        return Err(ExecError::Type(format!(
+            "vector distance needs equal dimensions, got {} and {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    // Accumulate in f64 to keep the sums well-conditioned for long vectors.
+    let dist = match op {
+        BinOp::VecL2 => a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| {
+                let d = f64::from(*x) - f64::from(*y);
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt(),
+        BinOp::VecCosine => {
+            let dot: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                .sum();
+            let na: f64 = a.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+            let nb: f64 = b.iter().map(|y| f64::from(*y) * f64::from(*y)).sum();
+            let denom = na.sqrt() * nb.sqrt();
+            if denom == 0.0 {
+                // Cosine is undefined for a zero vector; define two zeros as
+                // identical (0) and a zero against a real vector as maximally
+                // dissimilar (1), so the result stays in the usual [0, 2] range.
+                if na == 0.0 && nb == 0.0 {
+                    0.0
+                } else {
+                    1.0
+                }
+            } else {
+                1.0 - dot / denom
+            }
+        }
+        BinOp::VecInner => {
+            let dot: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                .sum();
+            -dot
+        }
+        _ => unreachable!("vector_distance only handles the vector operators"),
+    };
+    Ok(Value::Float(dist))
 }
 
 /// `json -> key` / `json ->> key`: navigate a JSON value by a text member name
