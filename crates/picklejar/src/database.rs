@@ -43,6 +43,7 @@ use picklejar_sql::statement::{
     TableConstraint, TableRef,
 };
 use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
+use picklejar_storage::page::Page;
 use picklejar_storage::{BufferPool, FileManager, PageId};
 use picklejar_txn::{MvccTable, Transaction, TransactionManager};
 use picklejar_wal::{WalSyncHandle, WalWriter};
@@ -227,6 +228,11 @@ pub struct Database {
     /// Sidecar file recording the variable-key (`CREATE INDEX`) secondary
     /// indexes (their roots and columns).
     midx_path: PathBuf,
+    /// The heap data file (the `base` passed to [`Self::open`]).
+    db_path: PathBuf,
+    /// Sidecar file holding the Reed-Solomon parity that [`Self::protect`] writes
+    /// and [`Self::open_resilient`] heals corrupt heap pages from.
+    parity_path: PathBuf,
     /// When on, a `SELECT ... ORDER BY col <op> :q LIMIT k` over a vector column
     /// (with no WHERE, join, or grouping, and where row-level security does not
     /// apply) is served from an HNSW index instead of an exact scan. Off by
@@ -240,6 +246,19 @@ pub struct Database {
     /// reuse an index it was itself permitted to build, never one another role
     /// built; keying by metric means an L2 index is never reused for a cosine query.
     vector_index_cache: HashMap<(String, String, String, Metric), CachedVectorIndex>,
+}
+
+/// A summary of a [`Database::protect`] call: what the parity snapshot covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectReport {
+    /// Heap pages captured in the snapshot.
+    pub protected_pages: u64,
+    /// Data shards per stripe (`k`).
+    pub data_shards: usize,
+    /// Parity shards per stripe (`m`): the most bad pages per stripe that heal.
+    pub parity_shards: usize,
+    /// Size of the parity sidecar on disk.
+    pub parity_bytes: u64,
 }
 
 impl std::fmt::Debug for Database {
@@ -374,6 +393,8 @@ impl Database {
         let acl_path = base.with_extension("acl");
         let pol_path = base.with_extension("pol");
         let midx_path = base.with_extension("midx");
+        let parity_path = base.with_extension("parity");
+        let db_path = base.to_path_buf();
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -400,6 +421,8 @@ impl Database {
             rls: HashMap::new(),
             pol_path,
             midx_path,
+            db_path,
+            parity_path,
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
         };
@@ -419,6 +442,71 @@ impl Database {
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
         db.mgr.recover(next_xid, &aborted);
         Ok(db)
+    }
+
+    /// Open a database, first healing any heap page whose checksum fails from the
+    /// Reed-Solomon parity sidecar that [`Self::protect`] wrote, if one exists.
+    ///
+    /// This is the transparent self-heal entry point for a node nobody can reach:
+    /// a page corrupted by radiation or bit-rot is reconstructed from parity
+    /// *before* the buffer pool (which refuses a corrupt page) ever reads it, and
+    /// WAL recovery then replays anything committed since the parity snapshot. With
+    /// no parity sidecar present it behaves exactly like [`Self::open`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parity sidecar is present but unusable (a corrupt
+    /// header), or if the database cannot be opened.
+    pub fn open_resilient(base: impl AsRef<Path>) -> Result<Self> {
+        let base = base.as_ref();
+        let parity_path = base.with_extension("parity");
+        if parity_path.exists() {
+            picklejar_storage::resilience::heal_file(base, &parity_path)?;
+        }
+        Self::open(base)
+    }
+
+    /// Write a Reed-Solomon parity snapshot of the current committed heap to the
+    /// `.parity` sidecar, so a later [`Self::open_resilient`] can reconstruct
+    /// corrupt pages. Each stripe of `k` data pages gains `m` parity pages, which
+    /// tolerates any `m` bad pages per stripe at `m / k` storage overhead, the
+    /// mass-efficient alternative to redundant copies.
+    ///
+    /// The snapshot covers data committed up to this call; later writes are
+    /// crash-covered by the WAL and gain parity at the next `protect`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `k`/`m` are out of range, the heap cannot be read, or
+    /// the sidecar cannot be written.
+    pub fn protect(&mut self, k: usize, m: usize) -> Result<ProtectReport> {
+        self.pool.flush_all()?;
+        let count = self.pool.page_count();
+        let mut pages: Vec<Page> = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for id in 0..count {
+            let guard = self.pool.fetch_page(PageId::new(id))?;
+            pages.push(*guard.page());
+        }
+        picklejar_storage::resilience::write_parity(&self.parity_path, &pages, k, m)?;
+        let parity_bytes = std::fs::metadata(&self.parity_path).map_or(0, |meta| meta.len());
+        Ok(ProtectReport {
+            protected_pages: count,
+            data_shards: k,
+            parity_shards: m,
+            parity_bytes,
+        })
+    }
+
+    /// The path of the parity sidecar this database protects to.
+    #[must_use]
+    pub fn parity_path(&self) -> &Path {
+        &self.parity_path
+    }
+
+    /// The heap data file path.
+    #[must_use]
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Rebuild the catalog and table descriptors from the sidecar so the
