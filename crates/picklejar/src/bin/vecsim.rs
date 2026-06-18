@@ -24,8 +24,8 @@ fn main() -> ExitCode {
         return match run_seed(seed) {
             Ok(o) => {
                 println!(
-                    "seed {seed}: OK  tenants={} committed={} rolled_back={}",
-                    o.tenants, o.committed, o.rolled_back
+                    "seed {seed}: OK  tenants={} committed={} rolled_back={} live={}",
+                    o.tenants, o.committed, o.rolled_back, o.live
                 );
                 ExitCode::SUCCESS
             }
@@ -38,10 +38,10 @@ fn main() -> ExitCode {
 
     let count: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
     println!("running {count} deterministic vector durability+isolation simulations...");
-    let mut committed_total = 0u64;
+    let mut live_total = 0u64;
     for seed in 0..count {
         match run_seed(seed) {
-            Ok(o) => committed_total += o.committed as u64,
+            Ok(o) => live_total += o.live as u64,
             Err(e) => {
                 eprintln!("FAIL {e}");
                 eprintln!("reproduce with: cargo run --bin vecsim -- --seed {seed}");
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "all {count} seeds recovered with isolation intact ({committed_total} embeddings verified)"
+        "all {count} seeds recovered with isolation intact ({live_total} live embeddings verified)"
     );
     ExitCode::SUCCESS
 }
