@@ -227,6 +227,12 @@ pub struct Database {
     /// Sidecar file recording the variable-key (`CREATE INDEX`) secondary
     /// indexes (their roots and columns).
     midx_path: PathBuf,
+    /// When on, a `SELECT ... ORDER BY col <op> :q LIMIT k` over a vector column
+    /// (with no WHERE, join, or grouping, and where row-level security does not
+    /// apply) is served from an HNSW index instead of an exact scan. Off by
+    /// default, so the exact path stays the default and approximate results are an
+    /// explicit opt-in.
+    vector_index_on: bool,
 }
 
 impl std::fmt::Debug for Database {
@@ -235,6 +241,84 @@ impl std::fmt::Debug for Database {
         f.debug_struct("Database")
             .field("tables", &self.tables.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
+    }
+}
+
+/// Match an `ORDER BY` item against the `col <vector-op> <vector-literal>` shape
+/// the HNSW index path accepts, returning the column name, distance metric, and
+/// query vector. Returns `None` for anything else (a descending sort, a non-vector
+/// operator, a non-column left side, or a right side that is not a vector literal).
+fn match_knn_order(order: &OrderItem) -> Option<(String, crate::hnsw::Metric, Vec<f32>)> {
+    use crate::hnsw::Metric;
+    if order.desc {
+        return None;
+    }
+    let Expr::Binary { op, left, right } = &order.expr else {
+        return None;
+    };
+    let metric = match op {
+        BinOp::VecL2 => Metric::L2,
+        BinOp::VecCosine => Metric::Cosine,
+        BinOp::VecInner => Metric::InnerProduct,
+        BinOp::VecL1 => Metric::L1,
+        _ => return None,
+    };
+    let col = match left.as_ref() {
+        Expr::Column(c) | Expr::QualifiedColumn(_, c) => c.clone(),
+        _ => return None,
+    };
+    let query = match right.as_ref() {
+        Expr::Literal(Value::Vector(v)) => v.clone(),
+        Expr::Literal(Value::Text(t)) => picklejar_sql::ast::parse_vector(t)?,
+        _ => return None,
+    };
+    Some((col, metric, query))
+}
+
+/// The output shape of an index-served `SELECT`: either every column (`*`) or a
+/// fixed list of source-column indexes with their output names.
+enum Projection {
+    Star,
+    Columns(Vec<(usize, String)>),
+}
+
+impl Projection {
+    /// Resolve a projection list against the table's columns, or `None` if it is
+    /// anything richer than `*` or plain column references (which the index path
+    /// declines so the exact evaluator can handle it).
+    fn resolve(items: &[SelectItem], columns: &[String]) -> Option<Self> {
+        if items.len() == 1 && matches!(items[0], SelectItem::Star) {
+            return Some(Self::Star);
+        }
+        let mut picked = Vec::with_capacity(items.len());
+        for item in items {
+            let SelectItem::Expr(expr, alias) = item else {
+                return None;
+            };
+            let name = match expr {
+                Expr::Column(c) | Expr::QualifiedColumn(_, c) => c.clone(),
+                _ => return None,
+            };
+            let idx = columns.iter().position(|c| *c == name)?;
+            picked.push((idx, alias.clone().unwrap_or(name)));
+        }
+        Some(Self::Columns(picked))
+    }
+
+    /// The names of the output columns for this projection.
+    fn output_columns(&self, columns: &[String]) -> Vec<String> {
+        match self {
+            Self::Star => columns.to_vec(),
+            Self::Columns(picked) => picked.iter().map(|(_, name)| name.clone()).collect(),
+        }
+    }
+
+    /// Project one source row into the output row this projection describes.
+    fn project(&self, row: &[Value]) -> Vec<Value> {
+        match self {
+            Self::Star => row.to_vec(),
+            Self::Columns(picked) => picked.iter().map(|(i, _)| row[*i].clone()).collect(),
+        }
     }
 }
 
@@ -282,6 +366,7 @@ impl Database {
             rls: HashMap::new(),
             pol_path,
             midx_path,
+            vector_index_on: false,
         };
         db.load_catalog()?;
         db.load_views()?;
@@ -749,6 +834,13 @@ impl Database {
             } => self.alter_table(table, action),
             // EXPLAIN plans; EXPLAIN ANALYZE also runs the query.
             Statement::Explain { .. } => self.run_explain(&stmt),
+            // A pure nearest-neighbor `SELECT` may be served from the HNSW index
+            // when that path is enabled. Anything the index path declines (the
+            // common case, and every RLS-fenced query, which now carries a folded
+            // WHERE) falls through to the exact, transactional path below.
+            Statement::Select(ref s) if self.vector_index_on => self
+                .run_vector_index_select(s)?
+                .map_or_else(|| self.run_in_txn(&stmt), Ok),
             // DML and SELECT run inside the open transaction, or a fresh
             // auto-commit one. `expand_ctes` inlined any non-recursive WITH;
             // only a recursive WITH reaches here, evaluated against a snapshot.
@@ -867,6 +959,109 @@ impl Database {
             .into_iter()
             .map(|(id, _)| rows[node_to_row[id]].clone())
             .collect())
+    }
+
+    /// Turn the HNSW index path for vector `ORDER BY ... LIMIT` queries on or off.
+    /// It is off by default, so the exact scan stays the default and serving an
+    /// approximate result is always an explicit opt-in.
+    pub fn set_vector_index(&mut self, on: bool) {
+        self.vector_index_on = on;
+    }
+
+    /// Whether the HNSW index path is currently enabled.
+    #[must_use]
+    pub const fn vector_index_enabled(&self) -> bool {
+        self.vector_index_on
+    }
+
+    /// If `s` is a pure nearest-neighbor query this engine can serve from an HNSW
+    /// index, build the index over the visible rows, search it, and return the
+    /// projected rows. Otherwise return `None` so the caller runs the exact path.
+    ///
+    /// The accepted shape is deliberately narrow: a single base table; no WHERE,
+    /// join, grouping, DISTINCT, or OFFSET; an ORDER BY of exactly one ascending
+    /// `col <vector-op> <vector-literal>`; a LIMIT; and a projection that is `*`
+    /// or a list of plain column references. Row-level security is folded into a
+    /// WHERE before this runs, so an RLS-protected query always carries a WHERE
+    /// and never matches here; it falls through to the exact, fenced path. The
+    /// candidate rows are fetched through the engine's own `SELECT`, which
+    /// enforces table permissions, so this path cannot read rows the role could
+    /// not already read.
+    fn run_vector_index_select(&mut self, s: &Select) -> Result<Option<QueryOutcome>> {
+        // Structural gate: only the bare KNN shape is eligible.
+        if !s.joins.is_empty()
+            || s.where_clause.is_some()
+            || !s.group_by.is_empty()
+            || s.having.is_some()
+            || s.distinct
+            || s.offset.is_some()
+            || s.from.subquery.is_some()
+            || s.from.name.is_empty()
+            || s.order_by.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(limit) = s.limit else {
+            return Ok(None);
+        };
+        let k = usize::try_from(limit).unwrap_or(usize::MAX);
+        let Some((col, metric, query)) = match_knn_order(&s.order_by[0]) else {
+            return Ok(None);
+        };
+
+        // Fetch the visible rows through the engine's own SELECT. Permissions are
+        // enforced there, and since no RLS applies (a folded WHERE would have
+        // disqualified this shape) it returns every row of the table.
+        let QueryOutcome::Rows { columns, rows } =
+            self.execute(&format!("SELECT * FROM {}", s.from.name))?
+        else {
+            return Ok(None);
+        };
+        let Some(col_idx) = columns.iter().position(|c| *c == col) else {
+            return Ok(None);
+        };
+        let Some(projection) = Projection::resolve(&s.projections, &columns) else {
+            return Ok(None);
+        };
+        let out_columns = projection.output_columns(&columns);
+
+        // Determine the vector width from the first row that carries one. With no
+        // vectors the answer is empty, exactly as the exact path would return.
+        let Some(dim) = rows.iter().find_map(|r| match r.get(col_idx) {
+            Some(Value::Vector(v)) => Some(v.len()),
+            _ => None,
+        }) else {
+            return Ok(Some(QueryOutcome::Rows {
+                columns: out_columns,
+                rows: Vec::new(),
+            }));
+        };
+        // A dimension mismatch is a query error; let the exact path raise it so
+        // the message and behavior match the non-indexed path exactly.
+        if query.len() != dim {
+            return Ok(None);
+        }
+
+        let mut index = Hnsw::new_with_metric(dim, 16, 200, 0x5EED_15A1, metric);
+        let mut node_to_row: Vec<usize> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(Value::Vector(v)) = r.get(col_idx) {
+                if v.len() == dim {
+                    index.insert(v.clone());
+                    node_to_row.push(i);
+                }
+            }
+        }
+        let ef = k.max(64).saturating_mul(2);
+        let out_rows = index
+            .search(&query, k, ef)
+            .into_iter()
+            .map(|(id, _)| projection.project(&rows[node_to_row[id]]))
+            .collect();
+        Ok(Some(QueryOutcome::Rows {
+            columns: out_columns,
+            rows: out_rows,
+        }))
     }
 
     /// The role the session authenticated as (`session_user`).
