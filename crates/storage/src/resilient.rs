@@ -205,6 +205,37 @@ impl ResilientStore {
         &self.log
     }
 
+    /// Number of blobs stored.
+    #[must_use]
+    pub fn blob_count(&self) -> usize {
+        self.blobs.len()
+    }
+
+    /// Total bytes resident on the device: every framed shard of every blob,
+    /// including parity. This is the physical footprint radiation acts on, the
+    /// figure that sets the dose in a simulation.
+    #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.blobs
+            .values()
+            .flat_map(|shards| shards.iter())
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// The number of shards per blob, `k + m`.
+    #[must_use]
+    pub const fn shards_per_blob(&self) -> usize {
+        self.k + self.m
+    }
+
+    /// The parity count `m`: the most shards of one blob that can be lost and
+    /// still recovered.
+    #[must_use]
+    pub const fn parity(&self) -> usize {
+        self.m
+    }
+
     /// Overwrite one shard of one blob with `bytes`, for tests and fault drills.
     /// A real deployment never calls this; radiation does it instead.
     pub fn corrupt_shard(&mut self, key: u64, shard: usize, bytes: &[u8]) {

@@ -138,6 +138,7 @@ cargo run --release --bin vecsim -- --irradiate 10000 365 geo   # irradiate a ye
 cargo run --release --bin vecbench                   # HNSW vs brute-force speedup and recall
 cargo run --release --bin vecsqlbench                # cached SQL index path vs exact scan
 cargo run --release --bin resilientdemo              # erasure-coded self-healing corruption drill
+cargo run --release --bin resilientsim               # years of orbital radiation vs scrub cadence
 cargo run --release --bin vecert                     # the regenerable reliability certificate
 ```
 
