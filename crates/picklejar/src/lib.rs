@@ -17,7 +17,7 @@ pub mod radiation;
 pub mod security;
 pub mod vecsim;
 
-pub use database::{Database, ProtectReport, QueryOutcome};
+pub use database::{BackupReport, Database, ProtectReport, QueryOutcome};
 pub use error::{DbError, Result};
 
 // Re-export the value and type vocabulary so callers (the CLI, a future HTTP
