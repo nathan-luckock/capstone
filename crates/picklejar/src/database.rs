@@ -5055,6 +5055,7 @@ fn csv_field_from_value(value: &Value) -> String {
         Value::Date(days) => picklejar_sql::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
         Value::Decimal(m, s) => picklejar_sql::decimal::format(*m, *s),
+        Value::Vector(v) => picklejar_sql::ast::format_vector(v),
         Value::Text(s) | Value::Json(s) => s.clone(),
     }
 }
@@ -5106,6 +5107,10 @@ fn value_from_csv_field(field: &str, ty: DataType) -> Result<Value> {
                 .ok_or_else(|| DbError::Constraint(format!("invalid decimal in CSV: {field:?}")))?;
             Value::Decimal(m, s)
         }
+        DataType::Vector(_) => Value::Vector(
+            picklejar_sql::ast::parse_vector(field)
+                .ok_or_else(|| DbError::Constraint(format!("invalid vector in CSV: {field:?}")))?,
+        ),
         DataType::Text => Value::Text(field.to_string()),
     })
 }
@@ -5195,6 +5200,12 @@ fn stat_key(value: &Value) -> Vec<u8> {
             b.push(6);
             b.extend_from_slice(&n.to_le_bytes());
         }
+        Value::Vector(v) => {
+            b.push(10);
+            for x in v {
+                b.extend_from_slice(&x.to_bits().to_le_bytes());
+            }
+        }
     }
     b
 }
@@ -5233,6 +5244,7 @@ const fn sql_type_name(ty: DataType) -> &'static str {
         DataType::Timestamp => "timestamp without time zone",
         DataType::Json => "json",
         DataType::Decimal => "numeric",
+        DataType::Vector(_) => "vector",
     }
 }
 
@@ -5652,8 +5664,34 @@ fn coerce_value(value: Value, ty: DataType) -> Result<Value> {
                 .map(|(m, sc)| Value::Decimal(m, sc))
                 .ok_or_else(|| DbError::Constraint(format!("invalid decimal {text:?}")))
         }
+        // A text literal into a VECTOR column is parsed from its `[a,b,c]` form,
+        // then width-checked against the column's declared dimension.
+        (Value::Text(s), DataType::Vector(dim)) => {
+            let v = picklejar_sql::ast::parse_vector(s)
+                .ok_or_else(|| DbError::Constraint(format!("invalid vector literal {s:?}")))?;
+            check_vector_dim(&v, dim)?;
+            Ok(Value::Vector(v))
+        }
+        // A vector value already of the right kind still has to match the
+        // declared width.
+        (Value::Vector(v), DataType::Vector(dim)) => {
+            check_vector_dim(v, dim)?;
+            Ok(value)
+        }
         _ => Ok(value),
     }
+}
+
+/// Validate a vector's length against a column's declared dimension. A declared
+/// dimension of `0` means the column is width-agnostic and accepts any length.
+fn check_vector_dim(v: &[f32], dim: u32) -> Result<()> {
+    if dim != 0 && v.len() != dim as usize {
+        return Err(DbError::Constraint(format!(
+            "vector has {} dimensions, column expects {dim}",
+            v.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Evaluate a constant expression (an `INSERT` value) with no row context.
@@ -5859,6 +5897,77 @@ mod tests {
             QueryOutcome::Rows { columns, rows } => (columns, rows),
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    // --- VECTOR columns ---
+
+    #[test]
+    fn vector_column_round_trips() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE docs (id INT, embedding VECTOR(3))")
+            .unwrap();
+        // A typed VECTOR literal and a bare text literal both reach the column.
+        db.execute("INSERT INTO docs VALUES (1, VECTOR '[1, 2, 3]')")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (2, '[4, 5, 6]')")
+            .unwrap();
+        let (_, rows) = query(&mut db, "SELECT embedding FROM docs ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Vector(vec![1.0, 2.0, 3.0])],
+                vec![Value::Vector(vec![4.0, 5.0, 6.0])],
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_dimension_mismatch_is_rejected() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE docs (id INT, embedding VECTOR(3))")
+            .unwrap();
+        let err = db
+            .execute("INSERT INTO docs VALUES (1, '[1, 2]')")
+            .unwrap_err();
+        assert!(matches!(err, DbError::Constraint(m) if m.contains("dimensions")));
+    }
+
+    #[test]
+    fn dimensionless_vector_accepts_any_width() {
+        let (_dir, mut db) = db();
+        // No declared dimension: the column accepts vectors of any length.
+        db.execute("CREATE TABLE docs (id INT, embedding VECTOR)")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, '[1, 2]')").unwrap();
+        db.execute("INSERT INTO docs VALUES (2, '[3, 4, 5, 6]')")
+            .unwrap();
+        let (_, rows) = query(&mut db, "SELECT embedding FROM docs ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Vector(vec![1.0, 2.0])],
+                vec![Value::Vector(vec![3.0, 4.0, 5.0, 6.0])],
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_column_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vec.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE docs (id INT, embedding VECTOR(3))")
+                .unwrap();
+            db.execute("INSERT INTO docs VALUES (1, '[0.5, -1, 2]')")
+                .unwrap();
+        }
+        // The declared dimension and stored components both reload.
+        let mut db = Database::open(&path).expect("reopen");
+        let (_, rows) = query(&mut db, "SELECT embedding FROM docs");
+        assert_eq!(rows, vec![vec![Value::Vector(vec![0.5, -1.0, 2.0])]]);
+        // The reloaded column still enforces its width.
+        assert!(db.execute("INSERT INTO docs VALUES (2, '[1, 2]')").is_err());
     }
 
     fn names(cols: &[String]) -> Vec<&str> {

@@ -36,6 +36,7 @@ const fn value_type_name(v: &Value) -> &'static str {
         Value::Timestamp(_) => "TIMESTAMP",
         Value::Json(_) => "JSON",
         Value::Decimal(..) => "DECIMAL",
+        Value::Vector(_) => "VECTOR",
         Value::Null => "NULL",
     }
 }
@@ -51,6 +52,7 @@ const fn data_type_name(t: DataType) -> &'static str {
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
         DataType::Decimal => "DECIMAL",
+        DataType::Vector(_) => "VECTOR",
     }
 }
 
@@ -104,6 +106,18 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>> {
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(s.as_bytes());
+            }
+            // VECTOR stores a u32 component count then that many little-endian f32s.
+            Value::Vector(v) if matches!(ty, DataType::Vector(_)) => {
+                let len = u32::try_from(v.len()).map_err(|_| ExecError::RowType {
+                    column: i,
+                    expected: data_type_name(ty),
+                    found: "oversized VECTOR",
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                for x in v {
+                    bytes.extend_from_slice(&x.to_le_bytes());
+                }
             }
             other => {
                 return Err(ExecError::RowType {
@@ -188,6 +202,19 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                     Value::Text(s.to_string())
                 });
                 rest = &rest[len..];
+            }
+            DataType::Vector(_) => {
+                let count_bytes = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;
+                let count =
+                    u32::from_le_bytes(count_bytes.try_into().expect("checked 4 bytes")) as usize;
+                rest = &rest[4..];
+                let mut v = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let raw = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;
+                    v.push(f32::from_le_bytes(raw.try_into().expect("checked 4 bytes")));
+                    rest = &rest[4..];
+                }
+                out.push(Value::Vector(v));
             }
         }
     }

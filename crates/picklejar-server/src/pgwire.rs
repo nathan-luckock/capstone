@@ -847,6 +847,8 @@ fn value_text(value: &Value) -> Option<Vec<u8>> {
             Some(picklejar_sql::datetime::format_timestamp(*micros).into_bytes())
         }
         Value::Decimal(m, s) => Some(picklejar_sql::decimal::format(*m, *s).into_bytes()),
+        // Rendered like pgvector's text form, `[1,2,3]`.
+        Value::Vector(v) => Some(picklejar_sql::ast::format_vector(v).into_bytes()),
         Value::Text(s) | Value::Json(s) => Some(s.clone().into_bytes()),
     }
 }

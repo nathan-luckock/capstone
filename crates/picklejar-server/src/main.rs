@@ -168,6 +168,8 @@ fn value_json(v: &Value) -> Json {
         Value::Timestamp(micros) => Json::Str(picklejar_sql::datetime::format_timestamp(*micros)),
         // A number rendered as a JSON number (it is exact base-10 text).
         Value::Decimal(m, s) => Json::Str(picklejar_sql::decimal::format(*m, *s)),
+        // A vector renders as its bracketed text form, `[1,2,3]`.
+        Value::Vector(vec) => Json::Str(picklejar_sql::ast::format_vector(vec)),
         Value::Null => Json::Null,
     }
 }
@@ -208,6 +210,7 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
         DataType::Decimal => "DECIMAL",
+        DataType::Vector(_) => "VECTOR",
     }
 }
 

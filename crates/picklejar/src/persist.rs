@@ -40,16 +40,19 @@ pub struct TableRecord {
     pub next_rowid: u64,
 }
 
-const fn type_tag(t: DataType) -> &'static str {
+fn type_tag(t: DataType) -> String {
     match t {
-        DataType::Int => "INT",
-        DataType::Float => "FLOAT",
-        DataType::Bool => "BOOL",
-        DataType::Text => "TEXT",
-        DataType::Date => "DATE",
-        DataType::Timestamp => "TIMESTAMP",
-        DataType::Json => "JSON",
-        DataType::Decimal => "DECIMAL",
+        DataType::Int => "INT".to_string(),
+        DataType::Float => "FLOAT".to_string(),
+        DataType::Bool => "BOOL".to_string(),
+        DataType::Text => "TEXT".to_string(),
+        DataType::Date => "DATE".to_string(),
+        DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Json => "JSON".to_string(),
+        DataType::Decimal => "DECIMAL".to_string(),
+        // The dimension rides along in the token (whitespace-free) so a reopened
+        // column rebuilds its declared width.
+        DataType::Vector(n) => format!("VECTOR({n})"),
     }
 }
 
@@ -63,7 +66,10 @@ fn parse_type(s: &str) -> Option<DataType> {
         "TIMESTAMP" => Some(DataType::Timestamp),
         "JSON" => Some(DataType::Json),
         "DECIMAL" => Some(DataType::Decimal),
-        _ => None,
+        _ => {
+            let inner = s.strip_prefix("VECTOR(")?.strip_suffix(')')?;
+            Some(DataType::Vector(inner.parse().ok()?))
+        }
     }
 }
 
@@ -79,6 +85,8 @@ fn encode_default(default: Option<&Value>) -> String {
         Some(Value::Date(n)) => format!("d{n}"),
         Some(Value::Timestamp(n)) => format!("t{n}"),
         Some(Value::Decimal(m, scale)) => format!("D{m}v{scale}"),
+        // The component list is already whitespace-free (e.g. `[1,2,3]`).
+        Some(Value::Vector(v)) => format!("V{}", picklejar_sql::ast::format_vector(v)),
         Some(Value::Text(s) | Value::Json(s)) => {
             // Text and JSON share the hex form; the leading tag records which.
             let tag = if matches!(default, Some(Value::Json(_))) {
@@ -115,6 +123,7 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
                 scale.parse().map_err(|_| invalid())?,
             )
         }
+        'V' => Value::Vector(picklejar_sql::ast::parse_vector(rest).ok_or_else(invalid)?),
         's' | 'j' => {
             if rest.len() % 2 != 0 {
                 return Err(invalid());

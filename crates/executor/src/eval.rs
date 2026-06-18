@@ -610,6 +610,14 @@ pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
             }
             _ => return Err(bad()),
         },
+        // A vector casts from its text form (`'[1,2,3]'::vector`) or itself.
+        DataType::Vector(_) => match v {
+            Value::Vector(vec) => Value::Vector(vec.clone()),
+            Value::Text(s) => Value::Vector(
+                picklejar_sql::ast::parse_vector(s).ok_or_else(|| parse_fail("vector", s))?,
+            ),
+            _ => return Err(bad()),
+        },
     };
     Ok(out)
 }
@@ -625,6 +633,7 @@ fn value_text(v: &Value) -> String {
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
         Value::Json(s) => s.clone(),
         Value::Decimal(m, s) => picklejar_sql::decimal::format(*m, *s),
+        Value::Vector(v) => picklejar_sql::ast::format_vector(v),
         Value::Null => String::new(),
     }
 }

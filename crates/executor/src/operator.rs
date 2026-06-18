@@ -1051,6 +1051,15 @@ fn group_key_bytes(values: &[Value]) -> Vec<u8> {
                 b.extend_from_slice(&nm.to_le_bytes());
                 b.extend_from_slice(&ns.to_le_bytes());
             }
+            Value::Vector(v) => {
+                // Group by component bit patterns (grouping vectors is unusual
+                // but must be deterministic).
+                b.push(9);
+                b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                for x in v {
+                    b.extend_from_slice(&x.to_bits().to_le_bytes());
+                }
+            }
         }
     }
     b

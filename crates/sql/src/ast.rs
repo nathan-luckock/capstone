@@ -37,8 +37,39 @@ pub enum Value {
     /// An exact `DECIMAL` / `NUMERIC`, as `(mantissa, scale)`: the value is
     /// `mantissa / 10^scale`.
     Decimal(i128, u32),
+    /// A `VECTOR`: a dense embedding, stored as `f32` components. The AI memory
+    /// layer's core type; similarity is measured with the distance operators.
+    Vector(Vec<f32>),
     /// SQL `NULL`.
     Null,
+}
+
+/// Render a vector's components in the canonical `[1,2,3]` form `pgvector` uses.
+#[must_use]
+pub fn format_vector(v: &[f32]) -> String {
+    let mut out = String::from("[");
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&x.to_string());
+    }
+    out.push(']');
+    out
+}
+
+/// Parse the `pgvector` text form `[1,2,3]` into components. Returns `None` if
+/// the brackets are missing or a component is not a number.
+#[must_use]
+pub fn parse_vector(text: &str) -> Option<Vec<f32>> {
+    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|component| component.trim().parse::<f32>().ok())
+        .collect()
 }
 
 impl PartialEq for Value {
@@ -54,6 +85,10 @@ impl PartialEq for Value {
             // Decimals are equal by value, so 12.30 and 12.3 group together.
             (Self::Decimal(am, asc), Self::Decimal(bm, bsc)) => {
                 crate::decimal::compare(*am, *asc, *bm, *bsc) == std::cmp::Ordering::Equal
+            }
+            // Bit-equality per component keeps `Eq` reflexive (like `Float`).
+            (Self::Vector(a), Self::Vector(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
             }
             (Self::Null, Self::Null) => true,
             _ => false,
@@ -97,6 +132,8 @@ impl fmt::Display for Value {
             Self::Json(s) => write!(f, "'{}'::json", s.replace('\'', "''")),
             // Typed-literal form, so the exact value re-parses (no float detour).
             Self::Decimal(m, s) => write!(f, "DECIMAL '{}'", crate::decimal::format(*m, *s)),
+            // Typed-literal form so `parse(print(v)) == v`.
+            Self::Vector(v) => write!(f, "VECTOR '{}'", format_vector(v)),
             Self::Null => write!(f, "NULL"),
         }
     }
