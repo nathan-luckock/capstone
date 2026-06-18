@@ -71,6 +71,11 @@ pub enum PageType {
     BTreeLeaf = 3,
     /// Overflow page (for tuples larger than ~`PAGE_SIZE`/4).
     Overflow = 4,
+    /// Variable-length-key B+ tree leaf node (secondary indexes over arbitrary
+    /// and composite keys; see [`crate::varbtree`]).
+    BTreeVarLeaf = 5,
+    /// Variable-length-key B+ tree internal node.
+    BTreeVarInternal = 6,
 }
 
 impl PageType {
@@ -81,6 +86,8 @@ impl PageType {
             2 => Ok(Self::BTreeInternal),
             3 => Ok(Self::BTreeLeaf),
             4 => Ok(Self::Overflow),
+            5 => Ok(Self::BTreeVarLeaf),
+            6 => Ok(Self::BTreeVarInternal),
             other => Err(StorageError::InvalidPageType(other)),
         }
     }

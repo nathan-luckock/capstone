@@ -109,6 +109,15 @@ pub enum StorageError {
     /// Caller asked to delete a key that is not present in the B+ tree.
     #[error("B+ tree key not found: {0}")]
     BTreeKeyNotFound(u64),
+
+    /// A variable-length key is too large to fit in a single B+ tree node even
+    /// when the node is otherwise empty.
+    #[error("variable-length B+ tree key too large: {0} bytes")]
+    VarKeyTooLarge(usize),
+
+    /// Caller tried to insert a duplicate key into a variable-length B+ tree.
+    #[error("duplicate variable-length B+ tree key")]
+    DuplicateVarKey,
 }
 
 /// Convenience alias for results returned by the storage layer.
