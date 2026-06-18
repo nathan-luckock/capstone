@@ -209,6 +209,10 @@ impl Certificate {
         // a silently wrong embedding and never leaks another tenant's row.
         checks.push(irradiated_memory_layer());
 
+        // Self-healing storage: erasure-coded blobs survive and repair any m bad
+        // shards, the mass-efficient redundancy that replaces heavy hardware copies.
+        checks.push(erasure_self_heal());
+
         Self { checks }
     }
 
@@ -244,8 +248,9 @@ impl Certificate {
         let mut s = String::new();
         s.push_str("PICKLEJAR AI MEMORY LAYER RELIABILITY CERTIFICATE\n");
         s.push_str("fault model: single-event upsets injected into the serialized index, into\n");
-        s.push_str("      whole-store pages through SQL, and into an irradiated multi-tenant\n");
-        s.push_str("      workload at an orbit's upset rate\n");
+        s.push_str("      whole-store pages through SQL, into an irradiated multi-tenant\n");
+        s.push_str("      workload at an orbit's upset rate, and into erasure-coded shards that\n");
+        s.push_str("      self-heal from parity\n");
         s.push_str("method: deterministic, every check reproducible from a fixed seed\n");
         s.push_str("note: crash durability (100k sims) and tenant isolation are certified\n");
         s.push_str("      separately and at larger scale by the `dst` and `vecsim` binaries\n");
@@ -516,6 +521,73 @@ fn irradiated_memory_layer() -> Check {
             orbit.name()
         ),
         passed: violated == 0,
+    }
+}
+
+/// Self-healing storage, certified: erasure-code a batch of blobs, corrupt up to
+/// the parity limit of shards in each, and require every blob to come back
+/// byte-for-byte correct after repair from redundancy, with none served wrong.
+/// This is the mass-efficient redundancy that lets a node carry commodity storage
+/// and heal it in software instead of launching heavy redundant hardware.
+fn erasure_self_heal() -> Check {
+    use picklejar_storage::resilient::ResilientStore;
+    let (k, m) = (10usize, 4usize);
+    let Ok(mut store) = ResilientStore::new(k, m) else {
+        return Check {
+            name: "self-healing storage (erasure)".into(),
+            detail: "could not build the k=10, m=4 code".into(),
+            passed: false,
+        };
+    };
+    let blobs = 64u64;
+    let blob = |key: u64| -> Vec<u8> {
+        let len = 200 + usize::try_from(key % 5).unwrap_or(0) * 40;
+        (0..len)
+            .map(|i| u8::try_from((i as u64 ^ key) & 0xFF).expect("masked"))
+            .collect()
+    };
+    for key in 0..blobs {
+        if store.put(key, &blob(key)).is_err() {
+            return Check {
+                name: "self-healing storage (erasure)".into(),
+                detail: "encode failed".into(),
+                passed: false,
+            };
+        }
+    }
+
+    // Corrupt up to m shards in each blob, the way single-event upsets would.
+    let mut rng = Rng::new(0x5E1F_4EA1);
+    let total = u64::try_from(k + m).expect("small");
+    let mut injected = 0usize;
+    for key in 0..blobs {
+        let bad = rng.next_u64() % (u64::try_from(m).expect("small") + 1);
+        let mut hit = std::collections::HashSet::new();
+        while u64::try_from(hit.len()).expect("small") < bad {
+            hit.insert(usize::try_from(rng.next_u64() % total).expect("small"));
+        }
+        for &shard in &hit {
+            store.corrupt_shard(key, shard, b"single-event upset");
+            injected += 1;
+        }
+    }
+
+    // Read everything back; it must equal what was stored.
+    let mut wrong = 0usize;
+    for key in 0..blobs {
+        let ok = matches!(store.get(key), Ok(got) if got == blob(key));
+        if !ok {
+            wrong += 1;
+        }
+    }
+    let repaired = store.fault_log().iter().filter(|e| e.repaired).count();
+    Check {
+        name: "self-healing storage (erasure k=10, m=4)".into(),
+        detail: format!(
+            "{blobs} blobs, {injected} shard upsets injected, {repaired} repaired from parity, \
+             {wrong} served wrong; survives 4 failures at +40% storage vs +400% for copies"
+        ),
+        passed: wrong == 0,
     }
 }
 
