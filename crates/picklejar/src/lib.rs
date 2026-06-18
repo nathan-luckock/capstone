@@ -12,6 +12,7 @@ pub mod index;
 pub mod keyenc;
 pub mod persist;
 pub mod security;
+pub mod vecsim;
 
 pub use database::{Database, QueryOutcome};
 pub use error::{DbError, Result};
