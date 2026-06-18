@@ -642,6 +642,73 @@ pub fn load_rls(path: &Path) -> io::Result<RlsData> {
     Ok(rls)
 }
 
+/// One persisted variable-key (`CREATE INDEX`) secondary index.
+#[derive(Debug, Clone)]
+pub struct MultiIndexRecord {
+    /// The table it indexes.
+    pub table: String,
+    /// The index name.
+    pub name: String,
+    /// Root page of its variable-key B+ tree.
+    pub root: u64,
+    /// Distinct values in the leading column at build time (for the cost model).
+    pub distinct: u64,
+    /// The indexed column names, in index order.
+    pub columns: Vec<String>,
+}
+
+/// Persist the variable-key secondary indexes, one per line, atomically:
+/// `table name root distinct col1 col2 ...`.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_multi_indexes(path: &Path, records: &[MultiIndexRecord]) -> io::Result<()> {
+    let mut out = String::new();
+    for r in records {
+        let _ = write!(out, "{} {} {} {}", r.table, r.name, r.root, r.distinct);
+        for col in &r.columns {
+            let _ = write!(out, " {col}");
+        }
+        out.push('\n');
+    }
+    let tmp = path.with_extension("midx.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the variable-key secondary indexes. An absent file yields an empty list.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but is unreadable or malformed.
+pub fn load_multi_indexes(path: &Path) -> io::Result<Vec<MultiIndexRecord>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        if toks.len() < 5 {
+            return Err(invalid());
+        }
+        out.push(MultiIndexRecord {
+            table: toks[0].to_string(),
+            name: toks[1].to_string(),
+            root: parse_u64(toks[2])?,
+            distinct: parse_u64(toks[3])?,
+            columns: toks[4..].iter().map(|s| (*s).to_string()).collect(),
+        });
+    }
+    Ok(out)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }

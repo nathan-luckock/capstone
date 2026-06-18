@@ -119,12 +119,18 @@ tour, see the [README](../README.md).
 - **Storage** - 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree primary
   index, secondary indexes, and CRC32 page checksums.
 - **Indexes** - a unique column of an order-preserving fixed type (`INT`,
-  `DATE`, `TIMESTAMP`, `BOOL`) gets a physical secondary B+ tree. Because the
-  key map is bijective and order-preserving, the planner can drive both a point
-  get (`col = x`) and a range scan (`col > x`, `col BETWEEN a AND b`) off it, and
-  the cost model chooses the index whenever it beats a full scan. Every index
-  hit is a candidate that the executor re-checks against the predicate, so a
-  stale or out-of-snapshot entry is filtered, never returned.
+  `DATE`, `TIMESTAMP`, `BOOL`) gets a physical secondary B+ tree automatically,
+  and `CREATE INDEX` builds one over any indexable column, including `TEXT` and
+  **non-unique** columns, through a second, variable-length-key B+ tree. The key
+  is the column value encoded order-preservingly plus the row id, so repeated
+  values produce distinct keys and a value lookup is a prefix range scan that
+  returns every matching row. Because the key map is order-preserving, the
+  planner drives both a point get (`col = x`) and a range scan (`col > x`,
+  `col BETWEEN a AND b`) off either index, and the cost model chooses it whenever
+  it beats a full scan. Every index hit is a candidate the executor re-checks
+  against the predicate, so a stale or out-of-snapshot entry is filtered, never
+  returned. (`FLOAT` / `DECIMAL` are not keyed; such a column falls back to a
+  sequential scan.)
 - **Concurrency control** - MVCC with snapshot isolation and version chains.
 - **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
