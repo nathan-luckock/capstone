@@ -207,6 +207,15 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
 ///
 /// Returns an I/O error if the file cannot be written or renamed.
 pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
+    write_checked(path, &serialize(records))
+}
+
+/// Serialize `records` to the catalog body string.
+///
+/// These are the same bytes [`save`] writes under its integrity header, exposed
+/// so the engine can log an identical catalog snapshot to the WAL.
+#[must_use]
+pub fn serialize(records: &[TableRecord]) -> String {
     let mut out = String::new();
     for r in records {
         let _ = write!(
@@ -239,8 +248,21 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
         }
         out.push('\n');
     }
-    write_checked(path, &out)?;
-    Ok(())
+    out
+}
+
+/// Write an already-serialized catalog `body` to `path` under the integrity
+/// header.
+///
+/// Uses the same framing [`save`] does, so the engine can reconstruct the
+/// sidecar from a WAL catalog snapshot on open, making the log authoritative
+/// for the schema.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_serialized(path: &Path, body: &str) -> io::Result<()> {
+    write_checked(path, body)
 }
 
 /// Read records from `path`. An absent file yields an empty list (a brand-new

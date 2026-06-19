@@ -46,7 +46,7 @@ use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use picklejar_storage::page::Page;
 use picklejar_storage::{BufferPool, FileManager, PageId};
 use picklejar_txn::{MvccTable, Transaction, TransactionManager};
-use picklejar_wal::{WalSyncHandle, WalWriter};
+use picklejar_wal::{LogRecord, Lsn, TxnId, WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
 use crate::index::{Index, MultiIndex};
@@ -470,6 +470,16 @@ impl Database {
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
         };
+        // Make the WAL authoritative for the catalog: if the log carries a
+        // catalog snapshot (it does once any schema change has been logged),
+        // rebuild the sidecar from it before loading. This recovers a schema
+        // change whose sidecar write was lost in a crash, and lets a forward
+        // replay reconstruct the schema rather than only the base state.
+        if let Some(snapshot) = picklejar_wal::latest_catalog_snapshot(&wal_path, None)? {
+            if let Ok(body) = std::str::from_utf8(&snapshot) {
+                persist::save_serialized(&db.meta_path, body)?;
+            }
+        }
         db.load_catalog()?;
         db.load_views()?;
         db.load_constraints()?;
@@ -989,6 +999,22 @@ impl Database {
             })
             .collect();
         persist::save(&self.meta_path, &records)?;
+        // Log the same catalog snapshot to the WAL so forward replay can
+        // reconstruct the schema as of any LSN, not just the base state. The
+        // record carries a sentinel txn and sits outside the transaction
+        // redo/undo chain (analysis skips it), so it cannot be mistaken for an
+        // uncommitted loser. Fsync it so the schema change is durable in the log
+        // even if the sidecar rename that follows is lost in a crash.
+        {
+            let snapshot = persist::serialize(&records).into_bytes();
+            let mut writer = self.wal.writer();
+            let lsn = writer.append(
+                &LogRecord::Catalog { snapshot },
+                TxnId::new(0),
+                Lsn::INVALID,
+            )?;
+            writer.fsync_through(lsn)?;
+        }
         // Save the transaction watermark (the next xid) and the aborted set, so
         // a reopen knows which past transactions committed.
         persist::save_txn(
@@ -9243,6 +9269,36 @@ mod tests {
         let mut db = Database::open(&path).expect("reopen");
         let (_c, rows) = query(&mut db, "SELECT id FROM users");
         assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn catalog_change_recovers_from_wal_when_sidecar_write_is_lost() {
+        // The WAL is authoritative for the catalog: a schema change that reached
+        // the log is recovered on open even if its sidecar write never landed
+        // (a crash between the durable catalog record and the sidecar rename).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cat.db");
+        let meta_path = path.with_extension("meta");
+        let stale_meta;
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t1 (id INT)").unwrap();
+            // Capture the sidecar with only t1: the state a crash would leave if
+            // t2's sidecar write never reached disk.
+            stale_meta = std::fs::read(&meta_path).expect("read meta");
+            db.execute("CREATE TABLE t2 (id INT, name TEXT)").unwrap();
+            db.execute("INSERT INTO t2 VALUES (1, 'a')").unwrap();
+        }
+        // Roll the sidecar back to the t1-only state, leaving the WAL (which
+        // logged t2's catalog snapshot) intact: exactly the lost-write fault.
+        std::fs::write(&meta_path, &stale_meta).expect("clobber meta");
+
+        // Reopen. The WAL catalog record reconstructs t2's schema and the row
+        // it pointed at comes back.
+        let mut db = Database::open(&path).expect("reopen");
+        let (cols, rows) = query(&mut db, "SELECT id, name FROM t2");
+        assert_eq!(names(&cols), ["id", "name"]);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
     }
 
     #[test]

@@ -57,6 +57,10 @@ pub enum RecordKind {
     Checkpoint = 5,
     /// Compensation log record (written during undo). Sprint 4.
     Clr = 6,
+    /// Full catalog snapshot, written after a schema change so forward
+    /// replay can reconstruct the catalog as of any LSN. Carries the same
+    /// serialized body the `.meta` sidecar holds, as an opaque payload.
+    Catalog = 7,
 }
 
 impl RecordKind {
@@ -69,6 +73,7 @@ impl RecordKind {
             4 => Ok(Self::Abort),
             5 => Ok(Self::Checkpoint),
             6 => Ok(Self::Clr),
+            7 => Ok(Self::Catalog),
             other => Err(WalError::UnknownRecordType(other)),
         }
     }
@@ -119,6 +124,16 @@ pub enum LogRecord {
         /// or [`Lsn::INVALID`](crate::Lsn::INVALID) when nothing remains.
         undo_next: u64,
     },
+    /// Full catalog snapshot written after a schema change. The payload is
+    /// the serialized catalog body (the same bytes the `.meta` sidecar
+    /// holds), stored opaquely. Replay applies the latest snapshot at or
+    /// before the recovery point, which makes the WAL authoritative for the
+    /// schema and lets point-in-time recovery reconstruct schema changes
+    /// rather than only the base state.
+    Catalog {
+        /// Serialized catalog body.
+        snapshot: Vec<u8>,
+    },
 }
 
 impl LogRecord {
@@ -132,6 +147,7 @@ impl LogRecord {
             Self::Abort => RecordKind::Abort,
             Self::Checkpoint { .. } => RecordKind::Checkpoint,
             Self::Clr { .. } => RecordKind::Clr,
+            Self::Catalog { .. } => RecordKind::Catalog,
         }
     }
 
@@ -187,6 +203,13 @@ impl LogRecord {
                 let img_len = u16::try_from(undo_image.len()).expect("CLR undo image fits in u16");
                 out.extend_from_slice(&img_len.to_le_bytes());
                 out.extend_from_slice(undo_image);
+            }
+            Self::Catalog { snapshot } => {
+                // The whole payload is the snapshot; its length is implied by
+                // the record's length field, so no inner length prefix is
+                // needed (and the snapshot can exceed the 64 KiB a u16 prefix
+                // would allow).
+                out.extend_from_slice(snapshot);
             }
         }
 
@@ -290,6 +313,9 @@ impl LogRecord {
             }
             RecordKind::Checkpoint => Self::decode_checkpoint(payload)?,
             RecordKind::Clr => Self::decode_clr(payload)?,
+            RecordKind::Catalog => Self::Catalog {
+                snapshot: payload.to_vec(),
+            },
         };
         Ok(record)
     }
@@ -482,6 +508,31 @@ mod tests {
         };
         let (_hdr, rec) = round_trip(&r, 1, u64::MAX, 1);
         assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn catalog_round_trips() {
+        let snapshot = b"users 3 4 5 ...serialized catalog body...".to_vec();
+        let r = LogRecord::Catalog {
+            snapshot: snapshot.clone(),
+        };
+        let (hdr, rec) = round_trip(&r, 200, 0, 0);
+        assert_eq!(hdr.kind, RecordKind::Catalog);
+        assert_eq!(rec, LogRecord::Catalog { snapshot });
+    }
+
+    #[test]
+    fn catalog_snapshot_exceeding_u16_round_trips() {
+        // A real catalog can exceed the 64 KiB a u16 length prefix allows, so
+        // the payload carries no inner length prefix and the record length
+        // (u32) bounds it.
+        let snapshot = vec![0xABu8; 100_000];
+        let r = LogRecord::Catalog {
+            snapshot: snapshot.clone(),
+        };
+        let (hdr, rec) = round_trip(&r, 1, 0, 0);
+        assert_eq!(hdr.kind, RecordKind::Catalog);
+        assert_eq!(rec, LogRecord::Catalog { snapshot });
     }
 
     #[test]

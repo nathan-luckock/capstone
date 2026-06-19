@@ -178,11 +178,16 @@ From-scratch bounded model checkers for the write-ahead-logging ordering invaria
 and each ships a deliberately buggy variant that yields a concrete counterexample,
 so the proofs are not vacuous. Both are certified in `vecert`.
 
-### Sprint 18 - Log-streamed point-in-time recovery (planned)
+### Sprint 18 - WAL-logged catalog for log-streamed recovery
 
-WAL-logging the catalog metadata so forward replay reconstructs later schema
-changes, not just the base state. This is the last piece of the recovery story and
-the one honest gap that remains.
+The catalog is now written to the WAL as a snapshot record after every schema
+change, and replayed on open, so the log is authoritative for the schema: a
+schema change that reached the log is recovered even if its sidecar write was lost
+in a crash, and forward replay reconstructs later schema changes rather than only
+the base state. The record carries a sentinel transaction and sits outside the
+redo/undo chain (analysis skips it), so it can never be mistaken for an
+uncommitted loser. Bounding the replay to a chosen LSN reconstructs the schema as
+of that point, the basis for point-in-time recovery across schema changes.
 
 ## Direction
 
@@ -205,14 +210,12 @@ cannot be physically serviced (orbital and edge data centers).
    open; `PROTECT`, `pg_fault_log`, and `pjscrub` operate it; backup, point-in-time
    restore, and a physical standby replica round out recovery; and the core WAL and
    isolation invariants are model-checked exhaustively, not just sampled.
-5. The one honest gap that remains is WAL-logging the catalog metadata so
-   point-in-time recovery is fully log-streamed (sprint 18), reconstructing later
-   schema changes rather than the base state.
+5. The catalog is now WAL-logged and replayed on open (sprint 18), so the log is
+   authoritative for the schema and forward replay reconstructs later schema
+   changes rather than only the base state. The recovery story is complete.
 
 ## Out of scope
 
-- Fully log-streamed point-in-time recovery across schema changes, which needs the
-  catalog metadata in the WAL (sprint 18, the one tracked gap above).
 - Multi-node distributed operation beyond a single physical standby: consensus,
   sharding, and partition reconciliation are company-scale work, not capstone work.
 - Hardware-in-the-loop and radiation-beam testing: the fault model is simulated and

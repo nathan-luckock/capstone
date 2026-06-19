@@ -28,6 +28,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
+use crate::lsn::Lsn;
 use crate::record::{LogRecord, RecordHeader, MIN_RECORD_BYTES};
 
 /// Forward iterator over a WAL file.
@@ -125,6 +126,45 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<Opti
         }
     }
     Ok(Some(()))
+}
+
+/// Scan the WAL at `path` for the most recent [`LogRecord::Catalog`] snapshot
+/// at or before `up_to` (or the most recent overall when `up_to` is `None`).
+///
+/// This makes the WAL authoritative for the catalog. On open, the engine
+/// applies the latest snapshot, so a schema change that reached the log is
+/// recovered even if its sidecar write was lost; bounding `up_to` lets a
+/// point-in-time restore reconstruct the schema as of a chosen LSN rather than
+/// only the base state.
+///
+/// A torn or corrupt tail record stops the scan cleanly (the reader treats it
+/// as end-of-log), so a snapshot is returned only when a complete,
+/// checksum-valid catalog record was read. An absent WAL yields `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, or if a record before the
+/// stopping point fails to decode (a checksum mismatch mid-log).
+pub fn latest_catalog_snapshot<P: AsRef<Path>>(
+    path: P,
+    up_to: Option<Lsn>,
+) -> Result<Option<Vec<u8>>> {
+    let reader = match WalReader::open(path) {
+        Ok(r) => r,
+        Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut latest: Option<Vec<u8>> = None;
+    for item in reader {
+        let (hdr, rec) = item?;
+        if up_to.is_some_and(|limit| hdr.lsn.get() > limit.get()) {
+            break;
+        }
+        if let LogRecord::Catalog { snapshot } = rec {
+            latest = Some(snapshot);
+        }
+    }
+    Ok(latest)
 }
 
 #[cfg(test)]
