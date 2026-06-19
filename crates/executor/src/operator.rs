@@ -984,7 +984,7 @@ fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> 
         acc.wcount += 1.0;
         let delta = x - acc.mean;
         acc.mean += delta / acc.wcount;
-        acc.m2 += delta * (x - acc.mean);
+        acc.m2 = delta.mul_add(x - acc.mean, acc.m2);
     }
     acc.min = Some(match acc.min.take() {
         Some(m) if sort_cmp(&m, &v) == Ordering::Less => m,
