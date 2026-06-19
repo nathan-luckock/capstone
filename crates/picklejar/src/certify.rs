@@ -225,6 +225,10 @@ impl Certificate {
         // The memory layer's central promise, model-checked: a tenant's query,
         // accelerated by the index or not, never returns another tenant's row.
         checks.push(rls_isolation_model());
+        // And its sibling: a query served from the index never returns a row that
+        // was deleted, so a forgotten memory can never resurface through a stale
+        // cache.
+        checks.push(cache_freshness_model());
 
         // The catalog is WAL-logged: a schema change whose sidecar write was
         // lost in a crash is recovered from the log on open, so the two copies
@@ -916,6 +920,25 @@ fn rls_isolation_model() -> Check {
         detail: format!(
             "no tenant query returns another tenant's row over all {states} reachable states \
              (bound {bound}); serving the index under a policy is caught"
+        ),
+        passed: held && teeth,
+    }
+}
+
+/// The cache-freshness invariant, model-checked: over every reachable
+/// interleaving of inserts, deletes, index builds, and queries, a query served
+/// from the index never returns a deleted row, and a delete that skips cache
+/// invalidation is caught.
+fn cache_freshness_model() -> Check {
+    let bound = 5u8;
+    let states = crate::freshness_model::reachable_states(bound, true);
+    let held = crate::freshness_model::check(bound, true).is_none();
+    let teeth = crate::freshness_model::check(2, false).is_some();
+    Check {
+        name: "cache freshness model-check".into(),
+        detail: format!(
+            "no query returns a deleted row over all {states} reachable states ({bound} rows); \
+             a delete that leaves the cache stale is caught"
         ),
         passed: held && teeth,
     }
