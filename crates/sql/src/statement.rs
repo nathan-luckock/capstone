@@ -927,6 +927,11 @@ pub enum ConflictAction {
         /// Optional predicate; the update is skipped when it is false.
         where_clause: Option<Expr>,
     },
+    /// `DO ASSERT`: contradiction detection for memory facts. On a key conflict,
+    /// if the proposed row's non-key values equal the stored row's it is an
+    /// idempotent re-assertion (skipped); if any differ it is a contradiction
+    /// (rejected). Requires a conflict target, like `DO UPDATE`.
+    Assert,
 }
 
 impl fmt::Display for OnConflict {
@@ -953,6 +958,7 @@ impl fmt::Display for OnConflict {
                 }
                 Ok(())
             }
+            ConflictAction::Assert => f.write_str(" DO ASSERT"),
         }
     }
 }
@@ -963,6 +969,7 @@ impl OnConflict {
     fn substitute_params(&self, params: &[Value]) -> Self {
         let action = match &self.action {
             ConflictAction::Nothing => ConflictAction::Nothing,
+            ConflictAction::Assert => ConflictAction::Assert,
             ConflictAction::Update {
                 assignments,
                 where_clause,
@@ -2638,6 +2645,8 @@ impl Parser {
         self.expect_keyword(Keyword::Do)?;
         let action = if self.eat_keyword(Keyword::Nothing) {
             ConflictAction::Nothing
+        } else if self.eat_ident_kw("assert") {
+            ConflictAction::Assert
         } else {
             self.expect_keyword(Keyword::Update)?;
             self.expect_keyword(Keyword::Set)?;
@@ -3707,6 +3716,20 @@ mod tests {
         assert_eq!(oc.target, vec!["id".to_string()]);
         assert!(matches!(oc.action, ConflictAction::Update { .. }));
         assert_eq!(returning.len(), 1);
+    }
+
+    #[test]
+    fn on_conflict_do_assert_round_trips() {
+        round_trip("INSERT INTO facts (k, v) VALUES (1, 2) ON CONFLICT (k) DO ASSERT");
+        let s = parse("INSERT INTO facts (k, v) VALUES (1, 2) ON CONFLICT (k) DO ASSERT");
+        let Statement::Insert { on_conflict, .. } = s else {
+            panic!("expected INSERT");
+        };
+        let oc = on_conflict.expect("has ON CONFLICT");
+        assert_eq!(oc.target, vec!["k".to_string()]);
+        assert!(matches!(oc.action, ConflictAction::Assert));
+        // `assert` stays usable as an ordinary identifier (non-reserved).
+        round_trip("SELECT assert FROM t");
     }
 
     #[test]

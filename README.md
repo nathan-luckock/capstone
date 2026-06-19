@@ -87,6 +87,8 @@ That last query can be served two ways. By default it is an exact scan. Run `SET
 
 Memory also travels in time, on both axes. Give a table `valid_from` and `valid_to` columns and `SET valid_time = TIMESTAMP '...'` rewinds every read in the session to an as-of instant, returning exactly the rows that were valid then over the half-open interval `[valid_from, valid_to)`. The other axis is the database's own history: `SET transaction_time = <point>` (a transaction-id watermark from `txid_current()`) travels a read to the MVCC snapshot as of a past transaction, walking each version chain to the version live then, so a row updated since shows its old value and a deleted one reappears. Valid-time asks what was true in the world; transaction-time asks what the database knew; with both set, a query is a full bitemporal as-of. `SET valid_time = off` / `SET transaction_time = off` return to the present. Both ride the same parser-safe session mechanism as the index toggle, which is what lets them sidestep the `AS OF` syntax collision.
 
+And memory defends its own consistency. `INSERT ... ON CONFLICT (key) DO ASSERT` re-asserts a fact the agent already holds for free, but rejects a write that records a *different* value for the same key as a contradiction, naming the column, the key, and the two values. The conflicting belief is caught at write time instead of silently overwriting what was there.
+
 ## It speaks Postgres
 
 No shim. The server implements the PostgreSQL v3 wire protocol, so the real `psql` binary connects straight to the engine:

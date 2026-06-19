@@ -4225,14 +4225,15 @@ impl Database {
             _ => unique_cols.clone(),
         };
         let has_target = matches!(on_conflict, Some(oc) if !oc.target.is_empty());
-        if let Some(OnConflict {
-            target,
-            action: ConflictAction::Update { .. },
-        }) = on_conflict
-        {
-            if target.is_empty() {
+        if let Some(oc) = on_conflict {
+            if oc.target.is_empty()
+                && matches!(
+                    oc.action,
+                    ConflictAction::Update { .. } | ConflictAction::Assert
+                )
+            {
                 return Err(DbError::Unsupported(
-                    "ON CONFLICT DO UPDATE requires a conflict target".into(),
+                    "ON CONFLICT DO UPDATE / DO ASSERT requires a conflict target".into(),
                 ));
             }
         }
@@ -4380,6 +4381,40 @@ impl Database {
                                 "ON CONFLICT DO UPDATE cannot affect one row twice in a statement"
                                     .into(),
                             ));
+                        } else {
+                            planned.push(values.clone());
+                            plans.push(RowPlan::Insert(values));
+                        }
+                    }
+                    ConflictAction::Assert => {
+                        // The fact this write conflicts with, whether already
+                        // stored or proposed earlier in this same statement.
+                        let prior = hit
+                            .and_then(|rowid| {
+                                existing
+                                    .iter()
+                                    .find(|(rid, _)| *rid == rowid)
+                                    .map(|(_, r)| r)
+                            })
+                            .or_else(|| planned.iter().find(|r| collides(&values, r)));
+                        // A conflicting fact exists: identical values are an
+                        // idempotent re-assertion (skip); any difference is a
+                        // contradiction (reject). No conflict: a fresh insert.
+                        if let Some(stored) = prior {
+                            if let Some(col) =
+                                value_disagreement(&values, stored, &arbiter, schema.len())
+                            {
+                                let key = arbiter
+                                    .iter()
+                                    .map(|&c| format!("{}={}", col_meta[c].0, values[c]))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return Err(DbError::Contradiction(format!(
+                                    "fact ({key}) already records {} = {}; cannot assert {} = {}",
+                                    col_meta[col].0, stored[col], col_meta[col].0, values[col]
+                                )));
+                            }
+                            plans.push(RowPlan::Skip);
                         } else {
                             planned.push(values.clone());
                             plans.push(RowPlan::Insert(values));
@@ -6481,6 +6516,21 @@ fn rows_match_on(cand: &[Value], row: &[Value], cols: &[usize]) -> bool {
         && cols.iter().all(|&c| {
             !matches!(cand[c], Value::Null) && !matches!(row[c], Value::Null) && cand[c] == row[c]
         })
+}
+
+/// For `ON CONFLICT ... DO ASSERT`: the first non-key column (one not in the
+/// conflict-target `arbiter`) at which the proposed row disagrees with the stored
+/// one, or `None` if they record the same fact. Equality is structural, so a
+/// re-asserted `NULL` matches a stored `NULL` (this is fact identity, not SQL
+/// three-valued logic): two writes record the same fact iff every value column is
+/// the same value.
+fn value_disagreement(
+    proposed: &[Value],
+    stored: &[Value],
+    arbiter: &[usize],
+    ncols: usize,
+) -> Option<usize> {
+    (0..ncols).find(|&c| !arbiter.contains(&c) && proposed[c] != stored[c])
 }
 
 /// Desugar `lhs [NOT] IN (v1, v2, ...)` to a chain of equalities, the same

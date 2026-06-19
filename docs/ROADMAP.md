@@ -39,6 +39,12 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   similarity, so a tenant's search can only ever rank its own vectors. The index
   is reachable from SQL through a cached, write-invalidated, RLS-safe path, about
   150x faster on a warm query than the exact scan.
+- **Contradiction detection.** `INSERT ... ON CONFLICT (key) DO ASSERT` is
+  write-time contradiction detection for memory facts: re-asserting an identical
+  fact is idempotent, but a write that records a different value for a key the
+  store already holds is rejected as a contradiction (the column, key, and both
+  values are named), instead of silently overwriting a held belief. This is the
+  unsolved AI-memory consistency problem from the research, enforced by the engine.
 - **Recall as a CI gate.** `recall@k` held against the exact brute-force oracle
   on clustered, near-duplicate, and unit-norm distributions. Building it found and
   fixed a real recall bug (0.47 to 0.98 on clustered data).
