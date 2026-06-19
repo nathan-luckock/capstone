@@ -37,7 +37,7 @@ every task to a pull request that is squash-merged once the checks
 | 16 | Operability of self-healing (PROTECT statement, pjscrub, pg_fault_log); snapshot backup and replication (Database::backup, pjbackup) | Shipped |
 | 17 | Model-checking the WAL-ordering and snapshot-isolation invariants from scratch (`walmodel`, the `txn` model, both certified in `vecert`) | Shipped |
 | 18 | WAL-logging the catalog and row-level-security state so the log is authoritative for schema and isolation, with resilient fallback to the sidecar, all certified in `vecert` | Shipped |
-| 19 | Model-checking the row-level-security retrieval invariant from scratch (`rlsmodel`): a tenant's query, accelerated by the index or not, never returns another tenant's row | Shipped |
+| 19 | Model-checking, through the approximate index, both tenant isolation (a tenant's query never returns another tenant's row) and cache freshness (a query never returns a deleted row) from scratch (`rlsmodel`) | Shipped |
 
 ## What shipped, by sprint
 

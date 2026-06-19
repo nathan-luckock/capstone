@@ -1,8 +1,7 @@
-//! Exhaustively model-check the row-level-security retrieval invariant and
-//! report: a tenant's query, accelerated by the approximate index or not, can
-//! never return another tenant's row. The complement to the `vecsim` random
-//! isolation sweep, this proves it over every reachable interleaving of a
-//! bounded model.
+//! Exhaustively model-check that the approximate index cache never serves a
+//! wrong row, two ways: it never returns another tenant's row (isolation) and it
+//! never returns a deleted row (freshness). The complement to the random `vecsim`
+//! sweep, this proves both over every reachable interleaving of a bounded model.
 //!
 //! ```text
 //! cargo run --release --bin rlsmodel        # sweep bounds 1..=4
@@ -11,36 +10,50 @@
 
 use std::process::ExitCode;
 
-use picklejar::isolation_model::{check, reachable_states};
+use picklejar::{freshness_model, isolation_model};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let max: u8 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
 
-    println!(
-        "model-checking the RLS retrieval invariant (a tenant query never returns another \
-         tenant's row)..."
-    );
+    println!("model-checking the index cache: a query never returns a row it should not...");
+
+    println!("isolation (a tenant query never returns another tenant's row):");
     for bound in 1..=max {
-        if let Some(cx) = check(bound, true) {
+        if let Some(cx) = isolation_model::check(bound, true) {
             eprintln!("VIOLATION at bound {bound}: {cx:?}");
             return ExitCode::FAILURE;
         }
         println!(
-            "  bound {bound}: invariant holds over {} reachable states",
-            reachable_states(bound, true)
+            "  bound {bound}: holds over {} reachable states",
+            isolation_model::reachable_states(bound, true)
         );
     }
-
-    // Confirm the check has teeth: a buggy engine that serves the approximate
-    // index under an active policy must be caught, or the proof above is vacuous.
-    if let Some(cx) = check(2, false) {
-        println!("  teeth check: an index path taken under a policy is caught ({cx:?})");
+    if let Some(cx) = isolation_model::check(2, false) {
+        println!("  teeth: an index path taken under a policy is caught ({cx:?})");
     } else {
         eprintln!("teeth check failed: a known-buggy dispatch was not caught");
         return ExitCode::FAILURE;
     }
 
-    println!("result: RLS retrieval isolation proved over every interleaving up to bound {max}");
+    println!("freshness (a query never returns a deleted row):");
+    for rows in 1..=max {
+        if let Some(cx) = freshness_model::check(rows, true) {
+            eprintln!("VIOLATION at {rows} rows: {cx:?}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "  {rows} rows: holds over {} reachable states",
+            freshness_model::reachable_states(rows, true)
+        );
+    }
+    if let Some(cx) = freshness_model::check(2, false) {
+        println!("  teeth: a delete that leaves the cache stale is caught ({cx:?})");
+    } else {
+        eprintln!("teeth check failed: a stale-cache delete was not caught");
+        return ExitCode::FAILURE;
+    }
+
+    println!("result: index-cache isolation and freshness proved over every interleaving up to bound {max}");
     ExitCode::SUCCESS
 }
