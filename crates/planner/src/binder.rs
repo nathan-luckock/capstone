@@ -446,7 +446,20 @@ fn resolve_order_key(expr: &Expr, projections: &[SelectItem]) -> Expr {
 
 /// Whether `name` (already upper-cased by the parser) is an aggregate.
 fn is_aggregate(name: &str) -> bool {
-    matches!(name, "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
+    matches!(
+        name,
+        "COUNT"
+            | "SUM"
+            | "MIN"
+            | "MAX"
+            | "AVG"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "VARIANCE"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "STDDEV"
+    )
 }
 
 /// Push `expr` into `out` unless an equal (by printed form) entry is present.
