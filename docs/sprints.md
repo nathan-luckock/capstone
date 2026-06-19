@@ -250,6 +250,27 @@ query with both set is a full bitemporal as-of. The snapshot construction is the
 same one the forward-replay point-in-time recovery on the frontier will need, so
 this also de-risks that path.
 
+### Sprint 22 - Logical point-in-time restore
+
+Point-in-time recovery, built on the transaction-time travel from the previous
+sprint. `restore_as_of(dest, point)` rebuilds a fresh database holding the state
+the source had as of a past transaction point: it reads every table through the
+travelled snapshot and replays the rows into the new database via the normal
+write path, so the result holds exactly the rows committed as of the point, with
+fresh transaction ids, a freshly built index, and correct anchors. It carries
+schema, explicit indexes, views, and data, bounded by retained version history.
+
+The cold read for this sprint surfaced why the restore is logical rather than a
+physical log replay, and the reason is worth recording. This engine keeps the
+heap (including the B+ tree index pages) durable by eager page flushing; the
+write-ahead log carries the version-heap writes and the catalog and isolation
+snapshots, but not the index page mutations. So replaying the log into an empty
+heap would reconstruct the row versions with no index to find them by, an
+unqueryable database. Re-materializing the as-of-point snapshot the MVCC version
+chains already retain is sound where a log replay is not. A physical forward
+replay remains possible, but it is gated on write-ahead-logging the index pages
+(full physical logging); the logical path covers the recovery need today.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a

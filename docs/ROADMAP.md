@@ -68,7 +68,11 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   parser-safe session mechanism as the index toggle, sidestepping the `AS OF`
   syntax collision, and both are read-only (writes act on the latest state);
   transaction-time is bounded by retained version history (pre-`VACUUM`).
-- **Backup, point-in-time recovery, and a physical standby replica.**
+- **Backup, point-in-time recovery, and a physical standby replica.** Backup
+  copies a consistent snapshot; logical point-in-time restore (`restore_as_of`)
+  rebuilds a fresh database holding the state as of a past transaction point, read
+  through the transaction-time-travel path and re-materialized through the normal
+  write path, so the result has fresh ids, a real index, and correct anchors.
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of
   its log record), the MVCC snapshot read-stability invariant, and, through the
@@ -100,13 +104,17 @@ model-checking of the core invariants.
 
 What is genuinely still ahead, stated honestly:
 
-- **Forward-replay point-in-time recovery.** Today the engine restores from a
-  consistent snapshot, not by replaying the log forward over a base image. Rolling
-  a base forward to an arbitrary LSN additionally needs the MVCC watermark and the
-  version pages to advance in step with the replayed heap, which the snapshot model
-  sidesteps and which is the real work here. The catalog and isolation snapshots
-  are already LSN-reconstructable (the scan accepts a bound), so schema and policy
-  as-of-a-point come for free once that forward-replay path exists.
+- **Physical forward-replay point-in-time recovery.** Logical point-in-time
+  restore is built (see "What is built"): the database is re-materialized as of a
+  past transaction point from the version chains MVCC already retains. A *physical*
+  forward replay, rolling a base image forward over the log to an arbitrary LSN,
+  is not, and the blocker is specific: the B+ tree index pages are kept durable by
+  eager flushing and are not written to the log, so the log alone cannot rebuild a
+  queryable heap. Closing this means write-ahead-logging the index page mutations
+  (full physical logging), after which a bounded redo plus the already
+  LSN-reconstructable catalog and isolation snapshots would give physical
+  as-of-a-point restore. The logical path covers the recovery need today; the
+  physical path is a throughput and fidelity improvement, not a missing capability.
 - **Partition tolerance.** Meaningful only once there is a multi-node replica to
   diverge from, so it is folded into the replication path rather than built ahead
   of it: the link is down for a bounded interval, the node serves locally, and it
