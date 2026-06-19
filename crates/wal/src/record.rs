@@ -65,6 +65,12 @@ pub enum RecordKind {
     /// log is authoritative for tenant isolation the same way `Catalog` is for
     /// schema. Carries the serialized `.pol` body as an opaque payload.
     RlsPolicies = 8,
+    /// Records that a table's primary index now maps `key` to a version at
+    /// `(page_id, slot_id)`. The index pages are not themselves logged, so this
+    /// is what lets a physical forward replay rebuild the primary index from the
+    /// log rather than only the heap. Metadata, like `Catalog`: it carries no
+    /// undo and never makes a transaction a recovery loser.
+    IndexUpdate = 9,
 }
 
 impl RecordKind {
@@ -79,6 +85,7 @@ impl RecordKind {
             6 => Ok(Self::Clr),
             7 => Ok(Self::Catalog),
             8 => Ok(Self::RlsPolicies),
+            9 => Ok(Self::IndexUpdate),
             other => Err(WalError::UnknownRecordType(other)),
         }
     }
@@ -146,6 +153,18 @@ pub enum LogRecord {
         /// Serialized row-level-security body.
         snapshot: Vec<u8>,
     },
+    /// A primary-index mapping written after a heap version write: `key` now
+    /// resolves to the version at `(page_id, slot_id)`. Replaying these in LSN
+    /// order rebuilds the primary index for a physical forward replay, since the
+    /// index pages themselves are never logged.
+    IndexUpdate {
+        /// The primary-index key (the row's `rowid`).
+        key: u64,
+        /// Page the new head version landed on.
+        page_id: u64,
+        /// Slot within that page.
+        slot_id: u16,
+    },
 }
 
 impl LogRecord {
@@ -161,6 +180,7 @@ impl LogRecord {
             Self::Clr { .. } => RecordKind::Clr,
             Self::Catalog { .. } => RecordKind::Catalog,
             Self::RlsPolicies { .. } => RecordKind::RlsPolicies,
+            Self::IndexUpdate { .. } => RecordKind::IndexUpdate,
         }
     }
 
@@ -223,6 +243,15 @@ impl LogRecord {
                 // needed (and the snapshot can exceed the 64 KiB a u16 prefix
                 // would allow).
                 out.extend_from_slice(snapshot);
+            }
+            Self::IndexUpdate {
+                key,
+                page_id,
+                slot_id,
+            } => {
+                out.extend_from_slice(&key.to_le_bytes());
+                out.extend_from_slice(&page_id.to_le_bytes());
+                out.extend_from_slice(&slot_id.to_le_bytes());
             }
         }
 
@@ -332,6 +361,23 @@ impl LogRecord {
             RecordKind::RlsPolicies => Self::RlsPolicies {
                 snapshot: payload.to_vec(),
             },
+            RecordKind::IndexUpdate => {
+                // key (8) + page_id (8) + slot_id (2) = 18 fixed.
+                if payload.len() < 18 {
+                    return Err(WalError::PayloadTruncated {
+                        expected: 18,
+                        available: payload.len(),
+                    });
+                }
+                let key = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+                let page_id = u64::from_le_bytes(payload[8..16].try_into().expect("8 bytes"));
+                let slot_id = u16::from_le_bytes(payload[16..18].try_into().expect("2 bytes"));
+                Self::IndexUpdate {
+                    key,
+                    page_id,
+                    slot_id,
+                }
+            }
         };
         Ok(record)
     }
@@ -560,6 +606,37 @@ mod tests {
         let (hdr, rec) = round_trip(&r, 7, 0, 0);
         assert_eq!(hdr.kind, RecordKind::RlsPolicies);
         assert_eq!(rec, LogRecord::RlsPolicies { snapshot });
+    }
+
+    #[test]
+    fn index_update_round_trips() {
+        let r = LogRecord::IndexUpdate {
+            key: 0x0102_0304_0506_0708,
+            page_id: 0xDEAD_BEEF,
+            slot_id: 17,
+        };
+        let (hdr, rec) = round_trip(&r, 70, 69, 4);
+        assert_eq!(hdr.kind, RecordKind::IndexUpdate);
+        assert_eq!(rec, r);
+    }
+
+    #[test]
+    fn truncated_index_update_payload_rejected() {
+        let r = LogRecord::IndexUpdate {
+            key: 1,
+            page_id: 2,
+            slot_id: 3,
+        };
+        let mut buf = Vec::new();
+        r.write(lsn(1), Lsn::INVALID, txn(1), &mut buf);
+        buf.truncate(buf.len() - 3); // drop part of the fixed payload
+        let new_len = u32::try_from(buf.len()).unwrap();
+        buf[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&new_len.to_le_bytes());
+        let trailer_offset = buf.len() - TRAILER_BYTES;
+        let new_crc = crc32(&buf[..trailer_offset]);
+        buf[trailer_offset..].copy_from_slice(&new_crc.to_le_bytes());
+        let err = LogRecord::read(&buf).expect_err("must error");
+        assert!(matches!(err, WalError::PayloadTruncated { .. }));
     }
 
     #[test]

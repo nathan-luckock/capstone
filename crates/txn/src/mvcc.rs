@@ -103,6 +103,58 @@ impl<'env> MvccTable<'env> {
         }
     }
 
+    /// Physically rebuild this table as of `target` from `wal_path` into the
+    /// (fresh) `pool`: a point-in-time recovery that replays both halves of the
+    /// table from the log.
+    ///
+    /// The heap half is `redo_through`: every version write up to `target` is
+    /// re-applied, so the version pages land at their original ids with their
+    /// as-of-`target` bytes. The index half is the reason this engine needs the
+    /// `IndexUpdate` records at all: the B+ tree pages are not in the log, so the
+    /// primary index is rebuilt from the logged `key -> version` mappings, the
+    /// last write per key winning (the chain head as of `target`). `mgr` must be
+    /// recovered to the transaction watermark at `target` so the rebuilt table's
+    /// reads resolve visibility correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log cannot be read or a page cannot be written.
+    pub fn recover_physical(
+        pool: &'env BufferPool,
+        wal: WalSyncHandle,
+        mgr: &'env TransactionManager,
+        wal_path: impl AsRef<std::path::Path>,
+        target: Lsn,
+    ) -> Result<Self> {
+        picklejar_wal::redo_through(pool, &wal_path, target)?;
+        let mappings = picklejar_wal::index_updates_through(&wal_path, target)?;
+        let index = BTree::create(pool)?;
+        let mut version_page = None;
+        for (key, page_id, slot_id) in mappings {
+            let at = TupleRef::new(PageId::new(page_id), SlotId::new(slot_id));
+            index.upsert(key, at)?;
+            version_page = Some(PageId::new(page_id));
+        }
+        // A table empty as of the target has no head page; give it a fresh one so
+        // a later write has somewhere to go.
+        let version_page = if let Some(p) = version_page {
+            p
+        } else {
+            let (p, mut guard) = pool.new_page()?;
+            HeapPage::init(guard.page_mut());
+            drop(guard);
+            p
+        };
+        pool.flush_all()?;
+        Ok(Self {
+            pool,
+            wal,
+            mgr,
+            index,
+            version_page: Cell::new(version_page),
+        })
+    }
+
     /// The index B+ tree's current root page. Changes when the root splits,
     /// so the engine must read it back after a write and persist it.
     #[must_use]
@@ -129,6 +181,7 @@ impl<'env> MvccTable<'env> {
         let bytes = Version::encode(txn.xid(), 0, prev, value);
         let new_ref = self.store_version(txn.xid(), &bytes)?;
         self.index.upsert(key, new_ref)?;
+        self.log_index_update(txn.xid(), key, new_ref);
         Ok(())
     }
 
@@ -157,6 +210,7 @@ impl<'env> MvccTable<'env> {
         let bytes = Version::encode(txn.xid(), 0, Some(head), value);
         let new_ref = self.store_version(txn.xid(), &bytes)?;
         self.index.upsert(key, new_ref)?;
+        self.log_index_update(txn.xid(), key, new_ref);
         Ok(())
     }
 
@@ -259,6 +313,25 @@ impl<'env> MvccTable<'env> {
         Ok(TupleRef::new(page, SlotId::new(slot)))
     }
 
+    /// Log that `key`'s primary-index head is now the version at `at`, so a
+    /// physical forward replay can rebuild the index even though the B+ tree
+    /// pages are never logged. Append-only: the mapping is made durable by the
+    /// next write's or the commit's flush, the same window the heap write has, so
+    /// this adds no fsync to the write path. A failure to buffer it only weakens
+    /// physical point-in-time recovery, never the heap's own durability, so it is
+    /// not propagated as a write error.
+    fn log_index_update(&self, xid: u64, key: u64, at: TupleRef) {
+        let rec = LogRecord::IndexUpdate {
+            key,
+            page_id: at.page_id.get(),
+            slot_id: at.slot_id.get(),
+        };
+        self.wal
+            .writer()
+            .append(&rec, TxnId::new(xid), Lsn::INVALID)
+            .ok();
+    }
+
     /// Stamp the `xmax` of an existing version in place, logging the change.
     fn stamp_xmax(&self, xid: u64, target: TupleRef) -> Result<()> {
         let before = self.read_version_bytes(target)?;
@@ -348,7 +421,7 @@ mod tests {
     use tempfile::TempDir;
 
     struct Env {
-        _dir: TempDir,
+        dir: TempDir,
         pool: BufferPool,
         wal: WalSyncHandle,
         mgr: TransactionManager,
@@ -361,7 +434,7 @@ mod tests {
         let file = FileManager::open(dir.path().join("data.db")).expect("data");
         let pool = BufferPool::with_wal(file, 64, wal.as_hook());
         Env {
-            _dir: dir,
+            dir,
             pool,
             wal,
             mgr: TransactionManager::new(),
@@ -600,6 +673,184 @@ mod tests {
         let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
         let t = e.mgr.begin();
         assert!(table.scan(&t).expect("scan").is_empty());
+    }
+
+    /// The LSN of the last record written so far: the boundary `recover_physical`
+    /// includes up to and including.
+    fn last_lsn(e: &Env) -> picklejar_wal::Lsn {
+        picklejar_wal::Lsn::new(e.wal.writer().current_lsn().get() - 1)
+    }
+
+    /// Open a fresh, plain pool over a new data file in the same temp dir, for
+    /// replaying a physical recovery into.
+    fn fresh_recovery_pool(e: &Env, name: &str) -> BufferPool {
+        let file = FileManager::open(e.dir.path().join(name)).expect("fresh data");
+        BufferPool::new(file, 64)
+    }
+
+    #[test]
+    fn physical_recovery_rebuilds_the_table_as_of_a_past_point() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+
+        // Commit key 1 = "v1", then capture the point just after.
+        let t1 = e.mgr.begin();
+        table.insert(&t1, 1, b"v1").expect("insert");
+        e.mgr.commit(&t1);
+        let watermark = e.mgr.next_xid();
+        let target = last_lsn(&e);
+
+        // Changes after the target: update 1 -> "v2" and insert a new key 2.
+        let t2 = e.mgr.begin();
+        table.update(&t2, 1, b"v2").expect("update");
+        table.insert(&t2, 2, b"new").expect("insert");
+        e.mgr.commit(&t2);
+        e.wal.writer().fsync_all().expect("flush the log");
+
+        // Physically rebuild as of the target into a fresh pool and a manager at
+        // the target's watermark.
+        let pool2 = fresh_recovery_pool(&e, "recovered.db");
+        let mgr2 = TransactionManager::new();
+        mgr2.recover(watermark, &[]);
+        let wal_path = e.dir.path().join("wal.log");
+        let recovered =
+            MvccTable::recover_physical(&pool2, e.wal.clone(), &mgr2, &wal_path, target)
+                .expect("recover");
+
+        let reader = mgr2.begin();
+        assert_eq!(
+            recovered.get(&reader, 1).expect("get").as_deref(),
+            Some(&b"v1"[..]),
+            "key 1 holds its as-of-target value, not the later update",
+        );
+        assert_eq!(
+            recovered.get(&reader, 2).expect("get"),
+            None,
+            "key 2 was inserted after the target and must be absent",
+        );
+        // The rebuilt index drives a scan too: exactly key 1 is live.
+        let keys: Vec<u64> = recovered
+            .scan(&reader)
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec![1]);
+    }
+
+    #[test]
+    fn physical_recovery_to_a_later_point_includes_the_later_writes() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+
+        let t1 = e.mgr.begin();
+        table.insert(&t1, 1, b"v1").expect("insert");
+        e.mgr.commit(&t1);
+
+        let t2 = e.mgr.begin();
+        table.update(&t2, 1, b"v2").expect("update");
+        table.insert(&t2, 2, b"new").expect("insert");
+        e.mgr.commit(&t2);
+        let watermark = e.mgr.next_xid();
+        let target = last_lsn(&e); // after the second transaction
+        e.wal.writer().fsync_all().expect("flush the log");
+
+        let pool2 = fresh_recovery_pool(&e, "recovered2.db");
+        let mgr2 = TransactionManager::new();
+        mgr2.recover(watermark, &[]);
+        let wal_path = e.dir.path().join("wal.log");
+        let recovered =
+            MvccTable::recover_physical(&pool2, e.wal.clone(), &mgr2, &wal_path, target)
+                .expect("recover");
+
+        let reader = mgr2.begin();
+        assert_eq!(
+            recovered.get(&reader, 1).expect("get").as_deref(),
+            Some(&b"v2"[..]),
+            "the later target includes the update",
+        );
+        assert_eq!(
+            recovered.get(&reader, 2).expect("get").as_deref(),
+            Some(&b"new"[..]),
+            "the later target includes the inserted key",
+        );
+    }
+
+    #[test]
+    fn physical_replay_matches_the_committed_state_at_every_checkpoint() {
+        // A differential oracle for physical point-in-time recovery: drive a random
+        // committed workload, recording the committed key/value state at a series
+        // of checkpoint LSNs, then physically recover to each checkpoint and
+        // confirm the rebuilt table scans to exactly the oracle's state then. This
+        // exercises the heap-replay-plus-index-rebuild over arbitrary interleavings
+        // of inserts, updates, deletes, and re-inserts, at arbitrary recovery
+        // points, the way the engine is not crash-tested at the MiniHeap level.
+        type State = std::collections::BTreeMap<u64, Vec<u8>>;
+
+        for seed in 0..40u64 {
+            let e = env();
+            let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+
+            // A tiny xorshift, seeded per run, so a failure replays exactly.
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+
+            let mut oracle = State::new();
+            let mut checkpoints: Vec<(Lsn, u64, State)> = Vec::new();
+            // Inserts use a fresh key every time, the way the engine assigns a new
+            // rowid per INSERT; updates and deletes target an existing key. The
+            // engine never inserts over a live key, so the test does not either.
+            let mut next_key = 0u64;
+
+            for step in 0..30 {
+                let txn = e.mgr.begin();
+                if oracle.is_empty() || next() % 2 == 0 {
+                    let k = next_key;
+                    next_key += 1;
+                    let v = format!("v{}", next() % 1000).into_bytes();
+                    table.insert(&txn, k, &v).expect("insert");
+                    oracle.insert(k, v);
+                } else {
+                    let keys: Vec<u64> = oracle.keys().copied().collect();
+                    let idx = usize::try_from(next() % keys.len() as u64).expect("in range");
+                    let k = keys[idx];
+                    if next() % 2 == 0 {
+                        let v = format!("u{}", next() % 1000).into_bytes();
+                        table.update(&txn, k, &v).expect("update");
+                        oracle.insert(k, v);
+                    } else {
+                        table.delete(&txn, k).expect("delete");
+                        oracle.remove(&k);
+                    }
+                }
+                e.mgr.commit(&txn);
+                if step % 3 == 0 {
+                    checkpoints.push((last_lsn(&e), e.mgr.next_xid(), oracle.clone()));
+                }
+            }
+            e.wal.writer().fsync_all().expect("flush");
+            let wal_path = e.dir.path().join("wal.log");
+
+            for (i, (target, watermark, snapshot)) in checkpoints.iter().enumerate() {
+                let pool2 = fresh_recovery_pool(&e, &format!("rec_{seed}_{i}.db"));
+                let mgr2 = TransactionManager::new();
+                mgr2.recover(*watermark, &[]);
+                let recovered =
+                    MvccTable::recover_physical(&pool2, e.wal.clone(), &mgr2, &wal_path, *target)
+                        .expect("recover");
+                let reader = mgr2.begin();
+                let got: State = recovered.scan(&reader).expect("scan").into_iter().collect();
+                assert_eq!(
+                    &got, snapshot,
+                    "physical replay to {target:?} mismatched the oracle (seed {seed}, checkpoint {i})"
+                );
+            }
+        }
     }
 
     #[test]

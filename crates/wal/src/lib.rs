@@ -35,7 +35,10 @@ pub use hook::WalSyncHandle;
 pub use lsn::{Lsn, TxnId};
 pub use reader::{latest_catalog_snapshot, latest_rls_snapshot, WalReader};
 pub use record::{LogRecord, RecordHeader, RecordKind, HEADER_BYTES, MIN_RECORD_BYTES};
-pub use recovery::{analyze, recover, redo, undo, Analysis, RecoveryStats, TxnStatus};
+pub use recovery::{
+    analyze, index_updates_through, recover, redo, redo_through, undo, Analysis, RecoveryStats,
+    TxnStatus,
+};
 pub use sim::{run_seed, FaultDisk, Outcome};
 pub use workload::{MiniHeap, Txn};
 pub use writer::WalWriter;

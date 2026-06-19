@@ -121,6 +121,7 @@ pub fn analyze<P: AsRef<Path>>(wal_path: P) -> Result<Analysis> {
             LogRecord::Checkpoint { .. }
                 | LogRecord::Catalog { .. }
                 | LogRecord::RlsPolicies { .. }
+                | LogRecord::IndexUpdate { .. }
         ) {
             continue;
         }
@@ -167,6 +168,71 @@ pub fn redo(pool: &BufferPool, wal_path: impl AsRef<Path>) -> Result<usize> {
         }
     }
     Ok(applied)
+}
+
+/// Replay history up to and including `target`.
+///
+/// Re-applies every `Update` and `Clr` whose LSN is at most `target`, gated on
+/// the page LSN; records past `target` are skipped, so the heap is reconstructed
+/// exactly as of `target`. This is the heap half of a physical forward replay
+/// (point-in-time recovery). Returns the number of records actually applied.
+pub fn redo_through(pool: &BufferPool, wal_path: impl AsRef<Path>, target: Lsn) -> Result<usize> {
+    let reader = WalReader::open(wal_path)?;
+    let mut applied = 0usize;
+    for item in reader {
+        let (hdr, rec) = item?;
+        if hdr.lsn.get() > target.get() {
+            continue;
+        }
+        let page = match rec {
+            LogRecord::Update {
+                page_id,
+                slot_id,
+                after,
+                ..
+            } => Some((page_id, slot_id, after)),
+            LogRecord::Clr {
+                page_id,
+                slot_id,
+                undo_image,
+                ..
+            } => Some((page_id, slot_id, undo_image)),
+            _ => None,
+        };
+        if let Some((page_id, slot_id, image)) = page {
+            applied += usize::from(apply_image(pool, page_id, slot_id, &image, hdr.lsn)?);
+        }
+    }
+    Ok(applied)
+}
+
+/// Collect the primary-index mappings logged up to and including `target`.
+///
+/// Each `IndexUpdate` up to `target` is returned as `(key, page_id, slot_id)`, in
+/// LSN order. Replaying these into a fresh index (last write per key wins)
+/// rebuilds the primary index as of `target`, the index half of a physical
+/// forward replay.
+pub fn index_updates_through(
+    wal_path: impl AsRef<Path>,
+    target: Lsn,
+) -> Result<Vec<(u64, u64, u16)>> {
+    let reader = WalReader::open(wal_path)?;
+    let mut out = Vec::new();
+    for item in reader {
+        let (hdr, rec) = item?;
+        if hdr.lsn.get() > target.get() {
+            continue;
+        }
+        if let LogRecord::IndexUpdate {
+            key,
+            page_id,
+            slot_id,
+        } = rec
+        {
+            out.push((key, page_id, slot_id));
+        }
+    }
+    Ok(out)
 }
 
 /// Apply one image (after-image for an Update, undo-image for a CLR) to a
