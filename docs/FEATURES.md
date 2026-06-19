@@ -57,6 +57,15 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
 - **Upserts** - `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ...
   [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed
   value.
+- **Contradiction detection** - `INSERT ... ON CONFLICT (key) DO ASSERT`, for
+  AI-memory facts. On a key conflict, if the proposed row's non-key values equal
+  the stored row's it is an idempotent re-assertion (skipped); if any differ it is
+  a contradiction and the write is rejected, naming the column, the key, and the
+  two values. So an agent can re-assert what it already knows freely, while a write
+  that conflicts with a held fact is caught at write time instead of silently
+  overwriting it. Conflicts within a single multi-row statement are caught the same
+  way. Equality is structural (a re-asserted `NULL` matches a stored `NULL`): this
+  is fact identity, not SQL three-valued logic.
 - **Queries** - projection and `*`, `WHERE` with SQL three-valued logic,
   `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (the `OUTER` keyword
   optional), `NATURAL` joins and `JOIN ... USING (cols)` (each resolved to the

@@ -53,6 +53,11 @@ pub enum DbError {
     /// A column constraint (NOT NULL, UNIQUE, or PRIMARY KEY) was violated.
     #[error("constraint violation: {0}")]
     Constraint(String),
+    /// An `ON CONFLICT ... DO ASSERT` write supplied a value that conflicts with
+    /// the fact already stored under the same key: a contradiction. Re-asserting
+    /// the identical fact is allowed; asserting a different one is rejected.
+    #[error("contradiction: {0}")]
+    Contradiction(String),
     /// The current role lacks the privilege a statement needs, or a role
     /// management statement was rejected.
     #[error("permission denied: {0}")]

@@ -271,6 +271,22 @@ chains already retain is sound where a log replay is not. A physical forward
 replay remains possible, but it is gated on write-ahead-logging the index pages
 (full physical logging); the logical path covers the recovery need today.
 
+### Sprint 23 - Contradiction detection
+
+The unsolved AI-memory consistency problem from the research, made concrete and
+enforced by the engine. `INSERT ... ON CONFLICT (key) DO ASSERT` distinguishes the
+two things a plain unique constraint cannot tell apart: re-asserting a fact the
+store already holds (idempotent, allowed) from asserting a different value for that
+key (a contradiction, rejected). On a key conflict the engine compares the
+proposed row's non-key values to the stored fact's; identical values are skipped,
+any difference raises a contradiction that names the column, the key, and the two
+values, so a conflicting belief is caught at write time instead of silently
+overwriting what was there. Conflicts within a single multi-row statement are
+caught the same way. It reuses the existing `ON CONFLICT` upsert machinery, the
+snapshot of live rows and the arbiter collision test, adding one resolution branch
+and a structural value comparison; equality is fact identity (a re-asserted NULL
+matches a stored NULL), not SQL three-valued logic.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a
