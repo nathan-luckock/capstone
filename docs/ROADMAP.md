@@ -90,6 +90,19 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   rebuilds a fresh database holding the state as of a past transaction point, read
   through the transaction-time-travel path and re-materialized through the normal
   write path, so the result has fresh ids, a real index, and correct anchors.
+- **Physical forward-replay (the engine of point-in-time recovery).** An
+  `MvccTable` can rebuild itself physically as of an arbitrary target LSN straight
+  from the log: `redo_through` replays every heap version write up to the target
+  into a fresh file (the version pages land at their original ids), and the
+  primary index, whose B+ tree pages are never logged, is rebuilt from the
+  `IndexUpdate` mappings the engine now logs on every version write (last write per
+  key winning, the chain head as of the target). The recovered table reads exactly
+  the state as of the target: a row updated since shows its old value, a row
+  inserted since is absent. A differential oracle validates it: across forty
+  seeded random workloads, the table is recovered to every checkpoint LSN and its
+  scan is checked against an independent model of the committed state then. The
+  `IndexUpdate` log record is additive and append-only, so it adds no fsync to the
+  write path and leaves the 100,000-seed-validated recovery untouched.
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of
   its log record), the MVCC snapshot read-stability invariant, and, through the
@@ -128,17 +141,18 @@ model-checking of the core invariants.
 
 What is genuinely still ahead, stated honestly:
 
-- **Physical forward-replay point-in-time recovery.** Logical point-in-time
-  restore is built (see "What is built"): the database is re-materialized as of a
-  past transaction point from the version chains MVCC already retains. A *physical*
-  forward replay, rolling a base image forward over the log to an arbitrary LSN,
-  is not, and the blocker is specific: the B+ tree index pages are kept durable by
-  eager flushing and are not written to the log, so the log alone cannot rebuild a
-  queryable heap. Closing this means write-ahead-logging the index page mutations
-  (full physical logging), after which a bounded redo plus the already
-  LSN-reconstructable catalog and isolation snapshots would give physical
-  as-of-a-point restore. The logical path covers the recovery need today; the
-  physical path is a throughput and fidelity improvement, not a missing capability.
+- **Physical forward-replay point-in-time recovery (engine built; SQL wiring
+  ahead).** The mechanism is built and tested (see "What is built"): an `MvccTable`
+  rebuilds its heap *and* its primary index from the log to an arbitrary target
+  LSN, since each heap version write now also logs an `IndexUpdate` mapping (the
+  index pages themselves are still never logged, but the key-to-version mappings
+  are). What remains is the `Database`-level wiring: rebuilding the non-logged
+  *secondary* indexes from the replayed heap, patching the per-table page anchors
+  in the as-of catalog, and reconstructing the sidecars, so a single
+  `restore_physical_to_lsn` covers a whole multi-index database. The logical
+  restore covers the recovery need today; the physical path adds speed (no
+  re-insert) and fidelity (it preserves the MVCC history), now resting on a proven
+  core.
 - **Partition tolerance.** Meaningful only once there is a multi-node replica to
   diverge from, so it is folded into the replication path rather than built ahead
   of it: the link is down for a bounded interval, the node serves locally, and it

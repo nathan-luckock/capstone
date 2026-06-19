@@ -323,6 +323,34 @@ residual is reported, not papered over, and closing it (a page-id guard in the
 header) is recorded on the roadmap. Naming the fault you do not yet catch is worth
 more than a green check that never exercised it.
 
+### Sprint 26 - Physical forward-replay (the engine of point-in-time recovery)
+
+The logical restore (sprint 22) re-materializes the past by re-inserting rows; a
+physical forward replay rebuilds the past straight from the log. The cold read
+that capped sprint 22 named the exact blocker: this engine keeps the heap durable
+by eager flushing, the B+ tree index pages are never in the log, and a stored
+version does not record its own key, so the log alone cannot rebuild a queryable
+index. This sprint closes that with one additive record. Every heap version write
+now also logs an `IndexUpdate` mapping `key -> (page, slot)`; the record is
+append-only (no extra fsync, flushed by the next write or commit), is skipped by
+analysis like the other metadata records, and leaves the 100,000-seed-validated
+recovery untouched. On top of it, `MvccTable::recover_physical(target)` rebuilds a
+table to an arbitrary LSN: `redo_through` replays the heap version pages up to the
+target into a fresh file (landing them at their original ids, with the index pages
+the rebuild allocates falling safely above them), and the primary index is rebuilt
+by replaying the `IndexUpdate` mappings, last write per key winning, the chain head
+as of the target. A recovered table reads exactly its as-of-target state: a row
+updated since shows its old value, a row inserted since is absent. The validation
+is a differential oracle in the project's house style: across forty seeded random
+workloads of inserts, updates, and deletes, the table is physically recovered to
+every one of a series of checkpoint LSNs and its full scan is compared against an
+independently-tracked model of the committed state at that point, so the rebuild
+is checked over arbitrary interleavings at arbitrary recovery points, not just two
+hand-written cases. The remaining work is the
+`Database`-level wiring (non-logged secondary indexes rebuilt from the replayed
+heap, the as-of catalog's page anchors patched, sidecars reconstructed) so one
+call restores a whole multi-index database; the engine it rests on is now proven.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a
