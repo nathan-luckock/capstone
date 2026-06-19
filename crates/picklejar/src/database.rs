@@ -308,6 +308,17 @@ pub struct BackupReport {
     pub bytes: u64,
 }
 
+/// A summary of a [`Database::restore_as_of`] call: what was re-materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// The transaction point the restore captured.
+    pub point: u64,
+    /// Number of tables re-created.
+    pub tables: usize,
+    /// Number of rows re-inserted across all tables.
+    pub rows: usize,
+}
+
 /// A summary of a [`Database::protect`] call: what the parity snapshot covered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtectReport {
@@ -679,6 +690,107 @@ impl Database {
             if src.exists() {
                 report.bytes += std::fs::copy(&src, &dst)?;
                 report.files += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Logical point-in-time restore: rebuild a fresh database at `dest` holding
+    /// the state this database had as of transaction point `point` (a
+    /// transaction-id watermark from `txid_current()`).
+    ///
+    /// Each table's schema is reconstructed from the catalog, its explicit indexes
+    /// and views are recreated, and its rows are read through the
+    /// transaction-time-travel path, so the rebuilt database holds exactly the rows
+    /// committed as of `point`, re-materialized through the normal write path (fresh
+    /// transaction ids, a freshly built index, correct anchors). This is the sound,
+    /// logical form of point-in-time recovery: a physical log replay cannot rebuild
+    /// this engine's heap, because the B+ tree index pages are kept durable by
+    /// eager flushing and are not in the write-ahead log, so the log alone cannot
+    /// reconstruct a queryable database. Re-materializing the as-of-point snapshot
+    /// the MVCC version chains already retain sidesteps that entirely.
+    ///
+    /// Bounded by retained version history (a point older than `VACUUM` reclaimed is
+    /// no longer reachable). Like [`dump`](Self::dump), it carries schema, explicit
+    /// indexes, views, and data; it does not carry roles, grants, or policies. The
+    /// schema is the current one, so the restore is exact when the schema has not
+    /// changed since `point`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dest` cannot be created, or if re-creating a table or
+    /// re-inserting a row fails.
+    pub fn restore_as_of(&mut self, dest: impl AsRef<Path>, point: u64) -> Result<RestoreReport> {
+        let mut out = Self::open(dest)?;
+        // Travel this database's reads to the as-of point for the duration of the
+        // copy, restoring the prior setting (if any) on the way out.
+        let saved = self.transaction_time_as_of;
+        self.transaction_time_as_of = Some(point);
+        let result = self.copy_as_of_into(&mut out, point);
+        self.transaction_time_as_of = saved;
+        result
+    }
+
+    /// Re-materialize this database's (already travelled) reads into the fresh
+    /// database `out`: schema, then explicit indexes, then views, then data.
+    fn copy_as_of_into(&mut self, out: &mut Self, point: u64) -> Result<RestoreReport> {
+        let order = self.fk_safe_table_order();
+        let mut report = RestoreReport {
+            point,
+            tables: 0,
+            rows: 0,
+        };
+        // 1. Schema, parents before children (foreign-key-safe).
+        for table in &order {
+            let create = self.reconstruct_create_table(table)?;
+            out.execute(&create.to_string())?;
+            report.tables += 1;
+        }
+        // 2. Explicit indexes (those not auto-generated for a PRIMARY KEY / UNIQUE).
+        for table in &order {
+            if let Some(meta) = self.catalog.get_table(table) {
+                for ix in &meta.indexes {
+                    if ix.name != format!("{table}_{}_idx", ix.column) {
+                        out.execute(&format!(
+                            "CREATE INDEX {} ON {table} ({})",
+                            ix.name, ix.column
+                        ))?;
+                    }
+                }
+            }
+        }
+        // 3. Views, in name order.
+        let mut views: Vec<(String, String)> = self
+            .views
+            .iter()
+            .map(|(name, query)| (name.clone(), query.to_string()))
+            .collect();
+        views.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, query) in views {
+            out.execute(&format!("CREATE VIEW {name} AS {query}"))?;
+        }
+        // 4. Data as of the point, read through the travelled snapshot and
+        //    re-inserted in foreign-key-safe order.
+        for table in &order {
+            let QueryOutcome::Rows { columns, rows } =
+                self.execute(&format!("SELECT * FROM {table}"))?
+            else {
+                continue;
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let col_list = columns.join(", ");
+            for row in &rows {
+                let cells = row
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.execute(&format!(
+                    "INSERT INTO {table} ({col_list}) VALUES ({cells})"
+                ))?;
+                report.rows += 1;
             }
         }
         Ok(report)

@@ -20,7 +20,7 @@ pub mod security;
 pub mod valid_time_model;
 pub mod vecsim;
 
-pub use database::{BackupReport, Database, ProtectReport, QueryOutcome};
+pub use database::{BackupReport, Database, ProtectReport, QueryOutcome, RestoreReport};
 pub use error::{DbError, Result};
 
 // Re-export the value and type vocabulary so callers (the CLI, a future HTTP

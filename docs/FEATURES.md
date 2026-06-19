@@ -78,6 +78,17 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   script (tables in foreign-key-safe order with their constraints, then
   explicit indexes, views, and an `INSERT` per table) that recreates the whole
   database when run on an empty one. This is picklejar's `pg_dump`.
+- **Logical point-in-time restore** - `restore_as_of(dest, point)` rebuilds a
+  fresh database holding the state this one had as of a past transaction point (a
+  watermark from `txid_current()`). It reads every table through the
+  transaction-time-travel path and replays the rows into the new database via the
+  normal write path, so the result holds exactly the rows committed as of the
+  point, with fresh transaction ids, a freshly built index, and correct anchors.
+  It carries schema, explicit indexes, views, and data (like `dump`), bounded by
+  retained version history. The engine takes this logical route deliberately: the
+  B+ tree index pages are kept durable by eager flushing and are not in the
+  write-ahead log, so a physical log replay cannot rebuild a queryable heap, while
+  re-materializing the snapshot the version chains already retain is sound.
 - **Temporal types** - `DATE` and `TIMESTAMP` columns, with `DATE '2024-01-15'`
   / `TIMESTAMP '2024-01-15 10:30:00'` typed literals (a bare string is coerced
   into a temporal column). Stored as an epoch offset (days / microseconds) so
