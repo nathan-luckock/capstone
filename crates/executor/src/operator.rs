@@ -854,6 +854,14 @@ enum AggFunc {
     Min,
     Max,
     Avg,
+    /// Population variance (`VAR_POP`): the average squared deviation.
+    VarPop,
+    /// Sample variance (`VARIANCE` / `VAR_SAMP`): divides by `n - 1`.
+    VarSamp,
+    /// Population standard deviation (`STDDEV_POP`).
+    StddevPop,
+    /// Sample standard deviation (`STDDEV` / `STDDEV_SAMP`).
+    StddevSamp,
 }
 
 /// A parsed aggregate: a function, its argument (`None` for `COUNT(*)`), and
@@ -881,6 +889,12 @@ struct Acc {
     /// Whether any summed value was a decimal.
     saw_decimal: bool,
     num: u64,
+    /// Welford running count / mean / sum-of-squared-deviations, for the variance
+    /// and standard-deviation aggregates. One-pass and numerically stable, so a
+    /// large mean does not swamp the spread the way `sum_sq - sum^2/n` would.
+    wcount: f64,
+    mean: f64,
+    m2: f64,
     /// Running min / max of non-null values.
     min: Option<Value>,
     max: Option<Value>,
@@ -906,6 +920,10 @@ fn parse_agg(expr: &Expr) -> Result<AggSpec> {
         "MIN" => AggFunc::Min,
         "MAX" => AggFunc::Max,
         "AVG" => AggFunc::Avg,
+        "VAR_POP" => AggFunc::VarPop,
+        "VARIANCE" | "VAR_SAMP" => AggFunc::VarSamp,
+        "STDDEV_POP" => AggFunc::StddevPop,
+        "STDDEV" | "STDDEV_SAMP" => AggFunc::StddevSamp,
         other => return Err(ExecError::Unsupported(format!("aggregate {other}"))),
     };
     let arg = match args.as_slice() {
@@ -959,6 +977,15 @@ fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> 
         }
         _ => {}
     }
+    // Fold numeric values into the Welford state for the variance/stddev
+    // aggregates. Harmless for the others (their accumulators ignore these
+    // fields).
+    if let Some(x) = numeric_f64(&v) {
+        acc.wcount += 1.0;
+        let delta = x - acc.mean;
+        acc.mean += delta / acc.wcount;
+        acc.m2 += delta * (x - acc.mean);
+    }
     acc.min = Some(match acc.min.take() {
         Some(m) if sort_cmp(&m, &v) == Ordering::Less => m,
         _ => v.clone(),
@@ -1004,6 +1031,49 @@ fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
         }
         AggFunc::Min => acc.min.clone().unwrap_or(Value::Null),
         AggFunc::Max => acc.max.clone().unwrap_or(Value::Null),
+        AggFunc::VarPop => variance(acc, false),
+        AggFunc::VarSamp => variance(acc, true),
+        AggFunc::StddevPop => stddev(acc, false),
+        AggFunc::StddevSamp => stddev(acc, true),
+    }
+}
+
+/// The population (`sample == false`) or sample (`sample == true`) variance from a
+/// Welford accumulator, or `NULL` when there are too few values (none for
+/// population, fewer than two for sample, matching SQL).
+fn variance(acc: &Acc, sample: bool) -> Value {
+    let n = acc.wcount;
+    if sample {
+        if n < 2.0 {
+            return Value::Null;
+        }
+        Value::Float(acc.m2 / (n - 1.0))
+    } else {
+        if n < 1.0 {
+            return Value::Null;
+        }
+        Value::Float(acc.m2 / n)
+    }
+}
+
+/// The standard deviation: the square root of the corresponding variance, or
+/// `NULL` when the variance is.
+fn stddev(acc: &Acc, sample: bool) -> Value {
+    match variance(acc, sample) {
+        Value::Float(v) => Value::Float(v.sqrt()),
+        other => other,
+    }
+}
+
+/// The numeric value of `v` as `f64`, or `None` for a non-numeric value (which the
+/// variance and standard-deviation aggregates skip, like `SUM` does).
+#[allow(clippy::cast_precision_loss)]
+fn numeric_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        Value::Decimal(m, s) => Some(*m as f64 / 10f64.powi(i32::try_from(*s).unwrap_or(0))),
+        _ => None,
     }
 }
 
@@ -1354,7 +1424,8 @@ fn compute_partition(
                 };
             }
         }
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "VAR_POP" | "VAR_SAMP" | "VARIANCE"
+        | "STDDEV_POP" | "STDDEV_SAMP" | "STDDEV" => {
             // Whole-partition aggregate: one value shared by every row.
             let spec = parse_agg(&Expr::Func {
                 name: func.to_string(),

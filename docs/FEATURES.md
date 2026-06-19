@@ -70,7 +70,9 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (the `OUTER` keyword
   optional), `NATURAL` joins and `JOIN ... USING (cols)` (each resolved to the
   equivalent `ON` predicate over the shared columns), `GROUP BY` with `COUNT` / `SUM` / `MIN` /
-  `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`
+  `MAX` / `AVG`, the statistical aggregates `VAR_POP` / `VAR_SAMP` (`VARIANCE`) /
+  `STDDEV_POP` / `STDDEV_SAMP` (`STDDEV`) computed in one stable Welford pass (and
+  `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`
   (with `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST`), `LIMIT` / `OFFSET`.
 - **Set operations** - `UNION`, `INTERSECT`, and `EXCEPT`, each with optional
   `ALL` (multiset) semantics.
