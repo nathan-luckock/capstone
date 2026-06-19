@@ -65,6 +65,11 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   concrete counterexample so the proof is not vacuous.
 - **The reliability certificate.** `vecert` runs every invariant above and emits
   a content-hashed, regenerable report, framed in a named orbit's upset rate.
+- **A WAL-logged catalog.** Schema changes are written to the WAL as snapshot
+  records and replayed on open, so the log is authoritative for the schema: a
+  schema change that reached the log is recovered even if its sidecar write was
+  lost, and forward replay reconstructs later schema changes rather than only the
+  base state.
 
 So the engine detects every corruption it is built to catch, repairs from
 redundancy with no human in the loop, never serves a silently wrong or
@@ -76,10 +81,10 @@ model-checking of the core invariants.
 
 What is genuinely still ahead, stated honestly:
 
-- **Fully log-streamed point-in-time recovery.** Catalog metadata currently lives
-  in checksummed sidecars rather than the WAL, so forward replay reconstructs the
-  base state, not later schema changes. WAL-logging the catalog closes this, and
-  is the last piece of the recovery story.
+- **Point-in-time recovery bounded to an arbitrary LSN.** The catalog is now
+  WAL-logged and replayed on open; bounding that replay to a chosen LSN (the scan
+  already accepts the bound) wires restore-to-a-timestamp across schema changes
+  into the backup path.
 - **Partition tolerance.** Meaningful only once there is a multi-node replica to
   diverge from, so it is folded into the replication path rather than built ahead
   of it: the link is down for a bounded interval, the node serves locally, and it
