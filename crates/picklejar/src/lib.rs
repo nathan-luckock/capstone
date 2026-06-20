@@ -37,6 +37,7 @@ pub mod ratelimit;
 pub mod rendezvous;
 pub mod reservoir;
 pub mod retrieval;
+pub mod roaring;
 pub mod security;
 pub mod shamir;
 pub mod skiplist;
