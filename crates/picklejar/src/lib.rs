@@ -12,6 +12,7 @@ pub mod bloom;
 pub mod captoken;
 pub mod certify;
 pub mod correlated;
+pub mod countbloom;
 pub mod crdtmem;
 pub mod database;
 pub mod error;
