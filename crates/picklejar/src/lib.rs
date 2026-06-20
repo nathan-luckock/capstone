@@ -28,6 +28,7 @@ pub mod index;
 pub mod isolation_model;
 pub mod keyenc;
 pub mod ledger;
+pub mod lsh;
 pub mod persist;
 pub mod quantize;
 pub mod radiation;
