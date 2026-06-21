@@ -2,16 +2,28 @@
 
 # picklejar
 
-**Durable, isolated AI memory for hardware you cannot reach.**
-Proven by 1,000,000 deterministic crash simulations. A from-scratch, Postgres-wire database engine in Rust.
+### Durable, isolated AI memory for hardware you can neither reach nor trust.
+
+A from-scratch, Postgres-wire database engine in Rust. Its durability is proven by **1,000,000 deterministic crash simulations**, its core invariants by **exhaustive model checking**, and even its cryptography is written by hand.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/capstone/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/capstone/actions/workflows/ci.yml)
 [![Crash sims](https://img.shields.io/badge/crash%20sims-1%2C000%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
-[![Rust](https://img.shields.io/badge/Rust-from%20scratch-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Model-checked](https://img.shields.io/badge/invariants-5%20exhaustively%20proven-8957e5?style=flat-square&logo=ghostery&logoColor=white)](#proof-not-vibes)
+[![No unsafe](https://img.shields.io/badge/unsafe-forbidden-CE422B?style=flat-square&logo=rust&logoColor=white)](#)
 [![Postgres wire](https://img.shields.io/badge/wire-PostgreSQL%20v3-336791?style=flat-square&logo=postgresql&logoColor=white)](#it-speaks-postgres)
 [![License](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-2F81F7?style=flat-square)](#license)
 
 </div>
+
+<table align="center">
+<tr>
+<td align="center"><strong>1,000,000</strong><br/>crash sims survived</td>
+<td align="center"><strong>40,947,775</strong><br/>rows verified</td>
+<td align="center"><strong>5</strong><br/>invariants <em>exhaustively</em><br/>model-checked</td>
+<td align="center"><strong>0</strong><br/>lines of <code>unsafe</code></td>
+<td align="center"><strong>0</strong><br/>crypto dependencies</td>
+</tr>
+</table>
 
 ---
 
@@ -49,6 +61,23 @@ VERDICT: 20 invariants proven, recall held under drift, throughput measured live
 ```
 
 The verification numbers are deterministic (only the throughput line varies by machine), and `vecert` emits the same set as a notarized, content-hashed certificate. Five of those invariants are proved by *exhaustive* from-scratch model checking, not sampling: WAL ordering, snapshot isolation, RLS-filtered retrieval, cache freshness, and valid-time travel.
+
+## Run something impossible
+
+Every capability below is a **from-scratch primitive with a live demo** — no libraries pulled in, even the SHA-256 and the finite-field math are hand-written. Pick one and watch it run:
+
+| Watch it happen | One command |
+|---|---|
+| A nearest-neighbor answer you can **verify without trusting the server** | `cargo run --release --bin authknn` |
+| A memory that **proves it forgot** — unrecoverable even after a crash and a parity rebuild | `cargo run --release --bin forgetsim` |
+| Similarity search on a server that **never sees your embeddings** | `cargo run --release --bin blindsim` |
+| A history that **catches a forger** who rewrote and re-signed the whole log | `cargo run --release --bin ledgersim` |
+| Force an unreachable node to **prove it still holds your data** | `cargo run --release --bin retrievesim` |
+| Two partitioned nodes that **merge with zero conflicts** | `cargo run --release --bin crdtsim` |
+| A key **split so no single node can read it** | `cargo run --release --bin shamirsim` |
+| The whole proof on one page: throughput, recall, every invariant | `cargo run --release --bin scorecard` |
+
+...and **~40 runnable demos in all** (`ls crates/picklejar/src/bin`), every one a primitive built by hand: HyperLogLog, Count-Min, cuckoo filters, product quantization, consistent hashing, vector clocks, a forward-secure audit log, and more.
 
 ## What this is
 
