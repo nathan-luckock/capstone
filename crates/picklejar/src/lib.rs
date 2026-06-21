@@ -38,6 +38,7 @@ pub mod pir;
 pub mod pq;
 pub mod quantile;
 pub mod quantize;
+pub mod quorum;
 pub mod radiation;
 pub mod ratelimit;
 pub mod rendezvous;
