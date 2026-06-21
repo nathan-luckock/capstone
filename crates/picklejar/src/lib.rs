@@ -26,6 +26,7 @@ pub mod forwardlog;
 pub mod freshness_model;
 pub mod hll;
 pub mod hnsw;
+pub mod homoagg;
 pub mod index;
 pub mod isolation_model;
 pub mod keyenc;
