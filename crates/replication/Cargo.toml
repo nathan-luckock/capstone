@@ -24,6 +24,10 @@ path = "src/bin/repdemo.rs"
 name = "pjctl"
 path = "src/bin/pjctl.rs"
 
+[[bin]]
+name = "repcert"
+path = "src/bin/repcert.rs"
+
 [dependencies]
 picklejar.workspace = true
 
