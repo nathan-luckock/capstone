@@ -79,6 +79,31 @@ add a row-level-security policy (see [the memory-layer section of the
 README](../README.md#the-memory-layer)); similarity search then runs through the
 same fence.
 
+## Run a replicated cluster (multi-node)
+
+For hardware that can vanish or get cut off, run picklejar as an
+availability-first cluster. Start three nodes, each pointed at the others:
+
+```bash
+pjnode --id 0 --port 7500 --peer 1@127.0.0.1:7501 --peer 2@127.0.0.1:7502 &
+pjnode --id 1 --port 7501 --peer 0@127.0.0.1:7500 --peer 2@127.0.0.1:7502 &
+pjnode --id 2 --port 7502 --peer 0@127.0.0.1:7500 --peer 1@127.0.0.1:7501 &
+```
+
+Store and recall vector memories across the cluster with the `pjctl` client:
+
+```bash
+NODES="--node 0@127.0.0.1:7500 --node 1@127.0.0.1:7501 --node 2@127.0.0.1:7502"
+pjctl $NODES store 1 0.1,0.2,0.9 "the sky is blue"
+pjctl $NODES store 2 0.9,0.1,0.1 "fire is hot"
+pjctl $NODES recall 0.1,0.2,0.82 2     # distributed nearest-neighbor
+```
+
+Writes go to a key's replicas; recall is a scatter-gather nearest-neighbor
+across the nodes. The cluster stays available through a network partition and
+reconciles itself on heal (run `repdemo` to watch that, `repsim` to prove it at
+scale).
+
 ## What you just used
 
 The server is the from-scratch picklejar engine: SQL, MVCC, write-ahead logging
