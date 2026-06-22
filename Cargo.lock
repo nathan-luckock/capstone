@@ -457,6 +457,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "picklejar-replication"
+version = "0.0.1"
+dependencies = [
+ "picklejar",
+]
+
+[[package]]
 name = "picklejar-server"
 version = "0.0.1"
 dependencies = [
