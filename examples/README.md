@@ -1,6 +1,6 @@
 # Examples
 
-## `agent_memory.py` — durable, tenant-isolated agent memory
+## `agent_memory.py`: durable, tenant-isolated agent memory
 
 A small end-to-end demo of picklejar as an AI agent's memory: store facts as
 embeddings, recall the relevant ones by meaning, keep tenants isolated, and
@@ -16,11 +16,11 @@ python examples/agent_memory.py
 ```
 
 What it shows:
-- **store / recall** — agent memories go in as embeddings; a query recalls the
+- **store / recall**: agent memories go in as embeddings; a query recalls the
   nearest ones (the engine's `VECTOR` + distance search).
-- **tenant isolation** — two tenants share the store, and a recall only ever
+- **tenant isolation**: two tenants share the store, and a recall only ever
   returns the caller's own memories, even when another tenant's vector is nearer.
-- **forget** — a memory is deleted and no longer recalled.
+- **forget**: a memory is deleted and no longer recalled.
 
 The `embed()` in the script is a tiny collision-free bag-of-words stand-in so the
 demo needs no model or API key; in a real agent you pass embeddings from a real
