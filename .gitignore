@@ -23,3 +23,9 @@ Thumbs.db
 # Crash dumps / cores
 *.core
 core.*
+
+# Python
+__pycache__/
+*.pyc
+sdk/python/dist/
+*.egg-info/

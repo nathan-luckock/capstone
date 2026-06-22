@@ -357,6 +357,23 @@ fn handle_parse<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8])
 
 /// `Bind`: substitute parameter values into a prepared statement, creating a
 /// portal.
+/// Whether a statement produces a result set (so the extended protocol must
+/// describe its columns and the client should expect `DataRow`s). This is the
+/// read statements, plus an `INSERT` / `UPDATE` / `DELETE` carrying a
+/// `RETURNING` clause, which streams the affected rows like a query.
+fn statement_returns_rows(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select(_)
+        | Statement::Union { .. }
+        | Statement::With { .. }
+        | Statement::Explain { .. } => true,
+        Statement::Insert { returning, .. }
+        | Statement::Update { returning, .. }
+        | Statement::Delete { returning, .. } => !returning.is_empty(),
+        _ => false,
+    }
+}
+
 fn handle_bind<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8]) -> io::Result<()> {
     if session.failed {
         return Ok(());
@@ -415,13 +432,7 @@ fn handle_bind<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8]) 
         Err(e) => return fail(session, stream, &e),
     };
     let bound = parsed.substitute_params(&values);
-    let row_returning = matches!(
-        bound,
-        Statement::Select(_)
-            | Statement::Union { .. }
-            | Statement::With { .. }
-            | Statement::Explain { .. }
-    );
+    let row_returning = statement_returns_rows(&bound);
     session.portals.insert(
         portal_name,
         Portal {
@@ -1431,6 +1442,54 @@ mod tests {
             msgs.iter()
                 .any(|(t, p)| *t == b'D' && String::from_utf8_lossy(p).contains("carol")),
             "the inserted row should be visible",
+        );
+    }
+
+    #[test]
+    fn extended_protocol_insert_returning_describes_rows() {
+        // Regression: INSERT ... RETURNING over the extended protocol must send
+        // a RowDescription (T) before its DataRow (D), or a driver rejects the
+        // response ("D message without prior T"). Describe reports the returned
+        // columns and the statement runs exactly once.
+        let mut script = Vec::new();
+        push_startup(&mut script);
+        push_query(&mut script, "CREATE TABLE t (id INT, name TEXT)");
+        push_parse(
+            &mut script,
+            "",
+            "INSERT INTO t VALUES ($1, $2) RETURNING id",
+            &[20, 25],
+        );
+        push_bind(&mut script, "", "", &[Some("9"), Some("dave")]);
+        push_describe(&mut script, b'P', "");
+        push_execute(&mut script, "");
+        push_sync(&mut script);
+        // A following simple query confirms the row was inserted exactly once.
+        push_query(&mut script, "SELECT count(*) FROM t");
+        push_terminate(&mut script);
+        let msgs = run(script);
+
+        let t_pos = msgs
+            .iter()
+            .position(|(t, _)| *t == b'T')
+            .expect("RETURNING must send a RowDescription");
+        let d_pos = msgs
+            .iter()
+            .position(|(t, _)| *t == b'D')
+            .expect("RETURNING must send a DataRow");
+        assert!(t_pos < d_pos, "RowDescription must precede the DataRow");
+        let data = msgs.iter().find(|(t, _)| *t == b'D').unwrap();
+        assert!(
+            String::from_utf8_lossy(&data.1).contains('9'),
+            "the returned id should be 9, row was {:?}",
+            data.1
+        );
+        // count(*) is 1: Describe-then-Execute did not double-insert.
+        assert!(
+            msgs.iter()
+                .filter(|(t, _)| *t == b'D')
+                .any(|(_, p)| String::from_utf8_lossy(p).contains('1')),
+            "exactly one row should have been inserted",
         );
     }
 

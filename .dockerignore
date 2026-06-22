@@ -1,0 +1,6 @@
+target/
+.git/
+sdk/python/dist/
+**/*.db
+**/*.db-*
+**/__pycache__/

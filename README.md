@@ -169,6 +169,7 @@ Both the simple and the extended query protocol (server-side prepared statements
 
 | | |
 |---|---|
+| [docs/quickstart.md](docs/quickstart.md) | run the server and store/recall memories in five minutes (psql, any driver, or the Python client) |
 | [docs/why-from-scratch.md](docs/why-from-scratch.md) | why this is not just Postgres + pgvector, the objection answered honestly |
 | [docs/gallery.md](docs/gallery.md) | every runnable demo and hand-built primitive, grouped |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is built, and where the frontier is |

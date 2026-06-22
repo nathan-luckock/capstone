@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "picklejar"
+version = "0.1.0"
+description = "Python client for the picklejar AI-memory database"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "picklejar" }]
+keywords = ["ai", "memory", "vector", "database", "embeddings", "postgres"]
+dependencies = ["psycopg[binary]>=3.1"]
+
+[project.urls]
+Homepage = "https://github.com/nathan-luckock/capstone"
+
+[tool.hatch.build.targets.wheel]
+packages = ["picklejar"]

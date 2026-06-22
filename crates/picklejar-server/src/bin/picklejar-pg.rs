@@ -31,6 +31,10 @@ struct Args {
     /// Path to the database file.
     #[arg(short, long, default_value = "picklejar.db")]
     database: String,
+    /// Address to bind. Defaults to loopback only; set `0.0.0.0` to accept
+    /// connections from other hosts (for example, from outside a container).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
     /// TCP port to listen on.
     #[arg(short, long, default_value_t = 5433)]
     port: u16,
@@ -57,10 +61,10 @@ fn main() {
             }
         };
 
-    let listener = match TcpListener::bind(("127.0.0.1", args.port)) {
+    let listener = match TcpListener::bind((args.host.as_str(), args.port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("could not bind port {}: {e}", args.port);
+            eprintln!("could not bind {}:{}: {e}", args.host, args.port);
             std::process::exit(1);
         }
     };
@@ -76,8 +80,9 @@ fn main() {
         "trust (no password)".to_string()
     };
     println!(
-        "picklejar-pg listening on 127.0.0.1:{port} (database {db_path}, auth: {auth_note})\n\
-         connect with: psql -h 127.0.0.1 -p {port} -U {user}",
+        "picklejar-pg listening on {host}:{port} (database {db_path}, auth: {auth_note})\n\
+         connect with: psql -h {host} -p {port} -U {user}",
+        host = args.host,
         port = args.port,
         db_path = args.database,
         user = args.user,
