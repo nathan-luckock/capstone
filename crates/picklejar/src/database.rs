@@ -6171,10 +6171,25 @@ fn column_type(rows: &[Vec<Value>], i: usize) -> DataType {
 /// A table's freshly computed `(column name, statistics)` list.
 type ColumnStatList = Vec<(String, ColumnStats)>;
 
+/// How many exact distinct values we track before falling back to the
+/// `HyperLogLog` estimate. Below this an exact set is cheap and precise; above
+/// it the set would grow without bound (memory proportional to cardinality),
+/// so we stop inserting and let the fixed ~16 KiB sketch carry the estimate.
+/// This is how real databases estimate `n_distinct` instead of holding every
+/// value: exact when it is affordable, a sketch when it is not.
+const EXACT_DISTINCT_CAP: usize = 4096;
+
 /// Compute one column's statistics over `rows`: its distinct count (NULLs
 /// excluded) and, for an integer column, its min and max.
+///
+/// The distinct count is exact up to [`EXACT_DISTINCT_CAP`] distinct values and
+/// a `HyperLogLog` estimate beyond that, so analyzing a high-cardinality column
+/// costs a fixed ~16 KiB rather than memory proportional to its cardinality.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut hll = crate::hll::HyperLogLog::new();
+    let mut overflowed = false;
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
     for row in rows {
@@ -6182,16 +6197,60 @@ fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
         if matches!(value, Value::Null) {
             continue;
         }
-        seen.insert(stat_key(value));
+        let key = stat_key(value);
+        hll.add(&key);
+        // Hold the exact set only while it is small; past the cap the sketch
+        // takes over and the set is freed, so memory stays bounded.
+        if !overflowed {
+            seen.insert(key);
+            if seen.len() > EXACT_DISTINCT_CAP {
+                overflowed = true;
+                seen.clear();
+            }
+        }
         if let Value::Int(n) = value {
             min = Some(min.map_or(*n, |m| m.min(*n)));
             max = Some(max.map_or(*n, |m| m.max(*n)));
         }
     }
-    ColumnStats {
-        distinct: u64::try_from(seen.len()).unwrap_or(u64::MAX).max(1),
-        min,
-        max,
+    let distinct = if overflowed {
+        hll.estimate().round().max(1.0) as u64
+    } else {
+        u64::try_from(seen.len()).unwrap_or(u64::MAX).max(1)
+    };
+    ColumnStats { distinct, min, max }
+}
+
+#[cfg(test)]
+mod analyze_column_tests {
+    use super::{analyze_column, EXACT_DISTINCT_CAP};
+    use picklejar_sql::Value;
+
+    #[test]
+    fn small_column_distinct_is_exact() {
+        // Seven distinct values repeated: an exact count, with min/max.
+        let rows: Vec<Vec<Value>> = (0..100).map(|i| vec![Value::Int(i % 7)]).collect();
+        let s = analyze_column(&rows, 0);
+        assert_eq!(s.distinct, 7);
+        assert_eq!(s.min, Some(0));
+        assert_eq!(s.max, Some(6));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn high_cardinality_distinct_is_estimated_in_bounded_memory() {
+        // Far more distinct values than the exact cap: the HyperLogLog estimate
+        // takes over and stays within a few percent, in fixed memory.
+        let n: i64 = 50_000;
+        assert!(usize::try_from(n).unwrap() > EXACT_DISTINCT_CAP);
+        let rows: Vec<Vec<Value>> = (0..n).map(|i| vec![Value::Int(i)]).collect();
+        let s = analyze_column(&rows, 0);
+        let err = (s.distinct as f64 - n as f64).abs() / n as f64;
+        assert!(
+            err < 0.05,
+            "distinct estimate {} should be within 5% of {n}",
+            s.distinct
+        );
     }
 }
 
