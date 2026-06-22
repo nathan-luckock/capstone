@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use picklejar_sql::{DataType, Statement};
+use picklejar_sql::{DataType, Statement, Value};
 
 use crate::error::{PlanError, Result};
 
@@ -41,27 +41,39 @@ pub struct IndexMeta {
 }
 
 /// Per-column statistics used by the cost model.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+///
+/// Not `Copy`: the most-common-values list is a (small, bounded) `Vec`, so the
+/// cost model clones a column's stats when it needs them.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ColumnStats {
     /// Number of distinct values (cardinality). Used for equality
-    /// selectivity (`1 / distinct`). Never zero.
+    /// selectivity (`1 / distinct`) outside the most-common-values list.
+    /// Never zero.
     pub distinct: u64,
     /// Smallest integer value seen, for range selectivity (`None` for a
     /// non-integer column or before `ANALYZE`).
     pub min: Option<i64>,
     /// Largest integer value seen, for range selectivity.
     pub max: Option<i64>,
+    /// The most common values and the fraction of the table's rows each
+    /// covers, highest first. `ANALYZE` fills this from a bounded Space-Saving
+    /// summary so a skewed column's equality selectivity uses a value's real
+    /// frequency instead of the uniform `1 / distinct` guess. Empty before
+    /// `ANALYZE` or for a column with no notable heavy hitters.
+    pub most_common: Vec<(Value, f64)>,
 }
 
 impl Default for ColumnStats {
     fn default() -> Self {
         // A single distinct value is the most pessimistic non-degenerate
         // default: equality selectivity 1.0 (matches every row). No min/max
-        // means range estimates fall back to the textbook default.
+        // means range estimates fall back to the textbook default, and an
+        // empty most-common list means equality uses 1 / distinct.
         Self {
             distinct: 1,
             min: None,
             max: None,
+            most_common: Vec::new(),
         }
     }
 }
@@ -104,7 +116,7 @@ impl TableMeta {
     /// Stats for `column`, or the default if none recorded.
     #[must_use]
     pub fn column_stats(&self, column: &str) -> ColumnStats {
-        self.stats.columns.get(column).copied().unwrap_or_default()
+        self.stats.columns.get(column).cloned().unwrap_or_default()
     }
 }
 

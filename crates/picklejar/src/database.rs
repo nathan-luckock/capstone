@@ -866,6 +866,7 @@ impl Database {
                             distinct: r.next_rowid.max(1),
                             min: None,
                             max: None,
+                            ..Default::default()
                         },
                     )?;
                 }
@@ -1987,6 +1988,7 @@ impl Database {
                         distinct: r.distinct,
                         min: None,
                         max: None,
+                        ..Default::default()
                     },
                 )?;
             }
@@ -3453,6 +3455,7 @@ impl Database {
                     distinct,
                     min: None,
                     max: None,
+                    ..Default::default()
                 },
             )?;
         }
@@ -4489,6 +4492,7 @@ impl Database {
                     distinct: row_count.max(1),
                     min: None,
                     max: None,
+                    ..Default::default()
                 },
             )?;
         }
@@ -6179,16 +6183,27 @@ type ColumnStatList = Vec<(String, ColumnStats)>;
 /// value: exact when it is affordable, a sketch when it is not.
 const EXACT_DISTINCT_CAP: usize = 4096;
 
+/// How many heaviest values the most-common-values list retains, so the cost
+/// model can cost a skewed value by its real frequency.
+const MOST_COMMON_VALUES: usize = 32;
+
+/// Space-Saving counter capacity while finding the heavy hitters. Wider than
+/// the retained list so the kept values' frequency estimates are tight.
+const MCV_TRACKING_CAPACITY: usize = 256;
+
 /// Compute one column's statistics over `rows`: its distinct count (NULLs
-/// excluded) and, for an integer column, its min and max.
+/// excluded), its min/max for an integer column, and its most common values.
 ///
 /// The distinct count is exact up to [`EXACT_DISTINCT_CAP`] distinct values and
 /// a `HyperLogLog` estimate beyond that, so analyzing a high-cardinality column
 /// costs a fixed ~16 KiB rather than memory proportional to its cardinality.
+/// The most-common-values list comes from a bounded Space-Saving summary, so a
+/// skewed column's equality selectivity uses real frequencies.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut hll = crate::hll::HyperLogLog::new();
+    let mut heavy = crate::spacesaving::SpaceSaving::with_capacity(MCV_TRACKING_CAPACITY);
     let mut overflowed = false;
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
@@ -6199,6 +6214,7 @@ fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
         }
         let key = stat_key(value);
         hll.add(&key);
+        heavy.offer(&key);
         // Hold the exact set only while it is small; past the cap the sketch
         // takes over and the set is freed, so memory stays bounded.
         if !overflowed {
@@ -6218,7 +6234,56 @@ fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
     } else {
         u64::try_from(seen.len()).unwrap_or(u64::MAX).max(1)
     };
-    ColumnStats { distinct, min, max }
+    let most_common = most_common_values(rows, col, &heavy);
+    ColumnStats {
+        distinct,
+        min,
+        max,
+        most_common,
+    }
+}
+
+/// Recover the heaviest values and their table-fraction frequencies from a
+/// Space-Saving summary. The summary tracks keys (the canonical [`stat_key`]
+/// bytes); a single extra pass over `rows` maps each retained key back to the
+/// `Value` the cost model compares query literals against.
+#[allow(clippy::cast_precision_loss)]
+fn most_common_values(
+    rows: &[Vec<Value>],
+    col: usize,
+    heavy: &crate::spacesaving::SpaceSaving,
+) -> Vec<(Value, f64)> {
+    let total_rows = rows.len();
+    if total_rows == 0 {
+        return Vec::new();
+    }
+    let top = heavy.top(MOST_COMMON_VALUES);
+    if top.is_empty() {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<&Vec<u8>> = top.iter().map(|(k, _)| k).collect();
+    let mut recovered: std::collections::HashMap<Vec<u8>, Value> = std::collections::HashMap::new();
+    for row in rows {
+        if recovered.len() == wanted.len() {
+            break;
+        }
+        let Some(value) = row.get(col) else { continue };
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let key = stat_key(value);
+        if wanted.contains(&key) && !recovered.contains_key(&key) {
+            recovered.insert(key, value.clone());
+        }
+    }
+    top.iter()
+        .filter_map(|(k, tracked)| {
+            recovered.get(k).map(|v| {
+                let freq = (tracked.count as f64 / total_rows as f64).min(1.0);
+                (v.clone(), freq)
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -6250,6 +6315,23 @@ mod analyze_column_tests {
             err < 0.05,
             "distinct estimate {} should be within 5% of {n}",
             s.distinct
+        );
+    }
+
+    #[test]
+    fn skewed_column_records_its_heavy_hitter() {
+        // 900 rows of value 7 (90%), then 100 distinct cold values.
+        let mut rows: Vec<Vec<Value>> = (0..900).map(|_| vec![Value::Int(7)]).collect();
+        rows.extend((0..100).map(|i| vec![Value::Int(1000 + i)]));
+        let s = analyze_column(&rows, 0);
+        let (_, freq) = s
+            .most_common
+            .iter()
+            .find(|(v, _)| *v == Value::Int(7))
+            .expect("the dominant value must be a most-common value");
+        assert!(
+            (freq - 0.9).abs() < 0.05,
+            "heavy hitter frequency {freq} should be near 0.9"
         );
     }
 }

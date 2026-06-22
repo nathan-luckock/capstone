@@ -19,7 +19,7 @@
 //! - `NOT a` -> `1 - sel(a)`.
 //! - anything else -> `0.5` (no information).
 
-use picklejar_sql::{BinOp, Expr, UnOp};
+use picklejar_sql::{BinOp, Expr, UnOp, Value};
 
 use crate::catalog::TableMeta;
 
@@ -55,18 +55,12 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
             let b = selectivity(right, table);
             a.mul_add(-b, a + b)
         }
-        BinOp::Eq => column_const(left, right).map_or(UNKNOWN_SELECTIVITY, |col| {
-            let distinct = table.column_stats(col).distinct.max(1);
-            #[allow(clippy::cast_precision_loss)]
-            let d = distinct as f64;
-            1.0 / d
-        }),
-        BinOp::Ne => column_const(left, right).map_or(UNKNOWN_SELECTIVITY, |col| {
-            let distinct = table.column_stats(col).distinct.max(1);
-            #[allow(clippy::cast_precision_loss)]
-            let d = distinct as f64;
-            1.0 - 1.0 / d
-        }),
+        BinOp::Eq => column_and_literal(left, right)
+            .map_or(UNKNOWN_SELECTIVITY, |(col, lit)| eq_selectivity(col, lit, table)),
+        BinOp::Ne => column_and_literal(left, right)
+            .map_or(UNKNOWN_SELECTIVITY, |(col, lit)| {
+                1.0 - eq_selectivity(col, lit, table)
+            }),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => range_selectivity(op, left, right, table),
         // LIKE has no cheap cardinality estimate, and the arithmetic, concat,
         // and JSON-access operators are not boolean predicates: all default.
@@ -147,6 +141,51 @@ const fn flip(op: BinOp) -> BinOp {
 const fn int_literal(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Literal(picklejar_sql::Value::Int(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Equality selectivity for `col = lit`.
+///
+/// A value in the column's most-common-values list (gathered by `ANALYZE` from
+/// a Space-Saving summary) uses its measured frequency, so a skewed value is
+/// costed by how common it really is. A value not in the list takes the
+/// residual: the fraction of rows the list does not cover, spread uniformly
+/// over the remaining distinct values. With an empty list this reduces exactly
+/// to the old `1 / distinct`.
+#[allow(clippy::cast_precision_loss)]
+fn eq_selectivity(col: &str, lit: &Value, table: &TableMeta) -> f64 {
+    let stats = table.column_stats(col);
+    if let Some((_, freq)) = stats.most_common.iter().find(|(v, _)| v == lit) {
+        return *freq;
+    }
+    let mcv_count = stats.most_common.len() as u64;
+    let distinct = stats.distinct.max(1);
+    if distinct > mcv_count {
+        let mcv_freq: f64 = stats.most_common.iter().map(|(_, f)| f).sum();
+        let remaining = (distinct - mcv_count) as f64;
+        (1.0 - mcv_freq).max(0.0) / remaining
+    } else {
+        1.0 / distinct as f64
+    }
+}
+
+/// If exactly one side is a column reference and the other a literal, return
+/// the column name paired with the literal's value.
+fn column_and_literal<'a>(left: &'a Expr, right: &'a Expr) -> Option<(&'a str, &'a Value)> {
+    if let Some(v) = literal_value(right) {
+        Some((column_name(left)?, v))
+    } else if let Some(v) = literal_value(left) {
+        Some((column_name(right)?, v))
+    } else {
+        None
+    }
+}
+
+/// The value of a literal expression, if it is one.
+const fn literal_value(expr: &Expr) -> Option<&Value> {
+    match expr {
+        Expr::Literal(v) => Some(v),
         _ => None,
     }
 }
@@ -276,6 +315,38 @@ mod tests {
         assert!((selectivity(&pred("id > 5"), &t) - RANGE_SELECTIVITY).abs() < 1e-9);
     }
 
+    #[test]
+    fn equality_uses_most_common_value_frequency() {
+        use picklejar_sql::Value;
+        let mut c = Catalog::new();
+        c.apply(
+            &Parser::from_sql("CREATE TABLE t (id INT, name TEXT)")
+                .unwrap()
+                .parse_statement()
+                .unwrap(),
+        )
+        .unwrap();
+        c.set_row_count("t", 1000).unwrap();
+        // id = 7 covers 90% of rows; the other four distinct values share the rest.
+        c.set_column_stats(
+            "t",
+            "id",
+            ColumnStats {
+                distinct: 5,
+                most_common: vec![(Value::Int(7), 0.9)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let t = c.get_table("t").unwrap().clone();
+        // The heavy hitter is costed by its real frequency, not 1/5 = 0.2.
+        assert!((selectivity(&pred("id = 7"), &t) - 0.9).abs() < 1e-9);
+        // A value outside the list takes the residual: (1 - 0.9) / (5 - 1) = 0.025.
+        assert!((selectivity(&pred("id = 1"), &t) - 0.025).abs() < 1e-9);
+        // != is the complement of the heavy hitter.
+        assert!((selectivity(&pred("id != 7"), &t) - 0.1).abs() < 1e-9);
+    }
+
     /// A table whose `id` column has known min/max from `ANALYZE`.
     fn table_with_range(min: i64, max: i64) -> TableMeta {
         let mut c = Catalog::new();
@@ -293,6 +364,7 @@ mod tests {
                 distinct: 100,
                 min: Some(min),
                 max: Some(max),
+                ..Default::default()
             },
         )
         .unwrap();
