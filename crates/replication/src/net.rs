@@ -24,6 +24,8 @@ const REQ_GET: u8 = 2;
 const REQ_PULL: u8 = 3;
 const REQ_KNN: u8 = 4;
 const REQ_ROOT: u8 = 5;
+const REQ_DIGEST: u8 = 6;
+const REQ_PULLKEYS: u8 = 7;
 const VNODES: u32 = 64;
 const MERKLE_DEPTH: u32 = 8;
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -217,76 +219,129 @@ fn serve_conn(stream: &mut TcpStream, store: &Arc<Mutex<Replica>>) -> io::Result
 
 fn handle(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
     match req.first().copied() {
-        Some(REQ_PUT) => {
-            let mut off = 1;
-            let key = get_u64(req, &mut off);
-            let value = get_bytes(req, &mut off);
-            store.lock().expect("store lock").set(key, &value);
-            vec![REQ_PUT]
-        }
-        Some(REQ_GET) => {
-            let mut off = 1;
-            let key = get_u64(req, &mut off);
-            let slot = store.lock().expect("store lock").slots().get(&key).cloned();
-            let mut out = vec![REQ_GET];
-            if let Some(s) = slot {
-                out.push(1);
-                put_slot(&mut out, &s);
-            } else {
-                out.push(0);
-            }
-            out
-        }
-        Some(REQ_PULL) => {
-            let entries: Vec<(u64, Slot)> = {
-                let guard = store.lock().expect("store lock");
-                guard.slots().iter().map(|(k, s)| (*k, s.clone())).collect()
-            };
-            let mut out = vec![REQ_PULL];
-            put_u32(&mut out, u32::try_from(entries.len()).unwrap_or(u32::MAX));
-            for (k, s) in &entries {
-                put_u64(&mut out, *k);
-                put_slot(&mut out, s);
-            }
-            out
-        }
-        Some(REQ_KNN) => {
-            let mut off = 1;
-            let query = get_vec_f32(req, &mut off);
-            let k = usize::try_from(get_u32(req, &mut off)).unwrap_or(0);
-            let memories: Vec<(u64, Vec<u8>)> = {
-                let guard = store.lock().expect("store lock");
-                guard
-                    .slots()
-                    .iter()
-                    .filter_map(|(id, s)| s.value.as_ref().map(|v| (*id, v.clone())))
-                    .collect()
-            };
-            let mut hits: Vec<(u64, f64, Vec<u8>)> = memories
-                .iter()
-                .map(|(id, val)| {
-                    let (embedding, payload) = decode_memory(val);
-                    (*id, l2_sq(&query, &embedding), payload)
-                })
-                .collect();
-            hits.sort_by(|a, b| a.1.total_cmp(&b.1));
-            hits.truncate(k);
-            let mut out = vec![REQ_KNN];
-            put_u32(&mut out, u32::try_from(hits.len()).unwrap_or(u32::MAX));
-            for (id, dist, payload) in &hits {
-                put_u64(&mut out, *id);
-                put_f64(&mut out, *dist);
-                put_bytes(&mut out, payload);
-            }
-            out
-        }
+        Some(REQ_PUT) => req_put(req, store),
+        Some(REQ_GET) => req_get(req, store),
+        Some(REQ_PULL) => req_pull(store),
+        Some(REQ_KNN) => req_knn(req, store),
         Some(REQ_ROOT) => {
             let mut out = vec![REQ_ROOT];
             out.extend_from_slice(&store_root(store));
             out
         }
+        Some(REQ_DIGEST) => req_digest(store),
+        Some(REQ_PULLKEYS) => req_pullkeys(req, store),
         _ => vec![255],
     }
+}
+
+fn req_put(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let mut off = 1;
+    let key = get_u64(req, &mut off);
+    let value = get_bytes(req, &mut off);
+    store.lock().expect("store lock").set(key, &value);
+    vec![REQ_PUT]
+}
+
+fn req_get(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let mut off = 1;
+    let key = get_u64(req, &mut off);
+    let slot = store.lock().expect("store lock").slots().get(&key).cloned();
+    let mut out = vec![REQ_GET];
+    if let Some(s) = slot {
+        out.push(1);
+        put_slot(&mut out, &s);
+    } else {
+        out.push(0);
+    }
+    out
+}
+
+fn req_pull(store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let entries: Vec<(u64, Slot)> = {
+        let guard = store.lock().expect("store lock");
+        guard.slots().iter().map(|(k, s)| (*k, s.clone())).collect()
+    };
+    let mut out = vec![REQ_PULL];
+    put_u32(&mut out, u32::try_from(entries.len()).unwrap_or(u32::MAX));
+    for (k, s) in &entries {
+        put_u64(&mut out, *k);
+        put_slot(&mut out, s);
+    }
+    out
+}
+
+fn req_knn(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let mut off = 1;
+    let query = get_vec_f32(req, &mut off);
+    let k = usize::try_from(get_u32(req, &mut off)).unwrap_or(0);
+    let memories: Vec<(u64, Vec<u8>)> = {
+        let guard = store.lock().expect("store lock");
+        guard
+            .slots()
+            .iter()
+            .filter_map(|(id, s)| s.value.as_ref().map(|v| (*id, v.clone())))
+            .collect()
+    };
+    let mut hits: Vec<(u64, f64, Vec<u8>)> = memories
+        .iter()
+        .map(|(id, val)| {
+            let (embedding, payload) = decode_memory(val);
+            (*id, l2_sq(&query, &embedding), payload)
+        })
+        .collect();
+    hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+    hits.truncate(k);
+    let mut out = vec![REQ_KNN];
+    put_u32(&mut out, u32::try_from(hits.len()).unwrap_or(u32::MAX));
+    for (id, dist, payload) in &hits {
+        put_u64(&mut out, *id);
+        put_f64(&mut out, *dist);
+        put_bytes(&mut out, payload);
+    }
+    out
+}
+
+fn req_digest(store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    // A compact per-key fingerprint: (key, ts, origin) identifies a slot's
+    // version without shipping its value.
+    let digest: Vec<(u64, u64, u64)> = {
+        let guard = store.lock().expect("store lock");
+        guard
+            .slots()
+            .iter()
+            .map(|(k, s)| (*k, s.ts, s.origin))
+            .collect()
+    };
+    let mut out = vec![REQ_DIGEST];
+    put_u32(&mut out, u32::try_from(digest.len()).unwrap_or(u32::MAX));
+    for (k, ts, origin) in &digest {
+        put_u64(&mut out, *k);
+        put_u64(&mut out, *ts);
+        put_u64(&mut out, *origin);
+    }
+    out
+}
+
+fn req_pullkeys(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let mut off = 1;
+    let count = usize::try_from(get_u32(req, &mut off)).unwrap_or(0);
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        keys.push(get_u64(req, &mut off));
+    }
+    let slots: Vec<(u64, Slot)> = {
+        let guard = store.lock().expect("store lock");
+        keys.iter()
+            .filter_map(|k| guard.slots().get(k).map(|s| (*k, s.clone())))
+            .collect()
+    };
+    let mut out = vec![REQ_PULLKEYS];
+    put_u32(&mut out, u32::try_from(slots.len()).unwrap_or(u32::MAX));
+    for (k, s) in &slots {
+        put_u64(&mut out, *k);
+        put_slot(&mut out, s);
+    }
+    out
 }
 
 fn request(addr: &str, req: &[u8]) -> io::Result<Vec<u8>> {
@@ -313,14 +368,48 @@ pub fn pull_into(store: &Arc<Mutex<Replica>>, peer: &str) -> io::Result<usize> {
         return Ok(0);
     }
 
-    let resp = request(peer, &[REQ_PULL])?;
-    if resp.first() != Some(&REQ_PULL) {
+    // Roots differ. Exchange compact (key, ts, origin) digests and pull only the
+    // keys whose version the peer has and we do not, rather than the whole store.
+    let local: std::collections::BTreeMap<u64, (u64, u64)> = {
+        let guard = store.lock().expect("store lock");
+        guard
+            .slots()
+            .iter()
+            .map(|(k, s)| (*k, (s.ts, s.origin)))
+            .collect()
+    };
+    let digest = request(peer, &[REQ_DIGEST])?;
+    if digest.first() != Some(&REQ_DIGEST) {
         return Ok(0);
     }
     let mut off = 1;
-    let count = usize::try_from(get_u32(&resp, &mut off)).unwrap_or(0);
-    let mut pairs = Vec::with_capacity(count);
+    let count = usize::try_from(get_u32(&digest, &mut off)).unwrap_or(0);
+    let mut needed = Vec::new();
     for _ in 0..count {
+        let key = get_u64(&digest, &mut off);
+        let ts = get_u64(&digest, &mut off);
+        let origin = get_u64(&digest, &mut off);
+        if local.get(&key) != Some(&(ts, origin)) {
+            needed.push(key);
+        }
+    }
+    if needed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut req = vec![REQ_PULLKEYS];
+    put_u32(&mut req, u32::try_from(needed.len()).unwrap_or(u32::MAX));
+    for key in &needed {
+        put_u64(&mut req, *key);
+    }
+    let resp = request(peer, &req)?;
+    if resp.first() != Some(&REQ_PULLKEYS) {
+        return Ok(0);
+    }
+    let mut off = 1;
+    let got = usize::try_from(get_u32(&resp, &mut off)).unwrap_or(0);
+    let mut pairs = Vec::with_capacity(got);
+    for _ in 0..got {
         let key = get_u64(&resp, &mut off);
         let slot = get_slot(&resp, &mut off);
         pairs.push((key, slot));
@@ -331,7 +420,7 @@ pub fn pull_into(store: &Arc<Mutex<Replica>>, peer: &str) -> io::Result<usize> {
             guard.merge_slot(key, slot);
         }
     }
-    Ok(count)
+    Ok(got)
 }
 
 /// One result of a distributed nearest-neighbor recall.
@@ -604,6 +693,35 @@ mod tests {
             !ids.contains(&2),
             "the far memory is not in the top 2: {ids:?}"
         );
+    }
+
+    #[test]
+    fn pull_ships_only_the_differing_key() {
+        let (addr_a, store_a) = spawn_node(0);
+        let (_addr_b, store_b) = spawn_node(1);
+        {
+            let mut a = store_a.lock().expect("lock");
+            for k in 0..50u64 {
+                a.set(k, b"v");
+            }
+        }
+        // First pull copies all 50 keys.
+        assert_eq!(pull_into(&store_b, &addr_a).expect("pull"), 50);
+        // A changes one key; the next pull ships only that key.
+        {
+            let mut a = store_a.lock().expect("lock");
+            a.set(7, b"changed");
+        }
+        assert_eq!(
+            pull_into(&store_b, &addr_a).expect("pull"),
+            1,
+            "digest exchange ships only the changed key"
+        );
+        let v7 = {
+            let b = store_b.lock().expect("lock");
+            b.get(7).map(<[u8]>::to_vec)
+        };
+        assert_eq!(v7, Some(b"changed".to_vec()));
     }
 
     #[test]
