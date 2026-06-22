@@ -11,6 +11,7 @@ members = [
     "crates/picklejar-cli",
     "crates/picklejar-server",
     "crates/picklejar-difftest",
+    "crates/replication",
 ]
 
 [workspace.package]
