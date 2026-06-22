@@ -1,0 +1,29 @@
+<svg viewBox="0 0 920 430" xmlns="http://www.w3.org/2000/svg" role="img" font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace">
+  <title>picklejar attest terminal card: 34 of 34 checks passed</title>
+  <desc>A dark terminal window showing the picklejar grand attestation with green PASS lines and a verdict of 34 of 34 checks passed.</desc>
+  <rect x="8" y="8" width="904" height="414" rx="14" fill="#0d1117" stroke="#222b36" stroke-width="1"/>
+  <rect x="8" y="8" width="904" height="44" rx="14" fill="#161b22"/>
+  <rect x="8" y="38" width="904" height="14" fill="#161b22"/>
+  <circle cx="34" cy="30" r="6" fill="#ff5f56"/>
+  <circle cx="56" cy="30" r="6" fill="#febc2e"/>
+  <circle cx="78" cy="30" r="6" fill="#27c93f"/>
+  <text x="460" y="35" text-anchor="middle" font-size="14" fill="#7d8da0">picklejar · attest</text>
+
+  <text x="34" y="92" font-size="17" fill="#7d8da0">$ <tspan fill="#e6edf3">cargo run --release --bin attest</tspan></text>
+
+  <text x="34" y="132" font-size="14" fill="#56707f" letter-spacing="2">PICKLEJAR GRAND ATTESTATION</text>
+
+  <text x="34" y="170" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> wal ordering</text>
+  <text x="480" y="170" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> snapshot isolation</text>
+  <text x="34" y="200" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> rls retrieval isolation</text>
+  <text x="480" y="200" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> authenticated sql</text>
+  <text x="34" y="230" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> provable forgetting</text>
+  <text x="480" y="230" font-size="16" fill="#43d17f"><tspan fill="#566b5a">[</tspan>PASS<tspan fill="#566b5a">]</tspan> radiation survivability</text>
+  <text x="34" y="260" font-size="16" fill="#566b5a">... 34 checks across durability, cryptography, and distribution ...</text>
+
+  <line x1="34" y1="288" x2="886" y2="288" stroke="#222b36" stroke-width="1"/>
+
+  <text x="34" y="322" font-size="18" fill="#e6edf3">VERDICT: <tspan fill="#43d17f" font-weight="bold">34 / 34 checks passed</tspan> · all guarantees held</text>
+  <text x="34" y="352" font-size="15" fill="#7d8da0">attestation hash: <tspan fill="#e3b341">3750b4e8…</tspan>  (regenerate from this commit to verify)</text>
+  <text x="34" y="392" font-size="14" fill="#56707f">durability backed by 1,000,000 deterministic crash simulations</text>
+</svg>

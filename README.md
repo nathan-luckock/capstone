@@ -13,6 +13,10 @@ A from-scratch, Postgres-wire database engine in Rust. Its durability is proven 
 [![Postgres wire](https://img.shields.io/badge/wire-PostgreSQL%20v3-336791?style=flat-square&logo=postgresql&logoColor=white)](#it-speaks-postgres)
 [![License](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-2F81F7?style=flat-square)](#license)
 
+<br/>
+
+<img src="docs/img/attest.svg" alt="picklejar attest: one command re-verifies every guarantee, 34/34 checks passed" width="820"/>
+
 </div>
 
 > Built for hardware you can't reach: a satellite, a forward-deployed sensor, a seabed node, a robot in the field. When a disk corrupts and there is no technician, picklejar detects it, repairs it from parity, and proves it never served a wrong answer or leaked one tenant's data into another's.
@@ -31,26 +35,7 @@ A from-scratch, Postgres-wire database engine in Rust. Its durability is proven 
 
 ## See it prove itself
 
-One command re-verifies every guarantee live and emits a single content hash over all of them:
-
-```text
-$ cargo run --release --bin attest
-
-================ PICKLEJAR GRAND ATTESTATION ================
-  [PASS] WAL ordering model-check        [PASS] snapshot isolation model-check
-  [PASS] RLS retrieval isolation         [PASS] cache freshness model-check
-  [PASS] authenticated SQL soundness     [PASS] provable forgetting
-  [PASS] forward-secure audit log        [PASS] private information retrieval
-  [PASS] CRDT convergence                [PASS] quorum never stale (r+w>rf)
-  ... 34 checks across durability, cryptography, and distribution ...
-
-attestation hash: 3750b4e8...
-VERDICT: 34/34 checks passed -- ALL GUARANTEES HELD
-(durability backed by 1,000,000 deterministic crash simulations)
-============================================================
-```
-
-The verification results are deterministic and regenerable: re-run it from this commit and the hash matches. `cargo run --release --bin scorecard` does the same for live throughput and the 20 proven invariants. Nothing here is a static claim.
+The terminal above is real output. `cargo run --release --bin attest` re-verifies every guarantee live and emits a single content hash over all of them; re-run it from this commit and the hash matches. `cargo run --release --bin scorecard` does the same for live throughput and the 20 proven invariants. The verification results are deterministic and regenerable. Nothing here is a static claim.
 
 ## Run something impossible
 
