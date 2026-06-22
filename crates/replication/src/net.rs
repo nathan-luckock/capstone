@@ -131,25 +131,42 @@ fn get_vec_f32(b: &[u8], off: &mut usize) -> Vec<f32> {
     out
 }
 
-/// Encode a memory record (its embedding and payload) as the value bytes the
-/// replicated CRDT map stores.
-fn encode_memory(embedding: &[f32], payload: &[u8]) -> Vec<u8> {
+/// Encode a memory record (owning tenant, logical id, embedding, payload) as the
+/// value bytes the replicated CRDT map stores. The logical id is kept in the
+/// record so a recall returns the caller's id, not the internal scoped key.
+fn encode_memory(tenant: &str, id: u64, embedding: &[f32], payload: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
+    put_bytes(&mut b, tenant.as_bytes());
+    put_u64(&mut b, id);
     put_vec_f32(&mut b, embedding);
     put_bytes(&mut b, payload);
     b
 }
 
-/// Decode a memory record back into its embedding and payload.
-fn decode_memory(bytes: &[u8]) -> (Vec<f32>, Vec<u8>) {
+/// Decode a memory record into its tenant, logical id, embedding, and payload.
+fn decode_memory(bytes: &[u8]) -> (Vec<u8>, u64, Vec<f32>, Vec<u8>) {
     let mut off = 0;
+    let tenant = get_bytes(bytes, &mut off);
+    let id = get_u64(bytes, &mut off);
     let embedding = get_vec_f32(bytes, &mut off);
     let payload = if off < bytes.len() {
         get_bytes(bytes, &mut off)
     } else {
         Vec::new()
     };
-    (embedding, payload)
+    (tenant, id, embedding, payload)
+}
+
+/// Derive the replicated key for a tenant's memory id, so two tenants reusing the
+/// same id never collide in the keyspace (FNV-1a over the tenant and id).
+fn tenant_key(tenant: &str, id: u64) -> u64 {
+    let id_bytes = id.to_le_bytes();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in tenant.as_bytes().iter().chain(b":").chain(&id_bytes) {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 fn get_slot(b: &[u8], off: &mut usize) -> Slot {
@@ -272,21 +289,24 @@ fn req_pull(store: &Arc<Mutex<Replica>>) -> Vec<u8> {
 
 fn req_knn(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
     let mut off = 1;
+    let tenant = get_bytes(req, &mut off);
     let query = get_vec_f32(req, &mut off);
     let k = usize::try_from(get_u32(req, &mut off)).unwrap_or(0);
-    let memories: Vec<(u64, Vec<u8>)> = {
+    let values: Vec<Vec<u8>> = {
         let guard = store.lock().expect("store lock");
         guard
             .slots()
-            .iter()
-            .filter_map(|(id, s)| s.value.as_ref().map(|v| (*id, v.clone())))
+            .values()
+            .filter_map(|s| s.value.clone())
             .collect()
     };
-    let mut hits: Vec<(u64, f64, Vec<u8>)> = memories
+    // The tenant fence: only rank memories owned by the requesting tenant, so a
+    // recall can never surface another tenant's memory, even a nearer one.
+    let mut hits: Vec<(u64, f64, Vec<u8>)> = values
         .iter()
-        .map(|(id, val)| {
-            let (embedding, payload) = decode_memory(val);
-            (*id, l2_sq(&query, &embedding), payload)
+        .filter_map(|val| {
+            let (owner, id, embedding, payload) = decode_memory(val);
+            (owner == tenant).then(|| (id, l2_sq(&query, &embedding), payload))
         })
         .collect();
     hits.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -558,20 +578,23 @@ impl Coordinator {
         best.and_then(|s| s.value)
     }
 
-    /// Store a memory (its embedding and payload) under `id` on the key's
-    /// replicas. Returns how many replicas acknowledged.
+    /// Store a `tenant`'s memory (embedding + payload) under `id` on the key's
+    /// replicas. The key is tenant-scoped, so two tenants reusing an id never
+    /// collide. Returns how many replicas acknowledged.
     #[must_use]
-    pub fn store_memory(&self, id: u64, embedding: &[f32], payload: &[u8]) -> usize {
-        self.write(id, &encode_memory(embedding, payload))
+    pub fn store_memory(&self, tenant: &str, id: u64, embedding: &[f32], payload: &[u8]) -> usize {
+        let key = tenant_key(tenant, id);
+        self.write(key, &encode_memory(tenant, id, embedding, payload))
     }
 
-    /// Distributed nearest-neighbor recall: scatter the query to every node,
-    /// each returns its local top-`k` by the engine's `l2_sq` distance, and the
-    /// merged global top-`k` is returned. A memory replicated on several nodes is
-    /// de-duplicated by id.
+    /// Distributed nearest-neighbor recall, fenced to `tenant`: scatter the query
+    /// to every node, each ranks its local top-`k` among that tenant's own
+    /// memories by the engine's `l2_sq` distance, and the merged global top-`k` is
+    /// returned. A memory replicated on several nodes is de-duplicated by id.
     #[must_use]
-    pub fn recall(&self, query: &[f32], k: usize) -> Vec<Hit> {
+    pub fn recall(&self, tenant: &str, query: &[f32], k: usize) -> Vec<Hit> {
         let mut req = vec![REQ_KNN];
+        put_bytes(&mut req, tenant.as_bytes());
         put_vec_f32(&mut req, query);
         put_u32(&mut req, u32::try_from(k).unwrap_or(u32::MAX));
         let mut hits: Vec<Hit> = Vec::new();
@@ -679,12 +702,12 @@ mod tests {
         let coord = Coordinator::new(&nodes, 2, 1, 1);
 
         // Memories spread across the cluster by placement.
-        assert!(coord.store_memory(1, &[0.1, 0.2, 0.9], b"sky") >= 1);
-        assert!(coord.store_memory(2, &[0.9, 0.1, 0.1], b"fire") >= 1);
-        assert!(coord.store_memory(3, &[0.1, 0.2, 0.8], b"ocean") >= 1);
+        assert!(coord.store_memory("acme", 1, &[0.1, 0.2, 0.9], b"sky") >= 1);
+        assert!(coord.store_memory("acme", 2, &[0.9, 0.1, 0.1], b"fire") >= 1);
+        assert!(coord.store_memory("acme", 3, &[0.1, 0.2, 0.8], b"ocean") >= 1);
 
         // A query nearest to memory 3, then memory 1; memory 2 is far.
-        let hits = coord.recall(&[0.1, 0.2, 0.82], 2);
+        let hits = coord.recall("acme", &[0.1, 0.2, 0.82], 2);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id, 3, "nearest is memory 3");
         assert_eq!(hits[0].payload, b"ocean");
@@ -693,6 +716,36 @@ mod tests {
             !ids.contains(&2),
             "the far memory is not in the top 2: {ids:?}"
         );
+    }
+
+    #[test]
+    fn recall_is_fenced_to_the_tenant() {
+        let nodes: Vec<(u64, String)> = (0..3)
+            .map(|id| {
+                let (addr, _store) = spawn_node(id);
+                (id, addr)
+            })
+            .collect();
+        let coord = Coordinator::new(&nodes, 2, 1, 1);
+
+        // globex's memory is the NEAREST vector to the query; acme's is far.
+        assert!(coord.store_memory("globex", 1, &[0.1, 0.2, 0.82], b"globex secret") >= 1);
+        assert!(coord.store_memory("acme", 2, &[0.9, 0.1, 0.1], b"acme far") >= 1);
+
+        // acme recalls: gets its own far memory, never globex's nearer one.
+        let hits = coord.recall("acme", &[0.1, 0.2, 0.82], 5);
+        assert!(
+            hits.iter().all(|h| h.payload != b"globex secret".to_vec()),
+            "tenant fence breached: acme saw globex's memory"
+        );
+        assert!(
+            hits.iter().any(|h| h.payload == b"acme far".to_vec()),
+            "acme should still see its own memory"
+        );
+        // And globex sees its own, not acme's.
+        let g = coord.recall("globex", &[0.1, 0.2, 0.82], 5);
+        assert!(g.iter().any(|h| h.payload == b"globex secret".to_vec()));
+        assert!(g.iter().all(|h| h.payload != b"acme far".to_vec()));
     }
 
     #[test]

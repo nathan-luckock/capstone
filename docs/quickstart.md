@@ -95,13 +95,16 @@ Store and recall vector memories across the cluster with the `pjctl` client:
 
 ```bash
 NODES="--node 0@127.0.0.1:7500 --node 1@127.0.0.1:7501 --node 2@127.0.0.1:7502"
-pjctl $NODES store 1 0.1,0.2,0.9 "the sky is blue"
-pjctl $NODES store 2 0.9,0.1,0.1 "fire is hot"
-pjctl $NODES recall 0.1,0.2,0.82 2     # distributed nearest-neighbor
+pjctl $NODES store acme 1 0.1,0.2,0.9 "the sky is blue"
+pjctl $NODES store acme 2 0.9,0.1,0.1 "fire is hot"
+pjctl $NODES recall acme 0.1,0.2,0.82 2     # distributed nearest-neighbor, fenced to acme
 ```
 
-Writes go to a key's replicas; recall is a scatter-gather nearest-neighbor
-across the nodes. The cluster stays available through a network partition and
+Each memory belongs to a tenant, and a recall only ever ranks that tenant's own
+memories, enforced on the node, so another tenant's memory can never surface,
+even a nearer one. Writes go to a key's replicas; recall is a scatter-gather
+nearest-neighbor across the nodes. The cluster stays available through a
+partition and
 reconciles itself on heal (run `repdemo` to watch that, `repsim` to prove it at
 scale).
 

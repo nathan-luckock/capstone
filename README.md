@@ -72,7 +72,7 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 | **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index wired into SQL through a cached, RLS-safe path |
 | **Reliability under fault** | page, index, and metadata checksums; a self-healing redundant index; Reed-Solomon erasure coding; a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
-| **Multi-node (AP)** | Dynamo-style replication: consistent-hash placement, quorum writes, CRDT merge, Merkle anti-entropy, distributed vector KNN, proven to converge under partition |
+| **Multi-node (AP)** | Dynamo-style replication: consistent-hash placement, quorum writes, CRDT merge, Merkle anti-entropy, tenant-fenced distributed vector KNN, proven to converge under partition |
 
 The complete SQL surface is in [docs/FEATURES.md](docs/FEATURES.md).
 

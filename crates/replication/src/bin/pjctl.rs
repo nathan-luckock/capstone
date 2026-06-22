@@ -62,29 +62,31 @@ fn main() {
             None => fail("usage: get <key>"),
         },
         "store" => {
-            let id = rest.get(1).and_then(|s| s.parse::<u64>().ok());
-            let emb = rest.get(2).map(|s| parse_vec(s));
-            let content = rest.get(3).map_or("", String::as_str);
-            match (id, emb) {
-                (Some(id), Some(emb)) if !emb.is_empty() => {
-                    let acks = coord.store_memory(id, &emb, content.as_bytes());
+            let tenant = rest.get(1).map_or("", String::as_str);
+            let id = rest.get(2).and_then(|s| s.parse::<u64>().ok());
+            let emb = rest.get(3).map(|s| parse_vec(s));
+            let content = rest.get(4).map_or("", String::as_str);
+            match (tenant.is_empty(), id, emb) {
+                (false, Some(id), Some(emb)) if !emb.is_empty() => {
+                    let acks = coord.store_memory(tenant, id, &emb, content.as_bytes());
                     println!(
-                        "stored memory {id} (dim {}): {acks} replica(s) acked",
+                        "stored memory {id} for tenant {tenant} (dim {}): {acks} replica(s) acked",
                         emb.len()
                     );
                 }
-                _ => fail("usage: store <id> <f,f,...> <content>"),
+                _ => fail("usage: store <tenant> <id> <f,f,...> <content>"),
             }
         }
         "recall" => {
-            let query = rest.get(1).map(|s| parse_vec(s));
+            let tenant = rest.get(1).map_or("", String::as_str);
+            let query = rest.get(2).map(|s| parse_vec(s));
             let k = rest
-                .get(2)
+                .get(3)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(5);
             match query {
-                Some(q) if !q.is_empty() => {
-                    let hits = coord.recall(&q, k);
+                Some(q) if !q.is_empty() && !tenant.is_empty() => {
+                    let hits = coord.recall(tenant, &q, k);
                     if hits.is_empty() {
                         println!("(no memories)");
                     }
@@ -97,7 +99,7 @@ fn main() {
                         );
                     }
                 }
-                _ => fail("usage: recall <f,f,...> <k>"),
+                _ => fail("usage: recall <tenant> <f,f,...> <k>"),
             }
         }
         other => fail(&format!(
