@@ -45,7 +45,9 @@ use std::rc::Rc;
 
 use crate::error::{Result, StorageError};
 use crate::file::Disk;
-use crate::header::{recompute_checksum, verify_checksum, PageHeader};
+use crate::header::{
+    recompute_checksum, stamp_page_id, verify_checksum, verify_page_id, PageHeader,
+};
 use crate::page::{Page, PageId, PAGE_SIZE};
 
 /// Hook the buffer pool calls before flushing any dirty page, to enforce
@@ -347,6 +349,7 @@ impl BufferPool {
             let mut inner = self.frames[idx].inner.borrow_mut();
             if inner.dirty {
                 self.enforce_wal_ordering(&inner.page)?;
+                stamp_page_id(&mut inner.page, id.get());
                 recompute_checksum(&mut inner.page);
                 self.file.borrow_mut().write_page(id, &inner.page)?;
                 inner.dirty = false;
@@ -363,6 +366,7 @@ impl BufferPool {
             if inner.dirty {
                 if let Some(id) = inner.page_id {
                     self.enforce_wal_ordering(&inner.page)?;
+                    stamp_page_id(&mut inner.page, id.get());
                     recompute_checksum(&mut inner.page);
                     self.file.borrow_mut().write_page(id, &inner.page)?;
                     inner.dirty = false;
@@ -395,8 +399,19 @@ impl BufferPool {
             // it as uninitialized. Any initialized page that fails its checksum is
             // refused here, so a corrupted page (a radiation bit flip, silent data
             // corruption) is never served to the engine as if it were intact.
-            if inner.page.iter().any(|&b| b != 0) && !verify_checksum(&inner.page) {
+            let initialized = inner.page.iter().any(|&b| b != 0);
+            if initialized && !verify_checksum(&inner.page) {
                 return Err(StorageError::Checksum { page: id.0 });
+            }
+            // A misdirected write lands some other page's valid image here: the
+            // checksum passes, but the page's self-identifying id does not match
+            // the location, so the page-id guard refuses it.
+            if initialized && !verify_page_id(&inner.page, id.get()) {
+                let found = u64::from(PageHeader::read(&inner.page).map_or(0, |h| h.page_id));
+                return Err(StorageError::MisplacedPage {
+                    expected: id.0,
+                    found,
+                });
             }
             inner.page_id = Some(id);
             inner.dirty = false;
@@ -435,6 +450,7 @@ impl BufferPool {
         if let Some(old_id) = inner.page_id.take() {
             if inner.dirty {
                 self.enforce_wal_ordering(&inner.page)?;
+                stamp_page_id(&mut inner.page, old_id.get());
                 recompute_checksum(&mut inner.page);
                 self.file.borrow_mut().write_page(old_id, &inner.page)?;
                 inner.dirty = false;

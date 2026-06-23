@@ -996,22 +996,25 @@ fn drift_adaptive_recall() -> Check {
 }
 
 /// Detection coverage across the four storage-write fault classes. The payload
-/// checksum catches every bit flip and torn write, and the LSN-versus-log guard
-/// catches every lost write; a misdirected write that lands newer content is the
-/// honest residual (it needs a self-identifying page id, recorded on the roadmap).
+/// checksum catches every bit flip and torn write, the self-identifying page-id
+/// guard catches every misdirected write, and the LSN-versus-log guard catches
+/// every lost write: all four classes are fully detected.
 fn fault_detection_coverage() -> Check {
     let cov = crate::faults::run_fault_coverage(0x00FA_17C0, 2000);
-    let held = cov.bit_flip >= 1.0 && cov.torn_write >= 1.0 && cov.lost_write >= 1.0;
+    let held = cov.bit_flip >= 1.0
+        && cov.torn_write >= 1.0
+        && cov.lost_write >= 1.0
+        && cov.misdirected_write >= 1.0;
     Check {
         name: "storage-fault detection coverage".into(),
         detail: format!(
-            "bit flip {:.0}%, torn write {:.0}%, lost write {:.0}% caught over {} trials each; \
-             misdirected write {:.0}% (the page-id-guard residual)",
+            "bit flip {:.0}%, torn write {:.0}%, lost write {:.0}%, misdirected write {:.0}% \
+             caught over {} trials each (all four classes)",
             cov.bit_flip * 100.0,
             cov.torn_write * 100.0,
             cov.lost_write * 100.0,
+            cov.misdirected_write * 100.0,
             cov.trials,
-            cov.misdirected_write * 100.0
         ),
         passed: held,
     }

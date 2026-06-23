@@ -31,7 +31,7 @@ use std::path::Path;
 use crate::crc32::crc32;
 use crate::erasure::ReedSolomon;
 use crate::file::FileManager;
-use crate::header::verify_checksum;
+use crate::header::{verify_checksum, verify_page_id};
 use crate::page::{Page, PageId, PAGE_SIZE};
 
 /// Magic bytes at the head of a parity sidecar.
@@ -164,7 +164,10 @@ pub fn heal_file(heap_path: &Path, parity_path: &Path) -> io::Result<HealReport>
                 fm.read_page(PageId::new(id as u64), &mut page)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 report.pages_checked += 1;
-                if !verify_checksum(&page) {
+                // A failed checksum (bit flip, torn write) or a page whose
+                // self-identifying id does not match this location (a
+                // misdirected write) is corrupt: reconstruct it from parity.
+                if !verify_checksum(&page) || !verify_page_id(&page, id as u64) {
                     present[i] = false;
                 }
                 shards.push(page.to_vec());
@@ -275,12 +278,14 @@ mod tests {
         }
     }
 
-    /// A page whose payload is derived from its id, with a valid checksum.
+    /// A page whose payload is derived from its id, stamped with its own page
+    /// id, and carrying a valid checksum.
     fn page_for(id: u64) -> Page {
         let mut p: Page = [0u8; PAGE_SIZE];
         for (i, b) in p.iter_mut().enumerate().skip(12) {
             *b = u8::try_from((i as u64 ^ id.wrapping_mul(2_654_435_761)) & 0xFF).expect("masked");
         }
+        crate::header::stamp_page_id(&mut p, id);
         recompute_checksum(&mut p);
         p
     }
@@ -420,5 +425,40 @@ mod tests {
         let report = heal_file(&path, &parity).expect("heal");
         assert_eq!(report.stripes_unrecoverable, 0);
         assert_eq!(read_page(&path, 2), page_for(2));
+    }
+
+    #[test]
+    fn a_misdirected_write_with_a_valid_checksum_is_healed() {
+        // The hardest corruption to catch: another page's complete, valid image
+        // lands at the wrong location. Its checksum verifies, so only the
+        // self-identifying page id reveals it is misplaced. Heal must reconstruct
+        // the right page from parity.
+        let (k, m) = (6usize, 2usize);
+        let pages = 12u64;
+        let (dir, path) = build_heap(pages);
+        let parity = dir.path().join("h.parity");
+        let image: Vec<Page> = (0..pages).map(page_for).collect();
+        write_parity(&parity, &image, k, m).expect("protect");
+
+        // Overwrite page 3 with page 9's fully valid image (a misdirected write).
+        let displaced = page_for(9);
+        assert!(
+            crate::header::verify_checksum(&displaced),
+            "the intruder is internally valid"
+        );
+        let mut fm = FileManager::open(&path).expect("open");
+        fm.write_page(PageId::new(3), &displaced).expect("write");
+        fm.fsync().expect("fsync");
+        drop(fm);
+
+        let report = heal_file(&path, &parity).expect("heal");
+        assert_eq!(
+            report.pages_repaired, 1,
+            "the misplaced page must be repaired"
+        );
+        assert_eq!(report.stripes_unrecoverable, 0);
+        // Page 3 is back to its own content, and still verifies at its location.
+        assert_eq!(read_page(&path, 3), page_for(3));
+        assert!(crate::header::verify_page_id(&read_page(&path, 3), 3));
     }
 }

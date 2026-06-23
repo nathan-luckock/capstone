@@ -18,6 +18,19 @@ pub enum StorageError {
         page: u64,
     },
 
+    /// A page read back from disk passed its checksum but carries a different
+    /// self-identifying page id than the location it was read from: a
+    /// misdirected write landed some other page's internally-consistent image
+    /// here. The checksum cannot catch this (the displaced page is valid), so
+    /// the page-id guard does, and the page is refused rather than served.
+    #[error("page {expected} is misplaced on disk (found stamped id {found})")]
+    MisplacedPage {
+        /// The page ID that was requested (the location read from).
+        expected: u64,
+        /// The self-identifying id stamped in the page that was found there.
+        found: u64,
+    },
+
     /// A page ID was requested that is beyond the current end of the file.
     /// Returned by [`FileManager::read_page`] / [`FileManager::write_page`]
     /// when the caller asks for a page that has not been allocated.

@@ -1,7 +1,8 @@
 //! Measure the engine's detection coverage across the four storage-write fault
 //! classes: bit flip, torn write, lost write, and misdirected write. Each is
 //! injected into well-formed pages and run through the engine's layered
-//! page-integrity check (the payload checksum, then the LSN-versus-log guard).
+//! page-integrity check (the payload checksum, the self-identifying page-id
+//! guard, then the LSN-versus-log guard). All four are detected in full.
 //!
 //! ```text
 //! cargo run --release --bin faultsim          # 2000 trials per class
@@ -31,19 +32,18 @@ fn main() -> ExitCode {
         cov.lost_write * 100.0
     );
     println!(
-        "  misdirected write {:>6.1}%  (partial: LSN guard only; needs a page-id guard)",
+        "  misdirected write {:>6.1}%  (self-identifying page-id guard)",
         cov.misdirected_write * 100.0
     );
 
-    // Bit flip, torn, and lost writes must be caught completely; the misdirected
-    // residual is reported, not asserted, because the page format has no
-    // self-identifying id yet (recorded on the roadmap).
-    if cov.bit_flip >= 1.0 && cov.torn_write >= 1.0 && cov.lost_write >= 1.0 {
-        println!(
-            "\nresult: bit flip, torn write, and lost write fully detected; \
-             misdirected write {:.1}% (the page-id-guard residual)",
-            cov.misdirected_write * 100.0
-        );
+    // All four classes must now be caught completely; the page-id guard closed
+    // the misdirected-write residual the LSN guard alone left open.
+    if cov.bit_flip >= 1.0
+        && cov.torn_write >= 1.0
+        && cov.lost_write >= 1.0
+        && cov.misdirected_write >= 1.0
+    {
+        println!("\nresult: all four storage-write fault classes fully detected");
         ExitCode::SUCCESS
     } else {
         eprintln!("\nresult: a fault class regressed below full detection");

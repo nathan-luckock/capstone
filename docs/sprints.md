@@ -315,13 +315,14 @@ platter, and a misdirected write lands a page at the wrong location. `faultsim`
 injects all four and measures the engine's detection rate per class under its
 layered page check. The finding is honest and specific: the payload checksum
 catches every bit flip and torn write (both leave payload bytes that disagree with
-the stored CRC), and the LSN-versus-log guard catches every lost write (a page
-lagging the log is stale), but a misdirected write that lands newer content slips,
-because the page format carries no self-identifying page id to check its location
-against. The three covered classes are certified in `vecert`; the misdirected
-residual is reported, not papered over, and closing it (a page-id guard in the
-header) is recorded on the roadmap. Naming the fault you do not yet catch is worth
-more than a green check that never exercised it.
+the stored CRC), the LSN-versus-log guard catches every lost write (a page lagging
+the log is stale), and the self-identifying page-id guard catches every misdirected
+write (a displaced page carries another page's id, which does not match the
+location it landed at, so it is caught even when its content is newer). Every page
+is stamped with the low 32 bits of its own id inside the checksum range on write
+and the stamp is verified on read; all four classes are certified in `vecert`. The
+misdirected residual this sprint first reported honestly, rather than papering over,
+is now closed. Naming the fault you do not yet catch is what made it closeable.
 
 ### Sprint 26 - Physical forward-replay (the engine of point-in-time recovery)
 

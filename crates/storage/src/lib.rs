@@ -48,8 +48,9 @@ pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, WalSyncHook, K};
 pub use error::{Result, StorageError};
 pub use file::{Disk, FileManager};
 pub use header::{
-    compute_checksum, recompute_checksum, verify_checksum, PageHeader, PageType, FLAG_DIRTY,
-    FLAG_NEEDS_VACUUM, HEADER_SIZE, HEADER_SIZE_U16,
+    compute_checksum, recompute_checksum, stamp_page_id, verify_checksum, verify_page_id,
+    PageHeader, PageType, FLAG_DIRTY, FLAG_HAS_PAGE_ID, FLAG_NEEDS_VACUUM, HEADER_SIZE,
+    HEADER_SIZE_U16,
 };
 pub use heap::{HeapPage, SlotId, MAX_TUPLE_SIZE, SLOT_SIZE, SLOT_SIZE_U16};
 pub use page::{Page, PageId, PAGE_SIZE, PAGE_SIZE_U16};

@@ -61,14 +61,14 @@ fn page_header_strategy() -> impl Strategy<Value = PageHeader> {
         any::<u32>(),
     )
         .prop_map(
-            |(lsn, checksum, page_type, slot_count, free_space_ptr, flags, reserved)| PageHeader {
+            |(lsn, checksum, page_type, slot_count, free_space_ptr, flags, page_id)| PageHeader {
                 lsn,
                 checksum,
                 page_type,
                 slot_count,
                 free_space_ptr,
                 flags,
-                reserved,
+                page_id,
             },
         )
 }

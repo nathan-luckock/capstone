@@ -14,11 +14,17 @@
 //! is internally consistent) or a misdirected write (the displaced page is
 //! internally consistent); those need, respectively, the page's LSN compared to
 //! what the write-ahead log last logged for it, and a self-identifying page id.
-//! The LSN guard is implemented here; the page-id guard is a page-format addition
-//! the [roadmap](../../../docs/ROADMAP.md) records, so a misdirected write that
-//! lands newer content is the one residual this simulator reports uncaught.
+//! Both guards are now in the engine: the LSN-versus-log comparison, and the
+//! self-identifying page id stamped into every page's header
+//! ([`picklejar_storage::stamp_page_id`], checked by
+//! [`picklejar_storage::verify_page_id`]). A misdirected write carries the source
+//! page's id, which does not match the location it landed at, so it is caught even
+//! when its content is newer than the location expected. All four classes are
+//! detected; there is no residual.
 
-use picklejar_storage::{verify_checksum, PageHeader, HEADER_SIZE, PAGE_SIZE};
+use picklejar_storage::{
+    stamp_page_id, verify_checksum, verify_page_id, PageHeader, HEADER_SIZE, PAGE_SIZE,
+};
 
 /// `SplitMix64`: the shared deterministic PRNG, so a coverage run replays exactly.
 struct Rng(u64);
@@ -81,8 +87,9 @@ impl Fault {
     }
 }
 
-/// A well-formed heap page with random payload, a correct checksum, and LSN `lsn`.
-fn good_page(rng: &mut Rng, lsn: u64) -> Box<[u8; PAGE_SIZE]> {
+/// A well-formed heap page with random payload, stamped with page id `page_id`,
+/// carrying a correct checksum and LSN `lsn`.
+fn good_page(rng: &mut Rng, lsn: u64, page_id: u64) -> Box<[u8; PAGE_SIZE]> {
     let mut page = Box::new([0u8; PAGE_SIZE]);
     let mut h = PageHeader::new_heap();
     h.lsn = lsn;
@@ -90,19 +97,25 @@ fn good_page(rng: &mut Rng, lsn: u64) -> Box<[u8; PAGE_SIZE]> {
     for b in &mut page[HEADER_SIZE..] {
         *b = (rng.next_u64() & 0xFF) as u8;
     }
+    stamp_page_id(&mut page, page_id);
     picklejar_storage::recompute_checksum(&mut page);
     page
 }
 
-/// Whether the engine's layered page check catches a page at a slot whose log
-/// reached `expected_lsn`.
+/// Whether the engine's layered page check catches a page read from the slot
+/// holding page `expected_id`, whose log reached `expected_lsn`.
 ///
-/// The checksum catches a payload that disagrees with its stored CRC; the LSN
-/// guard catches a page lagging the log (a stored LSN below what the log last
-/// recorded for this slot, the signature of a lost or stale-misdirected write).
+/// Three layers, in order: the checksum catches a payload that disagrees with its
+/// stored CRC (a bit flip or torn write); the page-id guard catches a page whose
+/// stamped id is not this slot's (a misdirected write, whatever its content); the
+/// LSN guard catches a page lagging the log (a stored LSN below what the log last
+/// recorded for this slot, the signature of a lost write).
 #[must_use]
-pub fn caught(page: &[u8; PAGE_SIZE], expected_lsn: u64) -> bool {
+pub fn caught(page: &[u8; PAGE_SIZE], expected_lsn: u64, expected_id: u64) -> bool {
     if !verify_checksum(page) {
+        return true;
+    }
+    if !verify_page_id(page, expected_id) {
         return true;
     }
     let stored = PageHeader::read(page).map_or(0, |h| h.lsn);
@@ -118,9 +131,10 @@ pub struct FaultCoverage {
     pub torn_write: f32,
     /// Fraction of injected lost writes caught.
     pub lost_write: f32,
-    /// Fraction of injected misdirected writes caught. The current page format has
-    /// no self-identifying page id, so a misdirected write that lands *newer*
-    /// content slips the layered check; this rate is the honest residual.
+    /// Fraction of injected misdirected writes caught. Every page carries a
+    /// self-identifying id stamped in its header, so a displaced page (some other
+    /// page's valid image) fails the page-id guard regardless of its content; this
+    /// is now total, closing what used to be the residual.
     pub misdirected_write: f32,
     /// Trials per class.
     pub trials: usize,
@@ -132,9 +146,10 @@ pub struct FaultCoverage {
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // counts are small; the ratio is exact
 pub fn run_fault_coverage(seed: u64, per_class: usize) -> FaultCoverage {
+    const SLOT: u64 = 7;
     let mut rng = Rng::new(seed);
     // The write-ahead log says every live slot has reached this LSN; a correct
-    // page at the slot carries exactly it.
+    // page at the slot carries exactly it. The slot under test holds page `SLOT`.
     let expected: u64 = 1000;
 
     let mut hits = [0usize; 4];
@@ -142,36 +157,38 @@ pub fn run_fault_coverage(seed: u64, per_class: usize) -> FaultCoverage {
         for _ in 0..per_class {
             let detected = match fault {
                 Fault::BitFlip => {
-                    let mut page = good_page(&mut rng, expected);
+                    let mut page = good_page(&mut rng, expected, SLOT);
                     let offset = HEADER_SIZE + rng.below(PAGE_SIZE - HEADER_SIZE);
                     page[offset] ^= 1u8 << (rng.below(8));
-                    caught(&page, expected)
+                    caught(&page, expected, SLOT)
                 }
                 Fault::TornWrite => {
                     // Only a prefix of the new page landed; the suffix is the old
                     // page. The new header (with the new checksum) is in the
                     // prefix, so the stale suffix fails the checksum.
-                    let old = good_page(&mut rng, expected - 1);
+                    let old = good_page(&mut rng, expected - 1, SLOT);
                     let cut = HEADER_SIZE + 1 + rng.below(PAGE_SIZE - HEADER_SIZE - 1);
-                    let mut torn = good_page(&mut rng, expected);
+                    let mut torn = good_page(&mut rng, expected, SLOT);
                     torn[cut..].copy_from_slice(&old[cut..]);
-                    caught(&torn, expected)
+                    caught(&torn, expected, SLOT)
                 }
                 Fault::LostWrite => {
                     // The new write never landed; the slot keeps the previous,
                     // internally-consistent page, which carries an older LSN.
                     let behind = 1 + rng.below(50) as u64;
-                    let stale = good_page(&mut rng, expected - behind);
-                    caught(&stale, expected)
+                    let stale = good_page(&mut rng, expected - behind, SLOT);
+                    caught(&stale, expected, SLOT)
                 }
                 Fault::MisdirectedWrite => {
-                    // Some other page's correct image landed here. Its LSN is
-                    // unrelated to this slot's, so the LSN guard catches it only
-                    // when the displaced page is older than this slot expects.
-                    // `expected + delta - 50` ranges over `expected +/- 50`.
+                    // Some other page's correct image landed at this slot, with a
+                    // content LSN unrelated to this slot's (it ranges over
+                    // `expected +/- 50`, so the LSN guard alone would miss the
+                    // newer half). The displaced page is stamped with its own id,
+                    // never SLOT, so the page-id guard catches every one.
                     let other_lsn = (expected + rng.below(101) as u64).saturating_sub(50);
-                    let other = good_page(&mut rng, other_lsn);
-                    caught(&other, expected)
+                    let other_id = SLOT + 1 + rng.below(4096) as u64;
+                    let other = good_page(&mut rng, other_lsn, other_id);
+                    caught(&other, expected, SLOT)
                 }
             };
             if detected {
@@ -198,8 +215,8 @@ mod tests {
     #[test]
     fn a_correct_page_at_its_slot_is_not_flagged() {
         let mut rng = Rng::new(1);
-        let page = good_page(&mut rng, 1000);
-        assert!(!caught(&page, 1000), "a current, intact page must pass");
+        let page = good_page(&mut rng, 1000, 7);
+        assert!(!caught(&page, 1000, 7), "a current, intact page must pass");
     }
 
     #[test]
@@ -219,15 +236,27 @@ mod tests {
     }
 
     #[test]
-    fn misdirected_writes_with_newer_content_are_the_honest_residual() {
-        // Without a self-identifying page id, a misdirected write that lands newer
-        // content slips the layered check, so detection is partial, not total.
-        let cov = run_fault_coverage(99, 400);
-        assert!(
-            cov.misdirected_write > 0.0 && cov.misdirected_write < 1.0,
-            "misdirected detection should be partial, got {}",
-            cov.misdirected_write
-        );
+    fn the_page_id_guard_catches_every_misdirected_write() {
+        // With a self-identifying page id stamped in every header, a displaced
+        // page fails the page-id guard regardless of its content, so detection is
+        // total: the last residual is closed.
+        for seed in [99, 1234, 0xFA17] {
+            let cov = run_fault_coverage(seed, 400);
+            assert!(
+                cov.misdirected_write >= 1.0,
+                "every misdirected write must be caught, got {} at seed {seed}",
+                cov.misdirected_write
+            );
+        }
+    }
+
+    #[test]
+    fn all_four_fault_classes_are_fully_detected() {
+        let cov = run_fault_coverage(0x00C0_FFEE, 500);
+        assert!(cov.bit_flip >= 1.0);
+        assert!(cov.torn_write >= 1.0);
+        assert!(cov.lost_write >= 1.0);
+        assert!(cov.misdirected_write >= 1.0);
     }
 
     #[test]
@@ -241,9 +270,9 @@ mod tests {
         // A direct construction, independent of the sweep: a new page with one old
         // suffix byte fails the checksum.
         let mut rng = Rng::new(3);
-        let mut torn = good_page(&mut rng, 10);
+        let mut torn = good_page(&mut rng, 10, 7);
         torn[PAGE_SIZE - 1] ^= 0xFF; // a stale last byte
-        assert!(caught(&torn, 10), "a torn suffix must fail the checksum");
+        assert!(caught(&torn, 10, 7), "a torn suffix must fail the checksum");
         let _ = HEADER_SIZE;
     }
 }

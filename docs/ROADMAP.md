@@ -52,8 +52,10 @@ On top of it, the reliability infrastructure for AI memory, all shipped:
 - **A modeled fault environment.** The deterministic simulator irradiates a
   committed multi-tenant workload across every persistent file at a named orbit's
   single-event-upset rate, and proves it never serves a silently corrupted answer.
-  `faultsim` measures detection across all four storage-write fault classes (bit
-  flip, torn, lost, misdirected).
+  `faultsim` measures detection across all four storage-write fault classes and
+  catches every one: the payload checksum covers bit flips and torn writes, the
+  self-identifying page-id guard covers misdirected writes, and the LSN-versus-log
+  guard covers lost writes.
 - **Correctness oracles.** `recall@k` gated in CI against the brute-force oracle
   (which found and fixed a real 0.47-to-0.98 bug), plus a metamorphic oracle
   (self-retrieval, monotonicity, deletion consistency) for approximate search where
@@ -96,9 +98,6 @@ What is genuinely still ahead, stated honestly:
 - **Partition tolerance.** Folded into the replication path, not built ahead of it:
   the node serves locally with bounded staleness while a link is down, and
   reconciles on reconnect.
-- **A self-identifying page id.** The one residual fault class: a misdirected write
-  that lands *newer* content slips, because the page format stores no id to check
-  its location against. A header page-id guard (a page-format change) closes it.
 - **Deeper fault coverage.** Per-part, shielding-aware upset rates that only a
   specific flight build can supply, beyond the modeled-orbit and four-fault-class
   rates the simulator now sweeps.

@@ -190,13 +190,13 @@ Every page starts with a 24-byte header, little-endian:
 | 12 | 2 | `page_type: u16` | `Free` / `Heap` / `BTreeInternal` / `BTreeLeaf` / `Overflow`. |
 | 14 | 2 | `slot_count: u16` | Live + tombstoned slots. |
 | 16 | 2 | `free_space_ptr: u16` | Offset where the tuple region begins (tuples grow up toward lower offsets from here). |
-| 18 | 2 | `flags: u16` | Bit 0 = `FLAG_DIRTY` (in-memory only), Bit 1 = `FLAG_NEEDS_VACUUM`. |
-| 20 | 4 | `reserved: u32` | Zero on disk. Reserved for MVCC version-chain pointer. |
+| 18 | 2 | `flags: u16` | Bit 0 = `FLAG_DIRTY` (in-memory only), Bit 1 = `FLAG_NEEDS_VACUUM`, Bit 2 = `FLAG_HAS_PAGE_ID`. |
+| 20 | 4 | `page_id: u32` | Low 32 bits of this page's own id when `FLAG_HAS_PAGE_ID` is set; the misdirected-write guard. |
 
 **Decisions:**
 
 - `page_type` is a `u16` even though we have <8 variants. Room for visibility map / free-space map page types later without breaking the binary format.
-- `reserved: u32` exists specifically for the MVCC chain pointer. Reserving the space now means Sprint 6 doesn't force a layout migration.
+- `page_id: u32` is the self-identifying-page-id guard. The write path stamps it (low 32 bits of the page's id) inside the checksum range, and the read path rejects a page whose stamp does not match its location: a misdirected write that lands another page's internally-valid image is caught even though its checksum verifies. Two pages exactly `2^32` apart would alias, impossible in a file under 32 TiB.
 - `FLAG_DIRTY` is in-memory only - the flush path clears it before write-back.
 
 ### Checksum
@@ -391,7 +391,7 @@ Every write logs an `Update` WAL record (WAL-before-page) so versions are durabl
   opportunistic GC (pruning chains in place behind a global visibility horizon)
   is the natural follow-up once the engine is multi-threaded.
 
-The page header's `reserved: u32` field remains available for an on-page version-chain optimization; the current implementation stores the chain pointer inside the version payload instead.
+The page header word that earlier designs reserved for an on-page version-chain pointer now holds the self-identifying `page_id` (the misdirected-write guard); MVCC keeps its chain pointer inside the version payload instead, so the two never contended for it.
 
 ---
 

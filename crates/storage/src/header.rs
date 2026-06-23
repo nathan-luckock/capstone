@@ -10,8 +10,8 @@
 //! | 12     | 2    | `page_type`      | Free / Heap / `BTreeInternal` / `BTreeLeaf` / Overflow. |
 //! | 14     | 2    | `slot_count`     | Live + tombstoned slots.                           |
 //! | 16     | 2    | `free_space_ptr` | Offset where free region ends (tuples grow up).    |
-//! | 18     | 2    | `flags`          | Bit 0 = dirty (in-memory), 1 = needs vacuum.       |
-//! | 20     | 4    | `reserved`       | Zero. Reserved for MVCC chain pointer.             |
+//! | 18     | 2    | `flags`          | Bit 0 = dirty (in-memory), 1 = needs vacuum, 2 = has page id. |
+//! | 20     | 4    | `page_id`        | Low 32 bits of this page's own id, when bit 2 is set.        |
 //!
 //! # Checksum scope
 //!
@@ -21,6 +21,19 @@
 //! micro-optimization that adds up at high write rates). The checksum is
 //! enough to catch torn writes and silent bit-rot in the payload, which is
 //! what it's there for.
+//!
+//! # Self-identifying page id (misdirected-write guard)
+//!
+//! A checksum cannot catch a *misdirected write*: a page that is internally
+//! consistent (its checksum verifies) but landed at the wrong offset, so the
+//! location now holds some other page's valid image. To close that, the write
+//! path stamps each page with the low 32 bits of its own [`PageId`] in the
+//! `page_id` field and sets [`FLAG_HAS_PAGE_ID`]; the field sits inside the
+//! checksum range, so the id travels with the page. On read, [`verify_page_id`]
+//! confirms the stamp matches the location, so a displaced page is detected even
+//! when its content is newer than what the location expected. Two pages exactly
+//! `2^32` apart would alias, which cannot happen in a file under 32 TiB.
+//! Unstamped (legacy) pages carry no claim and pass, so the guard is additive.
 
 use crate::crc32::crc32;
 use crate::error::{Result, StorageError};
@@ -55,6 +68,12 @@ pub const FLAG_DIRTY: u16 = 0b0000_0001;
 /// Set if the page has accumulated enough tombstones that vacuum would
 /// reclaim meaningful space.
 pub const FLAG_NEEDS_VACUUM: u16 = 0b0000_0010;
+
+/// Set if [`PageHeader::page_id`] holds this page's self-identifying id.
+///
+/// New writes always set it; legacy pages written before the guard existed do
+/// not, and are exempt from the [`verify_page_id`] check (it is purely additive).
+pub const FLAG_HAS_PAGE_ID: u16 = 0b0000_0100;
 
 /// On-disk page type. Encoded as a `u16` in the header.
 #[repr(u16)]
@@ -110,8 +129,10 @@ pub struct PageHeader {
     pub free_space_ptr: u16,
     /// Bit field; see `FLAG_*` constants.
     pub flags: u16,
-    /// Zero on disk. Reserved for an MVCC version-chain pointer.
-    pub reserved: u32,
+    /// Low 32 bits of this page's own id, valid only when
+    /// [`FLAG_HAS_PAGE_ID`] is set in `flags`. The self-identifying-page-id
+    /// guard against misdirected writes; see the module docs.
+    pub page_id: u32,
 }
 
 impl PageHeader {
@@ -126,7 +147,7 @@ impl PageHeader {
             slot_count: 0,
             free_space_ptr: PAGE_SIZE_U16,
             flags: 0,
-            reserved: 0,
+            page_id: 0,
         }
     }
 
@@ -141,7 +162,7 @@ impl PageHeader {
         let slot_count = u16::from_le_bytes(page[14..16].try_into().expect("2 bytes"));
         let free_space_ptr = u16::from_le_bytes(page[16..18].try_into().expect("2 bytes"));
         let flags = u16::from_le_bytes(page[18..20].try_into().expect("2 bytes"));
-        let reserved = u32::from_le_bytes(page[20..24].try_into().expect("4 bytes"));
+        let page_id = u32::from_le_bytes(page[20..24].try_into().expect("4 bytes"));
         Ok(Self {
             lsn,
             checksum,
@@ -149,7 +170,7 @@ impl PageHeader {
             slot_count,
             free_space_ptr,
             flags,
-            reserved,
+            page_id,
         })
     }
 
@@ -161,7 +182,7 @@ impl PageHeader {
         page[14..16].copy_from_slice(&self.slot_count.to_le_bytes());
         page[16..18].copy_from_slice(&self.free_space_ptr.to_le_bytes());
         page[18..20].copy_from_slice(&self.flags.to_le_bytes());
-        page[20..24].copy_from_slice(&self.reserved.to_le_bytes());
+        page[20..24].copy_from_slice(&self.page_id.to_le_bytes());
     }
 }
 
@@ -190,6 +211,57 @@ pub fn recompute_checksum(page: &mut Page) {
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&new.to_le_bytes());
 }
 
+/// Byte offset of the `flags` field within the page.
+const FLAGS_OFFSET: usize = 18;
+/// Byte offset of the `page_id` field within the page.
+const PAGE_ID_OFFSET: usize = 20;
+
+/// Stamp `page` with the low 32 bits of `id` and set [`FLAG_HAS_PAGE_ID`], so a
+/// later read can tell whether the page is sitting at the right location.
+///
+/// Both touched fields lie inside [`CHECKSUM_RANGE`], so the caller must
+/// [`recompute_checksum`] afterward; the write path does both before every
+/// flush. Stamping is idempotent.
+pub fn stamp_page_id(page: &mut Page, id: u64) {
+    let mut flags = u16::from_le_bytes(
+        page[FLAGS_OFFSET..FLAGS_OFFSET + 2]
+            .try_into()
+            .expect("2 bytes"),
+    );
+    flags |= FLAG_HAS_PAGE_ID;
+    page[FLAGS_OFFSET..FLAGS_OFFSET + 2].copy_from_slice(&flags.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)] // low 32 bits is the stored id by design
+    let lo = id as u32;
+    page[PAGE_ID_OFFSET..PAGE_ID_OFFSET + 4].copy_from_slice(&lo.to_le_bytes());
+}
+
+/// Return true iff `page` either carries no page-id stamp (a legacy page, which
+/// makes no claim) or carries one matching `expected`.
+///
+/// A stamped page whose id does not match its location is a misdirected write:
+/// some other page's internally-consistent image landed here. This is the check
+/// a payload checksum cannot make, because the displaced page's checksum is
+/// valid - it is simply the wrong page.
+#[must_use]
+pub fn verify_page_id(page: &Page, expected: u64) -> bool {
+    let flags = u16::from_le_bytes(
+        page[FLAGS_OFFSET..FLAGS_OFFSET + 2]
+            .try_into()
+            .expect("2 bytes"),
+    );
+    if flags & FLAG_HAS_PAGE_ID == 0 {
+        return true;
+    }
+    let stored = u32::from_le_bytes(
+        page[PAGE_ID_OFFSET..PAGE_ID_OFFSET + 4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    #[allow(clippy::cast_possible_truncation)] // compare against the same low 32 bits we stamp
+    let want = expected as u32;
+    stored == want
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,7 +279,7 @@ mod tests {
             slot_count: 42,
             free_space_ptr: 4096,
             flags: FLAG_DIRTY | FLAG_NEEDS_VACUUM,
-            reserved: 0xaabb_ccdd,
+            page_id: 0xaabb_ccdd,
         };
         let mut page = make_page();
         header.write(&mut page);
@@ -233,7 +305,7 @@ mod tests {
             slot_count: 0x1112,
             free_space_ptr: 0x2122,
             flags: 0x3132,
-            reserved: 0x4142_4344,
+            page_id: 0x4142_4344,
         };
         let mut page = make_page();
         header.write(&mut page);
@@ -252,7 +324,7 @@ mod tests {
         assert_eq!(&page[16..18], &[0x22, 0x21]);
         // flags
         assert_eq!(&page[18..20], &[0x32, 0x31]);
-        // reserved
+        // page_id
         assert_eq!(&page[20..24], &[0x44, 0x43, 0x42, 0x41]);
     }
 
@@ -346,5 +418,66 @@ mod tests {
         recompute_checksum(&mut page);
         page[2000] = 0xff;
         assert!(!verify_checksum(&page));
+    }
+
+    #[test]
+    fn an_unstamped_page_makes_no_page_id_claim() {
+        let mut page = make_page();
+        PageHeader::new_heap().write(&mut page);
+        recompute_checksum(&mut page);
+        // No stamp: the guard is exempt at every location.
+        assert!(verify_page_id(&page, 0));
+        assert!(verify_page_id(&page, 7));
+        assert!(verify_page_id(&page, 999_999));
+    }
+
+    #[test]
+    fn a_stamped_page_verifies_only_at_its_own_location() {
+        let mut page = make_page();
+        PageHeader::new_heap().write(&mut page);
+        stamp_page_id(&mut page, 42);
+        recompute_checksum(&mut page);
+        // The stamp is inside the checksum range, so the page is still valid.
+        assert!(verify_checksum(&page));
+        assert!(verify_page_id(&page, 42), "must verify at its own id");
+        assert!(
+            !verify_page_id(&page, 41),
+            "a misdirected location is caught"
+        );
+        assert!(!verify_page_id(&page, 43));
+    }
+
+    #[test]
+    fn a_misdirected_stamped_page_is_caught_though_its_checksum_is_valid() {
+        // Page 100's valid image lands where page 7 should be: the checksum
+        // verifies (it is a real page) but the page-id guard rejects it.
+        let mut displaced = make_page();
+        PageHeader::new_heap().write(&mut displaced);
+        for (i, b) in displaced[HEADER_SIZE..].iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).unwrap();
+        }
+        stamp_page_id(&mut displaced, 100);
+        recompute_checksum(&mut displaced);
+        assert!(
+            verify_checksum(&displaced),
+            "the displaced page is internally valid"
+        );
+        assert!(
+            !verify_page_id(&displaced, 7),
+            "but it does not belong at page 7"
+        );
+    }
+
+    #[test]
+    fn stamping_is_idempotent() {
+        let mut page = make_page();
+        PageHeader::new_heap().write(&mut page);
+        stamp_page_id(&mut page, 12_345);
+        let once = *page;
+        stamp_page_id(&mut page, 12_345);
+        assert_eq!(*page, once, "stamping the same id twice changes nothing");
+        let h = PageHeader::read(&page).unwrap();
+        assert_eq!(h.page_id, 12_345);
+        assert!(h.flags & FLAG_HAS_PAGE_ID != 0);
     }
 }
